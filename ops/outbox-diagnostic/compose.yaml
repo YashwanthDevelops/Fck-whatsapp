@@ -1,0 +1,52 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: synapse
+      POSTGRES_DB: synapse
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
+    volumes:
+      - outbox-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synapse -d synapse"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [outbox-private]
+
+  synapse:
+    image: ghcr.io/element-hq/synapse:v1.161.0
+    environment:
+      SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
+      SYNAPSE_SERVER_NAME: outbox.test
+      SYNAPSE_REPORT_STATS: "no"
+    ports:
+      - "127.0.0.1:8009:8008"
+    volumes:
+      - outbox-synapse:/data
+      - ./configure.py:/opt/outbox-diagnostic-configure.py:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/_matrix/client/versions', timeout=5).read()",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    networks: [outbox-private]
+
+networks:
+  outbox-private:
+    driver: bridge
+
+volumes:
+  outbox-postgres:
+  outbox-synapse:

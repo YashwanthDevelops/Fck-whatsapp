@@ -1,0 +1,15 @@
+{
+	admin off
+}
+
+{$MATRIX_DOMAIN} {
+	route {
+		@admin_api path /_synapse/admin /_synapse/admin/*
+		respond @admin_api 404
+
+		@push_gateway path /_matrix/push/v1/notify
+		reverse_proxy @push_gateway sygnal:5000
+
+		reverse_proxy synapse:8008
+	}
+}

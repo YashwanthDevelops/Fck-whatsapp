@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Private Messenger Architecture",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "encrypted-delivery",
+        "label": "Encrypted delivery",
+        "focus": ["android", "ios", "synapse", "postgres"],
+        "note": "Each client encrypts locally; Synapse routes ciphertext and sync state."
+      },
+      {
+        "id": "privacy-limits",
+        "label": "Privacy limits",
+        "focus": ["synapse", "postgres"],
+        "note": "The server still sees routing metadata, timing, sizes, and IP addresses."
+      }
+    ]
+  },
+  "layout": {
+    "mode": "grid",
+    "cols": 3,
+    "gapX": 150,
+    "gapY": 80,
+    "cellW": 210,
+    "cellH": 88
+  },
+  "components": [
+    {
+      "id": "android",
+      "type": "frontend",
+      "label": "Android app",
+      "sublabel": "Compose • Rust SDK • Keystore",
+      "tag": "E2EE endpoint",
+      "row": 0,
+      "col": 0
+    },
+    {
+      "id": "ios",
+      "type": "frontend",
+      "label": "iOS app",
+      "sublabel": "SwiftUI • Rust SDK • Keychain",
+      "tag": "E2EE endpoint",
+      "row": 1,
+      "col": 0
+    },
+    {
+      "id": "synapse",
+      "type": "backend",
+      "label": "Synapse",
+      "sublabel": "Private Matrix homeserver",
+      "tag": "No message plaintext",
+      "row": 0,
+      "col": 1
+    },
+    {
+      "id": "postgres",
+      "type": "database",
+      "label": "PostgreSQL",
+      "sublabel": "Events • accounts • sync state",
+      "row": 0,
+      "col": 2
+    }
+  ],
+  "connections": [
+    {
+      "id": "android-matrix",
+      "from": "android",
+      "to": "synapse",
+      "label": "TLS • ciphertext send + sync",
+      "variant": "emphasis"
+    },
+    {
+      "id": "ios-matrix",
+      "from": "ios",
+      "to": "synapse",
+      "label": "TLS • ciphertext send + sync",
+      "variant": "emphasis"
+    },
+    {
+      "id": "synapse-postgres",
+      "from": "synapse",
+      "to": "postgres",
+      "label": "Ciphertext events + metadata"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Clients",
+      "items": [
+        "Native UI on both platforms",
+        "Device keys stay on each device"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Small private service",
+      "items": [
+        "One Synapse service and database",
+        "No federation or public registration"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Later phases",
+      "items": [
+        "Push is a generic wake-up only",
+        "Media is encrypted; resume design needs proof"
+      ]
+    }
+  ]
+}

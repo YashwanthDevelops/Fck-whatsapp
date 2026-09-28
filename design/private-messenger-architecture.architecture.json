@@ -1,0 +1,169 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Private Messenger Architecture",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "encrypted-delivery",
+        "label": "Encrypted delivery",
+        "focus": ["android", "ios", "synapse", "postgres"],
+        "note": "Both native clients encrypt locally and sync through one private homeserver."
+      },
+      {
+        "id": "wakeups",
+        "label": "Content-free wakeups",
+        "focus": ["synapse", "push-gateway", "push-providers"],
+        "note": "Push wakes the app; Matrix sync remains the source of truth."
+      },
+      {
+        "id": "media-later",
+        "label": "Encrypted media later",
+        "focus": ["android", "ios", "synapse", "media-store"],
+        "note": "The client encrypts attachments before upload in Phase 3."
+      }
+    ]
+  },
+  "layout": {
+    "mode": "grid",
+    "cols": 3,
+    "gapX": 150,
+    "gapY": 100,
+    "cellW": 210,
+    "cellH": 92
+  },
+  "components": [
+    {
+      "id": "android",
+      "type": "frontend",
+      "label": "Android app",
+      "sublabel": "Compose • SDK • Keystore",
+      "tag": "E2EE endpoint",
+      "row": 0,
+      "col": 0
+    },
+    {
+      "id": "ios",
+      "type": "frontend",
+      "label": "iOS app",
+      "sublabel": "SwiftUI • SDK • Keychain",
+      "tag": "E2EE endpoint",
+      "row": 1,
+      "col": 0
+    },
+    {
+      "id": "synapse",
+      "type": "backend",
+      "label": "Synapse",
+      "sublabel": "Private Matrix homeserver",
+      "tag": "No message plaintext",
+      "row": 0,
+      "col": 1
+    },
+    {
+      "id": "postgres",
+      "type": "database",
+      "label": "PostgreSQL",
+      "sublabel": "Events • accounts • sync state",
+      "row": 0,
+      "col": 2
+    },
+    {
+      "id": "media-store",
+      "type": "backend",
+      "label": "Media store",
+      "sublabel": "Ciphertext blobs • Phase 3",
+      "row": 1,
+      "col": 2
+    },
+    {
+      "id": "push-gateway",
+      "type": "backend",
+      "label": "Push gateway",
+      "sublabel": "Minimal routing data • Phase 1",
+      "row": 2,
+      "col": 1
+    },
+    {
+      "id": "push-providers",
+      "type": "external",
+      "label": "APNs / FCM",
+      "sublabel": "Generic wake-up only",
+      "row": 2,
+      "col": 2
+    }
+  ],
+  "connections": [
+    {
+      "id": "android-matrix",
+      "from": "android",
+      "to": "synapse",
+      "label": "TLS • ciphertext send + sync",
+      "variant": "emphasis"
+    },
+    {
+      "id": "ios-matrix",
+      "from": "ios",
+      "to": "synapse",
+      "label": "TLS • ciphertext send + sync",
+      "variant": "emphasis"
+    },
+    {
+      "id": "synapse-postgres",
+      "from": "synapse",
+      "to": "postgres",
+      "label": "Ciphertext events + metadata"
+    },
+    {
+      "id": "synapse-media",
+      "from": "synapse",
+      "to": "media-store",
+      "label": "Encrypted attachment bytes",
+      "variant": "dashed"
+    },
+    {
+      "id": "synapse-push",
+      "from": "synapse",
+      "to": "push-gateway",
+      "label": "Room/event IDs only",
+      "labelDy": 24
+    },
+    {
+      "id": "push-provider",
+      "from": "push-gateway",
+      "to": "push-providers",
+      "label": "No message content",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Clients",
+      "items": [
+        "Native UI on Android and iOS",
+        "Matrix Rust SDK encrypts before network send",
+        "Device keys stay on their device"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Small private backend",
+      "items": [
+        "One Synapse service and PostgreSQL database",
+        "No federation or public registration",
+        "No broker, Kubernetes, or custom message server"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Privacy limits",
+      "items": [
+        "Server sees accounts, rooms, timing, sizes, and IPs",
+        "Push providers see device tokens and wakeup timing",
+        "Background delivery remains best effort"
+      ]
+    }
+  ]
+}

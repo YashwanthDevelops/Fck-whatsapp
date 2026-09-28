@@ -1,0 +1,41 @@
+log:
+  setup:
+    version: 1
+    handlers:
+      stderr:
+        class: logging.StreamHandler
+        stream: ext://sys.stderr
+    root:
+      handlers: [stderr]
+      level: WARNING
+    disable_existing_loggers: false
+  access:
+    x_forwarded_for: false
+
+http:
+  bind_addresses: ["0.0.0.0"]
+  port: 5000
+
+metrics:
+  prometheus:
+    enabled: false
+
+apps:
+  # Matrix pusher app_id: dev.friendline.messenger.android
+  dev.friendline.messenger.android:
+    type: gcm
+    api_version: v1
+    project_id: REPLACE_WITH_FIREBASE_PROJECT_ID
+    service_account_file: /run/secrets/firebase_service_account.json
+    send_badge_counts: false
+
+  # Matrix pusher app_id and APNs topic: dev.friendline.messenger.ios
+  dev.friendline.messenger.ios:
+    type: apns
+    keyfile: /run/secrets/apns_auth_key.p8
+    key_id: REPLACE_WITH_APPLE_APNS_KEY_ID
+    team_id: REPLACE_WITH_APPLE_TEAM_ID
+    topic: dev.friendline.messenger.ios
+    platform: production
+    push_type: alert
+    send_badge_counts: false

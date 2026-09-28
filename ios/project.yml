@@ -1,0 +1,35 @@
+name: PrivateMessenger
+options:
+  bundleIdPrefix: dev.friendline
+  deploymentTarget:
+    iOS: "16.0"
+packages:
+  MatrixRustSDK:
+    url: https://github.com/matrix-org/matrix-rust-components-swift
+    exactVersion: 26.08.11
+targets:
+  PrivateMessenger:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - Sources
+    dependencies:
+      - package: MatrixRustSDK
+        product: MatrixRustSDK
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.friendline.messenger.ios
+        PRODUCT_NAME: Private Messenger
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Private Messenger
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Connect to your private development homeserver on the local network.
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: Record voice messages for encrypted conversations. Audio is encrypted on this device before it is sent.
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIUserInterfaceStyle: Automatic
+      configs:
+        debug:
+          INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: YES

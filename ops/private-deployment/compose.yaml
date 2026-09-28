@@ -1,0 +1,128 @@
+name: friendline-private
+
+services:
+  db:
+    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: synapse
+      POSTGRES_USER: synapse
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synapse -d synapse"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - database
+
+  synapse:
+    image: ${SYNAPSE_IMAGE:-ghcr.io/element-hq/synapse:v1.161.0}
+    restart: unless-stopped
+    environment:
+      SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
+      SYNAPSE_SERVER_NAME: ${MATRIX_DOMAIN:?Set MATRIX_DOMAIN to the stable domain you own}
+      SYNAPSE_REPORT_STATS: "no"
+      MATRIX_DOMAIN: ${MATRIX_DOMAIN:?Set MATRIX_DOMAIN to the stable domain you own}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - synapse_data:/data
+      - ./configure.py:/opt/private-deployment/configure.py:ro
+    expose:
+      - "8008"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/_matrix/client/versions', timeout=5).read()
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 60s
+    stop_grace_period: 1m
+    networks:
+      - database
+      - proxy
+
+  caddy:
+    image: ${CADDY_IMAGE:-caddy:2.11.4-alpine}
+    restart: unless-stopped
+    environment:
+      MATRIX_DOMAIN: ${MATRIX_DOMAIN:?Set MATRIX_DOMAIN to the stable domain you own}
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      synapse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "caddy", "validate", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      proxy:
+        aliases:
+          - ${MATRIX_DOMAIN:?Set MATRIX_DOMAIN to the stable domain you own}
+      edge: {}
+
+  sygnal:
+    image: ${SYGNAL_IMAGE:-matrixdotorg/sygnal:v0.17.0}
+    profiles:
+      - push
+    restart: unless-stopped
+    environment:
+      SYGNAL_CONF: /sygnal/sygnal.yaml
+    volumes:
+      - ./sygnal.yaml:/sygnal/sygnal.yaml:ro
+      - ./credentials:/run/secrets:ro
+    expose:
+      - "5000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=5).read()
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - proxy
+      - edge
+
+networks:
+  database:
+    internal: true
+  proxy:
+    internal: true
+  edge:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  synapse_data:
+  caddy_data:
+  caddy_config:
+
+secrets:
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_FILE:?Set POSTGRES_PASSWORD_FILE to a protected password file}
