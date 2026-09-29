@@ -67,6 +67,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
@@ -88,6 +89,8 @@ import dev.friendline.messenger.data.PeerTrustStatus
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -117,6 +120,7 @@ fun ChatScreen(
     onBack: () -> Unit,
     onSend: (String) -> Unit,
     onSendAttachment: (String) -> Unit,
+    onMessageVisible: (String, Long) -> Unit,
     onStartVoiceRecording: () -> Unit,
     onStopVoiceRecording: () -> Unit,
     onDiscardVoiceNote: () -> Unit,
@@ -167,6 +171,21 @@ fun ChatScreen(
         while (true) {
             elapsedRecordingMillis = (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0).toInt()
             kotlinx.coroutines.delay(250)
+        }
+    }
+    LaunchedEffect(roomId, messages, searchVisible) {
+        snapshotFlow {
+            if (searchVisible) {
+                null
+            } else {
+                listState.layoutInfo.visibleItemsInfo
+                    .mapNotNull { visible -> messages.getOrNull(visible.index) }
+                    .filter { !it.isOwn && it.isRemote && it.eventId != null }
+                    .maxByOrNull(ChatMessage::timestampMillis)
+                    ?.let { message -> message.eventId?.let { it to message.timestampMillis } }
+            }
+        }.distinctUntilChanged().collect { target ->
+            target?.let { (eventId, timestampMillis) -> onMessageVisible(eventId, timestampMillis) }
         }
     }
 
@@ -512,6 +531,7 @@ fun ChatScreen(
                     items(messages, key = ChatMessage::id) { message ->
                         MessageLine(
                             message = message,
+                            isGroup = isGroup,
                             onRetry = onRetry,
                             onReply = onReply,
                             onToggleReaction = onToggleReaction,
@@ -610,6 +630,7 @@ private fun SearchResultLine(hit: MessageSearchHit, onClick: () -> Unit) {
 @Composable
 private fun MessageLine(
     message: ChatMessage,
+    isGroup: Boolean,
     onRetry: () -> Unit,
     onReply: (ChatMessage) -> Unit,
     onToggleReaction: (ChatMessage, String) -> Unit,
@@ -621,11 +642,16 @@ private fun MessageLine(
     val surface = if (message.isOwn) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surface
     val author = if (message.isOwn) "You" else message.sender
     val time = DateFormat.getTimeInstance(DateFormat.SHORT, Locale.getDefault()).format(Date(message.timestampMillis))
+    val deliveryLabel = messageDeliveryLabel(
+        deliveryState = message.deliveryState,
+        hasBeenRead = message.hasBeenRead,
+        isGroup = isGroup,
+    )
     var menuExpanded by remember(message.id) { mutableStateOf(false) }
 
     Column(
         modifier = Modifier.fillMaxWidth().semantics(mergeDescendants = true) {
-            contentDescription = "$author, $time. ${message.attachment?.fileName.orEmpty()} ${message.body}. ${message.deliveryState}"
+            contentDescription = "$author, $time. ${message.attachment?.fileName.orEmpty()} ${message.body}. $deliveryLabel"
         },
         horizontalAlignment = alignment,
     ) {
@@ -688,7 +714,9 @@ private fun MessageLine(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(time, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (message.isOwn) Text(if (message.hasBeenRead) "Read" else message.deliveryState, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (message.isOwn) {
+                Text(deliveryLabel, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
         if (message.isOwn && message.canRetry) {
             TextButton(onClick = onRetry, contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 4.dp, vertical = 0.dp)) {
@@ -696,6 +724,17 @@ private fun MessageLine(
             }
         }
     }
+}
+
+internal fun messageDeliveryLabel(
+    deliveryState: String,
+    hasBeenRead: Boolean,
+    isGroup: Boolean,
+): String = when {
+    !hasBeenRead -> deliveryState
+    isGroup && deliveryState.startsWith("Delivered to ") -> "$deliveryState · Seen"
+    isGroup -> "Seen"
+    else -> "Read"
 }
 
 @Composable

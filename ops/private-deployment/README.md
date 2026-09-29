@@ -1,8 +1,8 @@
 # Private Matrix homeserver deployment
 
-This is a separate hosted deployment bundle for the private friend group. It does not share the local development stack's bind mounts, Compose project, or data. It prepares Synapse with PostgreSQL behind Caddy-managed HTTPS. An optional Sygnal profile and app configuration are included for Android/iOS push delivery; it remains inactive until real provider credentials and native push registration are ready.
+This is a separate hosted deployment bundle for the private friend group. It does not share the local development stack's bind mounts, Compose project, or data. It prepares Synapse with PostgreSQL behind Caddy-managed HTTPS. An optional Sygnal profile and app configuration are included for Android/iOS push delivery; it remains inactive until real provider credentials are configured and end-to-end delivery is validated.
 
-The stack keeps public registration and guest access disabled, blocks federation at both the Synapse listener and configuration layers, disables URL previews and anonymous statistics, and sets `push.include_content: false`. PostgreSQL, Synapse, and Caddy state use named Docker volumes. The database has no published port. Synapse is reachable only from Caddy on an isolated Docker network, and its outbound network is isolated as well. On that private proxy network, Docker resolves the configured Matrix domain to Caddy so Synapse can reach the same HTTPS push URL without public-network egress. Caddy publishes TCP 80/443 and UDP 443 for certificate validation, HTTPS, and HTTP/3.
+The stack keeps public registration and guest access disabled, blocks federation at both the Synapse listener and configuration layers, disables URL previews and anonymous statistics, and sets `push.include_content: false`. PostgreSQL is initialized with UTF-8 encoding and the `C` locale required by Synapse; this only takes effect when its data volume is first created. PostgreSQL, Synapse, and Caddy state use named Docker volumes. The database has no published port. Synapse is reachable only from Caddy on an isolated Docker network, and its outbound network is isolated as well. On that private proxy network, Docker resolves the configured Matrix domain to Caddy so Synapse can reach the same HTTPS push URL without public-network egress. Caddy publishes TCP 80/443 and UDP 443 for certificate validation, HTTPS, and HTTP/3.
 
 The server domain is an identity decision: Matrix user IDs include it. Choose the stable DNS name you own before first setup. Do not use the `.invalid` placeholder from `.env.example` for a real deployment.
 
@@ -13,7 +13,7 @@ The server domain is an identity decision: Matrix user IDs include it. Choose th
 - Inbound TCP ports 80 and 443, and optionally UDP 443, allowed through both the host firewall and hosting provider firewall. Caddy needs outbound access for DNS and ACME certificate issuance/renewal.
 - Durable storage with encryption at rest and enough room for the PostgreSQL database, Synapse media store, signing/configuration keys, and backups.
 
-The bundle does not create a host, domain, DNS records, firewall rules, or backups. The Sygnal route/configuration contract is ready, but push delivery needs Firebase and Apple Developer credentials plus native client registration. Calls need a separate service and are not configured here.
+The bundle does not create a host, domain, DNS records, firewall rules, or backups. The Sygnal route/configuration contract and native client lifecycle code are present, but push delivery needs Firebase and Apple Developer credentials plus end-to-end validation on signed devices. Calls need a separate service and are not configured here.
 
 ## First-time setup
 
@@ -29,7 +29,7 @@ Run these commands on the Linux host from this directory (`ops/private-deploymen
    chmod 600 .env
    ```
 
-2. Edit `.env`: set `MATRIX_DOMAIN` to the stable DNS name you own and confirm `POSTGRES_PASSWORD_FILE=./secrets/postgres_password`. The image tags are pinned to release versions. Before production, review security advisories and pin each image to a verified digest in the same change-control process.
+2. Edit `.env`: set `MATRIX_DOMAIN` to the stable DNS name you own and confirm `POSTGRES_PASSWORD_FILE=./secrets/postgres_password`. Do not use reserved documentation or local-only names such as `.invalid`, `.example`, `.test`, or `.local`; the Synapse helper rejects these before it writes the homeserver identity. This syntax check cannot verify DNS ownership or reachability. The image tags are pinned to release versions. Before production, review security advisories and pin each image to a verified digest in the same change-control process.
 
 3. Confirm that Compose resolves the required variables and secret file, without starting containers:
 
@@ -91,16 +91,17 @@ https://<MATRIX_DOMAIN>/_matrix/push/v1/notify
 
 `<MATRIX_DOMAIN>` is the same real domain used for Synapse and Caddy. Caddy routes this exact path to Sygnal when its `push` profile is active. The client must register an HTTP pusher with `data.url` set to this URL and `data.format` set to `event_id_only`. `event_id_only` is a client pusher option, not a Sygnal YAML setting; `push.include_content: false` in Synapse is the second server-side protection. Clients should display generic notification text and fetch/decrypt the event after opening the app. Push still exposes event/room/device identifiers and counts needed for delivery.
 
-The app identifiers currently in the source are:
+The native app identifiers and Sygnal pusher identities are:
 
-| Platform | Native release identifier | Matrix/Sygnal `app_id` | Sygnal app config key |
+| Build | Native application ID / bundle ID and APNs topic | Matrix/Sygnal `app_id` | APNs environment |
 | --- | --- | --- | --- |
-| Android | `dev.friendline.messenger` (application ID) | `dev.friendline.messenger.android` | `dev.friendline.messenger.android` |
-| iOS | `dev.friendline.messenger.ios` (bundle ID and APNs topic) | `dev.friendline.messenger.ios` | `dev.friendline.messenger.ios` |
+| Android release | `dev.friendline.messenger` | `dev.friendline.messenger.android` | n/a |
+| iOS debug | `dev.friendline.messenger.ios` | `dev.friendline.messenger.ios.dev` | Sandbox |
+| iOS release | `dev.friendline.messenger.ios` | `dev.friendline.messenger.ios` | Production |
 
-The Android release ID is in `app/build.gradle.kts`; the iOS bundle ID and APNs topic are in `ios/project.yml`. Debug/test package suffixes are not production push identifiers.
+The Android release ID is in `app/build.gradle.kts`; the iOS bundle ID, APNs topic, APS environment, and build-specific pusher app IDs are in `ios/project.yml`. Android's Matrix/Sygnal `app_id` stays `dev.friendline.messenger.android` across variants; the Firebase client app must match the built package ID. Current IDs are `dev.friendline.messenger` (standard release), `dev.friendline.messenger.debug` (standard debug), `dev.friendline.messenger.outboxdiag` (outbox diagnostic release), and `dev.friendline.messenger.outboxdiag.debug` (outbox diagnostic debug).
 
-Before enabling push, replace `REPLACE_WITH_FIREBASE_PROJECT_ID`, `REPLACE_WITH_APPLE_APNS_KEY_ID`, and `REPLACE_WITH_APPLE_TEAM_ID` in `sygnal.yaml`. Put the Firebase Admin SDK service account JSON at `credentials/firebase_service_account.json` and the Apple APNs authentication key at `credentials/apns_auth_key.p8`; keep both out of source control and restrict host permissions. The Sygnal config expects FCM HTTP v1 and an APNs token key in production mode. Its app entries disable badge counts to reduce metadata and avoid inaccurate encrypted-room counts. The `credentials/` directory is ignored by Git.
+Before enabling push, replace `REPLACE_WITH_FIREBASE_PROJECT_ID`, `REPLACE_WITH_APPLE_APNS_KEY_ID`, and `REPLACE_WITH_APPLE_TEAM_ID` in `sygnal.yaml`. Put the Firebase Admin SDK service account JSON at `credentials/firebase_service_account.json` and the Apple APNs authentication key at `credentials/apns_auth_key.p8`; keep both out of source control and restrict host permissions. The Sygnal config expects FCM HTTP v1 and an APNs token key, with separate sandbox and production app entries sharing the APNs topic/key. Its app entries disable badge counts to reduce metadata and avoid inaccurate encrypted-room counts. The `credentials/` directory is ignored by Git.
 
 Then start Sygnal using the opt-in profile:
 
@@ -109,7 +110,7 @@ docker compose --env-file .env --profile push up -d sygnal
 docker compose --env-file .env ps
 ```
 
-The profile is intentionally opt-in: the checked-in project has no Firebase project, service-account key, Apple team, APNs key, or signed native release configuration. The iOS sandbox APNs environment is also not enabled; production APNs credentials and device tokens must match the `platform` setting. Do not register pushers until native token acquisition and client registration code have been implemented and verified.
+The profile is intentionally opt-in: the checked-in project has no Firebase project, service-account key, Apple team, APNs key, or signed native build. The iOS project pairs the debug entitlement and `dev.friendline.messenger.ios.dev` pusher with Sygnal sandbox, and the release entitlement and `dev.friendline.messenger.ios` pusher with Sygnal production. The signed provisioning profile and provider credentials must still match. Do not enable push delivery until native token acquisition and client registration have been validated on signed devices and the actual provider payloads have been inspected.
 
 Each client pusher must use the matching `app_id` above and include fields equivalent to:
 
@@ -123,7 +124,7 @@ Each client pusher must use the matching `app_id` above and include fields equiv
 }
 ```
 
-The client must also supply its provider device token as `pushkey`, plus the required display-name and language fields. Keep that token out of logs and analytics. A full end-to-end test must check the actual APNs/FCM payloads to confirm that no plaintext, room title, sender name, or message preview appears.
+The iOS pusher additionally supplies a fixed `data.default_payload.aps.alert` with title “Private Messenger” and body “New message”; Android omits `default_payload` and posts generic notification text locally. Keep the iOS payload static. The client must also supply its provider device token as `pushkey`, plus the required display-name and language fields. Keep that token out of logs and analytics. A full end-to-end test must check the actual APNs/FCM payloads to confirm that no plaintext, room title, sender name, or message preview appears.
 
 ## Backups, updates, and recovery
 
@@ -140,4 +141,12 @@ docker compose --env-file .env exec synapse python -c "import urllib.request; ur
 
 ## Not yet provisioned
 
-The repository now contains a deployment definition and operator procedure, not a running server. Provisioning still requires a real user-owned domain and DNS, a Linux host with public ports 80/443 routed to it, a strong password file, and the host's security/backup setup. Push additionally requires Firebase and Apple Developer credentials and native push implementation. These values are intentionally not present in this repository. No hosting account, payment, credentials, or real domain has been used.
+The repository contains a deployment definition and operator procedure, not a running server. The following operator-owned inputs and actions remain before private use:
+
+- Choose the permanent Matrix domain and provision a Linux host with Docker Compose V2. Point DNS A/AAAA records at that host, configure inbound TCP 80/443 (and optional UDP 443), and arrange encrypted storage, firewall policy, and tested backups. The Matrix domain becomes part of every account ID and should be selected before creating accounts.
+- On that host, create `.env` from `.env.example`, set `MATRIX_DOMAIN`, and create `secrets/postgres_password` with a random value of at least 32 characters and restrictive file permissions. Run the first-time initialization and account-provisioning steps above.
+- For Android push, create a Firebase project, enable FCM HTTP v1, register each application ID that will be built (the four current IDs are listed above), add matching client `google-services.json` files on the Android build machine, and place the Firebase service-account JSON on the host at `credentials/firebase_service_account.json`. Set the Firebase project ID in `sygnal.yaml`.
+- For iOS push, use an Apple Developer team to enable Push Notifications for bundle ID `dev.friendline.messenger.ios`, create an APNs authentication key, and install matching signed provisioning profiles on macOS/Xcode. Place the `.p8` key on the host at `credentials/apns_auth_key.p8`; set its Key ID and Team ID in `sygnal.yaml`. The debug build uses APNs sandbox and the release build uses production.
+- Enable the Sygnal `push` profile only after both provider configurations and client builds are ready. Validate registration and actual APNs/FCM payloads with signed physical devices before giving builds to friends. Push acceptance cannot be completed from this Windows host without the Apple signing setup and physical iOS device.
+
+Provider credentials and host secrets belong only in their protected local files; do not commit or share them. No hosting account, payment, credential, or real domain has been provisioned for this project.

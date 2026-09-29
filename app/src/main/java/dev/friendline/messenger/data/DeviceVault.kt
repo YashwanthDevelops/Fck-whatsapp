@@ -3,6 +3,9 @@ package dev.friendline.messenger.data
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import dev.friendline.messenger.push.PushPusherIdentity
+import dev.friendline.messenger.push.PushPusherOperation
+import dev.friendline.messenger.push.PushPusherRecord
 import org.json.JSONObject
 import org.matrix.rustcomponents.sdk.Session
 import org.matrix.rustcomponents.sdk.SlidingSyncVersion
@@ -27,6 +30,7 @@ class DeviceVault(context: Context) {
     private val storeKeyFile = File(root, "store-key.bin")
     private val sessionFile = File(root, "session.bin")
     private val settingsFile = File(root, "settings.bin")
+    private val pushPusherFile = File(root, "push-pusher.bin")
 
     @Synchronized
     fun loadOrCreateStoreKey(): ByteArray {
@@ -67,14 +71,91 @@ class DeviceVault(context: Context) {
 
     @Synchronized
     fun loadReadReceiptsEnabled(): Boolean {
-        if (!settingsFile.exists()) return false
-        val settings = JSONObject(String(open(settingsFile.readBytes()), Charsets.UTF_8))
-        return settings.optBoolean("readReceiptsEnabled", false)
+        return loadSettings().optBoolean("readReceiptsEnabled", false)
     }
 
     @Synchronized
     fun saveReadReceiptsEnabled(enabled: Boolean) {
-        val settings = JSONObject().put("readReceiptsEnabled", enabled)
+        writeSetting("readReceiptsEnabled", enabled)
+    }
+
+    @Synchronized
+    fun loadPushNotificationsEnabled(): Boolean {
+        return loadSettings().optBoolean("pushNotificationsEnabled", false)
+    }
+
+    @Synchronized
+    fun savePushNotificationsEnabled(enabled: Boolean) {
+        writeSetting("pushNotificationsEnabled", enabled)
+    }
+
+    @Synchronized
+    fun savePushRemovalPending(pending: Boolean) {
+        writeSetting("pushRemovalPending", pending)
+    }
+
+    @Synchronized
+    fun loadPushRemovalPending(): Boolean = loadSettings().optBoolean("pushRemovalPending", false)
+
+    /** Persist opt-out and its cleanup intent together in one encrypted atomic settings replacement. */
+    @Synchronized
+    fun savePushOptOutWithRemovalPending() {
+        val settings = loadSettings()
+            .put("pushNotificationsEnabled", false)
+            .put("pushRemovalPending", true)
+        writeAtomically(settingsFile, seal(settings.toString().toByteArray(Charsets.UTF_8)))
+    }
+
+    /** The encrypted record contains only pusher routing identity, provider token, and retry state. */
+    @Synchronized
+    internal fun loadPushPusherRecord(): PushPusherRecord? {
+        if (!pushPusherFile.exists()) return null
+        val plaintext = decryptLocalData(PUSH_PUSHER_PURPOSE, pushPusherFile.readBytes())
+        val json = JSONObject(String(plaintext, Charsets.UTF_8))
+        val identity = PushPusherIdentity(
+            homeserverUrl = json.getString("homeserverUrl"),
+            userId = json.getString("userId"),
+            deviceId = json.getString("deviceId"),
+            appId = json.getString("appId"),
+        )
+        val pushToken = if (json.isNull("pushToken")) null else json.getString("pushToken")
+        return PushPusherRecord(
+            identity = identity,
+            pushToken = pushToken,
+            operation = PushPusherOperation.valueOf(json.getString("operation")),
+        )
+    }
+
+    @Synchronized
+    internal fun savePushPusherRecord(record: PushPusherRecord) {
+        val json = JSONObject()
+            .put("homeserverUrl", record.identity.homeserverUrl)
+            .put("userId", record.identity.userId)
+            .put("deviceId", record.identity.deviceId)
+            .put("appId", record.identity.appId)
+            .put("pushToken", record.pushToken ?: JSONObject.NULL)
+            .put("operation", record.operation.name)
+        val encrypted = encryptLocalData(PUSH_PUSHER_PURPOSE, json.toString().toByteArray(Charsets.UTF_8))
+        writeAtomically(pushPusherFile, encrypted)
+    }
+
+    @Synchronized
+    internal fun clearPushPusherRecord() {
+        if (pushPusherFile.exists() && !pushPusherFile.delete()) {
+            throw IOException("Couldn't remove the encrypted push registration record")
+        }
+    }
+
+    @Synchronized
+    internal fun hasPushPusherRecord(): Boolean = pushPusherFile.isFile
+
+    private fun loadSettings(): JSONObject {
+        if (!settingsFile.exists()) return JSONObject()
+        return JSONObject(String(open(settingsFile.readBytes()), Charsets.UTF_8))
+    }
+
+    private fun writeSetting(name: String, value: Boolean) {
+        val settings = loadSettings().put(name, value)
         writeAtomically(settingsFile, seal(settings.toString().toByteArray(Charsets.UTF_8)))
     }
 
@@ -182,7 +263,7 @@ class DeviceVault(context: Context) {
 
     @Synchronized
     fun clearSession() {
-        val files = listOf(sessionFile, storeKeyFile, settingsFile)
+        val files = listOf(sessionFile, storeKeyFile, settingsFile, pushPusherFile)
         val snapshots = files.filter { it.isFile }.associateWith { it.readBytes() }
         val store = keyStore()
         try {
@@ -273,5 +354,6 @@ class DeviceVault(context: Context) {
         const val TRANSFORMATION = "AES/GCM/NoPadding"
         const val LOCAL_FILE_VERSION: Byte = 1
         const val GCM_TAG_BYTES = 16
+        const val PUSH_PUSHER_PURPOSE = "android-matrix-pusher-v1"
     }
 }

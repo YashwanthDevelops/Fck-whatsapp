@@ -21,6 +21,14 @@ private struct PreviewDocument: Identifiable {
     let url: URL
 }
 
+private struct MessageFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, next in next })
+    }
+}
+
 struct ContentView: View {
     @EnvironmentObject private var messenger: MessengerStore
     @State private var showingNewConversation = false
@@ -92,12 +100,68 @@ struct ContentView: View {
                     .frame(maxHeight: .infinity)
                 } else {
                     List(filteredConversations) { conversation in
-                        Button {
-                            Task { await messenger.openConversation(conversation.id) }
-                        } label: {
-                            ConversationRow(conversation: conversation)
+                        if conversation.isVerificationControl {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Label("Device verification invitation", systemImage: "checkmark.shield")
+                                    .font(.headline)
+                                if let peerUserId = conversation.verificationPeerUserId {
+                                    Text("From \(peerUserId)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                }
+                                Text("This channel is not end-to-end encrypted. Your homeserver can see who joined, when, and the verification events. It is for the SAS handshake only. Compare the code in person or through another trusted channel; never confirm a mismatch.")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                                if messenger.invitationActionsInProgress.contains(conversation.id) {
+                                    ProgressView("Updating invitation…")
+                                        .font(.caption)
+                                } else {
+                                    HStack {
+                                        Button("Decline", role: .destructive) {
+                                            Task { await messenger.declineRoomInvitation(conversation.id) }
+                                        }
+                                        .disabled(messenger.isBusy)
+                                        Spacer()
+                                        Button("Join channel") {
+                                            Task { await messenger.joinVerificationControlRoom(conversation.id) }
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .disabled(messenger.isBusy)
+                                    }
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        } else if conversation.isInvitation {
+                            VStack(alignment: .leading, spacing: 10) {
+                                ConversationRow(conversation: conversation)
+                                if messenger.invitationActionsInProgress.contains(conversation.id) {
+                                    ProgressView("Updating invitation…")
+                                        .font(.caption)
+                                } else {
+                                    HStack {
+                                        Button("Decline", role: .destructive) {
+                                            Task { await messenger.declineRoomInvitation(conversation.id) }
+                                        }
+                                        .disabled(messenger.isBusy)
+                                        Spacer()
+                                        Button("Accept") {
+                                            Task { await messenger.acceptRoomInvitation(conversation.id) }
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .disabled(messenger.isBusy || !conversation.isEncrypted)
+                                    }
+                                }
+                            }
+                        } else {
+                            Button {
+                                Task { await messenger.openConversation(conversation.id) }
+                            } label: {
+                                ConversationRow(conversation: conversation)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(messenger.isBusy)
                         }
-                        .buttonStyle(.plain)
                         .listRowInsets(EdgeInsets(top: 12, leading: 20, bottom: 12, trailing: 20))
                     }
                     .listStyle(.plain)
@@ -132,6 +196,47 @@ private struct PrivacySettingsScreen: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("DEVICE & MESSAGE HISTORY") {
+                    Label("Your encryption keys are kept on this device.", systemImage: "key.fill")
+                    Text("If you lose this device or its keys, older encrypted messages may be unrecoverable. The homeserver cannot restore message plaintext. Verify a replacement device with your contacts before trusting it.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("MESSAGE NOTIFICATIONS") {
+                    Toggle(
+                        "Enable private alerts",
+                        isOn: Binding(
+                            get: { messenger.pushNotificationsEnabled },
+                            set: { enabled in
+                                Task { await messenger.setPushNotificationsEnabled(enabled) }
+                            }
+                        )
+                    )
+                    .disabled(!NativePushNotifications.isConfigured && !messenger.pushNotificationsEnabled)
+
+                    Text(
+                        NativePushNotifications.isConfigured || messenger.pushRegistrationStatus == .removalPending
+                            ? messenger.pushRegistrationStatus.displayText
+                            : PushRegistrationResult.disabled.displayText
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                    if messenger.pushRegistrationStatus == .removalPending {
+                        Button("Retry alert removal") {
+                            Task { await messenger.retryPendingPushRemoval() }
+                        }
+                    }
+
+                    if NativePushNotifications.isConfigured && messenger.pushRegistrationStatus == .permissionRequired {
+                        Button("Open notification settings") {
+                            guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                            UIApplication.shared.open(url)
+                        }
+                    }
+                }
+
                 Section {
                     Toggle(
                         "Send read receipts",
@@ -146,6 +251,9 @@ private struct PrivacySettingsScreen: View {
                 }
                 if canVerifyConversationPeer {
                     Section("CONVERSATION VERIFICATION") {
+                        Text("Peer verification uses a private Matrix room that is not end-to-end encrypted. Your homeserver can see its members, timing, and verification events. Compare the SAS code in person or through another trusted channel before confirming.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                         switch messenger.currentPeerTrust {
                         case .verified:
                             Label("This person's identity is verified.", systemImage: "checkmark.shield.fill")
@@ -201,7 +309,9 @@ private struct PrivacySettingsScreen: View {
                             .disabled(messenger.verificationIsBusy)
                         }
                     case .waitingForPeer:
-                        Text("Waiting for the other device to accept and show a code.")
+                        Text(messenger.isWaitingForVerificationChannelPeer
+                             ? "Waiting for the other person to join the private verification channel. No SAS request is sent until they join."
+                             : "Waiting for the other device to accept and show a code.")
                             .font(.footnote).foregroundStyle(.secondary)
                         Button("Cancel verification", role: .cancel) {
                             Task { await messenger.cancelVerification() }
@@ -273,7 +383,7 @@ private struct ConversationRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
-            Text(conversation.isGroup ? "GROUP" : "LINE")
+            Text(conversation.isInvitation ? "INVITE" : (conversation.isGroup ? "GROUP" : "LINE"))
                 .font(.system(size: 9, weight: .bold, design: .rounded))
                 .tracking(0.8)
                 .foregroundStyle(Color.accentColor)
@@ -285,10 +395,13 @@ private struct ConversationRow: View {
                     Spacer(minLength: 8)
                     Text(shortTime(conversation.timestamp)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 }
-                Text(conversation.preview).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                Text(conversation.isInvitation ? "Invitation received" : conversation.preview)
+                    .font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
                 HStack(spacing: 6) {
                     Image(systemName: conversation.isEncrypted ? "lock.fill" : "exclamationmark.lock.fill")
-                    Text(conversation.isEncrypted ? "ENCRYPTED" : "PAUSED · NOT ENCRYPTED")
+                    Text(conversation.isInvitation
+                         ? (conversation.isEncrypted ? "ENCRYPTED INVITATION" : "NOT ENCRYPTED · CANNOT JOIN")
+                         : (conversation.isEncrypted ? "ENCRYPTED" : "PAUSED · NOT ENCRYPTED"))
                         .tracking(0.8)
                     if conversation.unreadCount > 0 { Spacer(); Text("\(conversation.unreadCount) NEW").tracking(0.6) }
                 }
@@ -339,6 +452,8 @@ private struct SignInScreen: View {
                             .font(.title2.weight(.semibold))
                         Text("Messages are encrypted on this device. The homeserver carries ciphertext and cannot read your chats.")
                             .font(.subheadline).foregroundStyle(.secondary)
+                        Text("Keep this device and its encryption keys safe. If they are lost, older messages may not be recoverable.")
+                            .font(.footnote).foregroundStyle(.secondary)
                     }
                     .padding(.vertical, 8)
                     .listRowBackground(Color.clear)
@@ -439,8 +554,11 @@ private struct ChatScreen: View {
     @State private var attachmentTargetRoomId: String?
     @State private var isImportingAttachment = false
     @State private var openedAttachment: PreviewDocument?
+    @State private var attachmentPreviewURLToDelete: URL?
     @State private var openingAttachmentID: String?
     @State private var loadingAudioMessageID: String?
+    @State private var editingMessage: ChatMessage?
+    @State private var messagePendingRedaction: ChatMessage?
     @FocusState private var composerFocused: Bool
 
     private var visibleMessages: [ChatMessage] {
@@ -525,6 +643,8 @@ private struct ChatScreen: View {
                             LazyVStack(spacing: 8) {
                                 ForEach(messenger.searchResults) { hit in
                                     Button {
+                                        isSearchingMessages = false
+                                        composerFocused = false
                                         Task { await messenger.openSearchHit(hit) }
                                     } label: {
                                         SearchResultRow(hit: hit)
@@ -542,30 +662,56 @@ private struct ChatScreen: View {
                         }
                     }
                 } else {
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            LazyVStack(spacing: 14) {
-                                ForEach(visibleMessages) { message in
-                                    MessageRow(
-                                        message: message,
-                                        onRetry: messenger.retryFailedMessages,
-                                        onReply: { messenger.setReplyTarget($0) },
-                                        onReact: { message, emoji in Task { await messenger.toggleReaction(message, key: emoji) } },
-                                        onOpenAttachment: openAttachment,
-                                        isAudioLoading: loadingAudioMessageID == message.id,
-                                        isAudioPlaying: voicePlayback.playingMessageId == message.id
-                                    )
-                                    .id(message.id)
+                    GeometryReader { viewport in
+                        ScrollViewReader { proxy in
+                            ScrollView {
+                                LazyVStack(spacing: 14) {
+                                    ForEach(visibleMessages) { message in
+                                        MessageRow(
+                                            message: message,
+                                            isGroup: messenger.currentRoomIsGroup,
+                                            onRetry: messenger.retryFailedMessages,
+                                            onReply: { messenger.setReplyTarget($0) },
+                                            onReact: { message, emoji in Task { await messenger.toggleReaction(message, key: emoji) } },
+                                            onEdit: { editingMessage = $0 },
+                                            onRedact: { messagePendingRedaction = $0 },
+                                            onOpenAttachment: openAttachment,
+                                            isAudioLoading: loadingAudioMessageID == message.id,
+                                            isAudioPlaying: voicePlayback.playingMessageId == message.id
+                                        )
+                                        .background {
+                                            GeometryReader { frame in
+                                                Color.clear.preference(
+                                                    key: MessageFramePreferenceKey.self,
+                                                    value: [message.id: frame.frame(in: .named("messageViewport"))]
+                                                )
+                                            }
+                                        }
+                                        .id(message.id)
+                                    }
                                 }
+                                .padding(.horizontal, 16).padding(.vertical, 18)
                             }
-                            .padding(.horizontal, 16).padding(.vertical, 18)
-                        }
-                        .onChange(of: visibleMessages.count) { _ in
-                            if let last = visibleMessages.last { withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(last.id, anchor: .bottom) } }
-                        }
-                        .overlay {
-                            if visibleMessages.isEmpty {
-                                EmptyState(title: "Open line", detail: "Messages in this conversation are end-to-end encrypted.", symbol: "waveform.path") { EmptyView() }
+                            .coordinateSpace(name: "messageViewport")
+                            .onPreferenceChange(MessageFramePreferenceKey.self) { frames in
+                                let bounds = CGRect(origin: .zero, size: viewport.size)
+                                let visibleIds = Set(visibleMessages.compactMap { message -> String? in
+                                    guard let frame = frames[message.id] else { return nil }
+                                    let intersection = frame.intersection(bounds)
+                                    guard !intersection.isNull,
+                                          intersection.width >= min(frame.width, 48),
+                                          intersection.height >= min(frame.height, 48) else { return nil }
+                                    return message.id
+                                })
+                                messenger.markVisibleIncomingMessagesRead(visibleIds)
+                            }
+                            .onChange(of: visibleMessages.count) { _ in
+                                if let last = visibleMessages.last { withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(last.id, anchor: .bottom) } }
+                            }
+                            .overlay {
+                                if visibleMessages.isEmpty {
+                                    EmptyState(title: "Open line", detail: "Messages in this conversation are end-to-end encrypted.", symbol: "waveform.path") { EmptyView() }
+                                }
                             }
                         }
                     }
@@ -598,7 +744,7 @@ private struct ChatScreen: View {
                             Button { messenger.discardPendingAttachment() } label: {
                                 Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                             }
-                            .disabled(messenger.isSendingAttachment || messenger.pendingAttachmentIsInSendQueue)
+                            .disabled(messenger.isSendingAttachment || !messenger.canDiscardPendingAttachment)
                             .accessibilityLabel("Discard pending attachment")
                         }
                         .padding(.horizontal, 16).padding(.vertical, 8)
@@ -731,6 +877,7 @@ private struct ChatScreen: View {
 
                         TextField("Write a message", text: $messageText, axis: .vertical)
                             .lineLimit(1...5).focused($composerFocused)
+                            .disabled(messenger.isBusy)
                             .padding(.horizontal, 13).padding(.vertical, 10)
                             .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20))
                             .privacySensitive()
@@ -798,6 +945,32 @@ private struct ChatScreen: View {
                         .accessibilityLabel("Verify this conversation")
                 }
             }
+            .sheet(item: $editingMessage) { message in
+                MessageEditSheet(message: message) { updatedBody in
+                    editingMessage = nil
+                    Task { await messenger.editMessage(message, newBody: updatedBody) }
+                }
+                .modifier(PrivateScenePrivacyShield())
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+            }
+            .confirmationDialog(
+                "Remove this message?",
+                isPresented: Binding(
+                    get: { messagePendingRedaction != nil },
+                    set: { if !$0 { messagePendingRedaction = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("Remove message", role: .destructive) {
+                    guard let message = messagePendingRedaction else { return }
+                    messagePendingRedaction = nil
+                    Task { await messenger.redactMessage(message) }
+                }
+                Button("Cancel", role: .cancel) { messagePendingRedaction = nil }
+            } message: {
+                Text("This removes the message for everyone in the conversation.")
+            }
             .onAppear { messageText = messenger.draft }
             .onChange(of: messageText) { text in messenger.updateDraft(text) }
             .onChange(of: messenger.messageSearchQuery) { query in messenger.searchMessagesDebounced(query) }
@@ -861,16 +1034,24 @@ private struct ChatScreen: View {
                     defer { if didStartAccess { source.stopAccessingSecurityScopedResource() } }
                     let staged = try MessengerAttachmentOutbox.stagePickedFile(from: source)
                     stagedURL = staged
-                    Task { await messenger.sendAttachment(fileURL: staged, forRoomId: targetRoomId) }
+                    Task {
+                        await messenger.sendAttachment(fileURL: staged, forRoomId: targetRoomId)
+                        attachmentTargetRoomId = nil
+                        isImportingAttachment = false
+                    }
                 } catch {
                     if let stagedURL { MessengerAttachmentOutbox.removeStagedFile(at: stagedURL) }
                     messenger.errorMessage = "Couldn't import that file. Choose it again."
+                    attachmentTargetRoomId = nil
+                    isImportingAttachment = false
                 }
-                attachmentTargetRoomId = nil
-                isImportingAttachment = false
             }
             .sheet(item: $openedAttachment, onDismiss: {
-                if let url = openedAttachment?.url { messenger.removeTemporaryMedia(at: url) }
+                // SwiftUI can clear the item binding before calling onDismiss;
+                // retain the protected temporary file URL separately so every
+                // decrypted preview is deleted when its sheet closes.
+                if let url = attachmentPreviewURLToDelete { messenger.removeTemporaryMedia(at: url) }
+                attachmentPreviewURLToDelete = nil
                 openedAttachment = nil
                 openingAttachmentID = nil
             }) { document in
@@ -912,6 +1093,7 @@ private struct ChatScreen: View {
         openingAttachmentID = message.id
         Task {
             if let url = await messenger.loadAttachmentForViewing(attachment) {
+                attachmentPreviewURLToDelete = url
                 openedAttachment = PreviewDocument(url: url)
             }
             openingAttachmentID = nil
@@ -953,9 +1135,12 @@ private struct PrivateScenePrivacyShield: ViewModifier {
 
 private struct MessageRow: View {
     let message: ChatMessage
+    let isGroup: Bool
     let onRetry: () -> Void
     let onReply: (ChatMessage) -> Void
     let onReact: (ChatMessage, String) -> Void
+    let onEdit: (ChatMessage) -> Void
+    let onRedact: (ChatMessage) -> Void
     let onOpenAttachment: (ChatMessage) -> Void
     var isAudioLoading = false
     var isAudioPlaying = false
@@ -999,7 +1184,14 @@ private struct MessageRow: View {
                 }
                 HStack(spacing: 5) {
                     Text(Date(timeIntervalSince1970: TimeInterval(message.timestamp) / 1_000).formatted(date: .omitted, time: .shortened))
-                    if message.isOwn { Text("· \((message.hasBeenRead ? "Read" : message.sendState).uppercased())") }
+                    if message.isOwn {
+                        let readLabel = isGroup ? "Seen" : "Read"
+                        let deliveryLabel = message.sendState.hasPrefix("Delivered to ")
+                            ? message.sendState
+                            : (message.hasBeenRead ? readLabel : message.sendState)
+                        Text("· \(deliveryLabel.uppercased())")
+                            .accessibilityLabel(deliveryLabel)
+                    }
                 }
                 .font(.system(size: 9, weight: .medium, design: .rounded)).tracking(0.5).foregroundStyle(.secondary)
                 if message.isOwn && message.canRetry {
@@ -1026,6 +1218,8 @@ private struct MessageRow: View {
         }
         .contextMenu {
             if message.canReply { Button("Reply", systemImage: "arrowshape.turn.up.left") { onReply(message) } }
+            if message.canEdit { Button("Edit", systemImage: "pencil") { onEdit(message) } }
+            if message.canRedact { Button("Remove message", systemImage: "trash", role: .destructive) { onRedact(message) } }
             ForEach(["👍", "❤️", "😂", "😮"], id: \.self) { emoji in
                 Button("React \(emoji)", systemImage: "face.smiling") { onReact(message, emoji) }
             }
@@ -1039,6 +1233,47 @@ private struct MessageRow: View {
         case .video: return "video"
         case .audio: return "waveform"
         case .file: return "doc"
+        }
+    }
+}
+
+private struct MessageEditSheet: View {
+    let message: ChatMessage
+    let onSave: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var bodyText: String
+    @FocusState private var editorFocused: Bool
+
+    init(message: ChatMessage, onSave: @escaping (String) -> Void) {
+        self.message = message
+        self.onSave = onSave
+        _bodyText = State(initialValue: message.body)
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Your edit is sent as an encrypted message update.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                TextEditor(text: $bodyText)
+                    .focused($editorFocused)
+                    .scrollContentBackground(.hidden)
+                    .padding(8)
+                    .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+                    .privacySensitive()
+            }
+            .padding()
+            .navigationTitle("Edit message")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") { onSave(bodyText) }
+                        .disabled(bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || bodyText == message.body)
+                }
+            }
         }
     }
 }

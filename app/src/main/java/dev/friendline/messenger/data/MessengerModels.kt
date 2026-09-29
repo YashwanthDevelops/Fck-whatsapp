@@ -9,6 +9,10 @@ data class ConversationSummary(
     val isEncrypted: Boolean,
     val isGroup: Boolean = false,
     val membership: String = "JOINED",
+    /** True only for the protocol-only room used to coordinate peer device verification. */
+    val isVerificationControl: Boolean = false,
+    /** The peer this control room verifies; null when the room is not a control room. */
+    val verificationPeerUserId: String? = null,
 )
 
 data class ChatMessage(
@@ -33,6 +37,7 @@ data class ChatAttachment(
     val fileName: String,
     val mimeType: String,
     val kind: AttachmentKind,
+    val sizeBytes: Long? = null,
 )
 
 enum class AttachmentKind {

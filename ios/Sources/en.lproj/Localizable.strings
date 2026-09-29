@@ -1,0 +1,2 @@
+/* Sygnal uses this localization key. Keep it generic; loc-args may contain sender metadata. */
+"MSG_FROM_USER" = "New message";

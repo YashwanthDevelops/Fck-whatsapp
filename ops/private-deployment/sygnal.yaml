@@ -39,3 +39,14 @@ apps:
     platform: production
     push_type: alert
     send_badge_counts: false
+
+  # Development iOS pusher app_id; APNs topic remains the app bundle ID.
+  dev.friendline.messenger.ios.dev:
+    type: apns
+    keyfile: /run/secrets/apns_auth_key.p8
+    key_id: REPLACE_WITH_APPLE_APNS_KEY_ID
+    team_id: REPLACE_WITH_APPLE_TEAM_ID
+    topic: dev.friendline.messenger.ios
+    platform: sandbox
+    push_type: alert
+    send_badge_counts: false

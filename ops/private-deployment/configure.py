@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import secrets
 import tempfile
 from pathlib import Path
-
-import yaml
 
 
 CONFIG_PATH = Path("/data/homeserver.yaml")
@@ -17,6 +16,31 @@ DOMAIN_PATTERN = re.compile(
     r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)"
     r"(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))+\Z"
 )
+RESERVED_DOMAIN_SUFFIXES = (".example", ".invalid", ".localhost", ".local", ".test")
+RESERVED_EXAMPLE_DOMAINS = (
+    "example.com",
+    "example.net",
+    "example.org",
+)
+
+
+def is_deployable_domain(domain: str) -> bool:
+    """Reject malformed and documentation-only names before fixing a Matrix ID domain."""
+    normalized = domain.lower()
+    if not DOMAIN_PATTERN.fullmatch(domain):
+        return False
+    try:
+        ipaddress.ip_address(normalized)
+    except ValueError:
+        pass
+    else:
+        return False
+    if normalized.endswith(RESERVED_DOMAIN_SUFFIXES):
+        return False
+    return not any(
+        normalized == reserved or normalized.endswith(f".{reserved}")
+        for reserved in RESERVED_EXAMPLE_DOMAINS
+    )
 
 
 def read_database_password() -> str:
@@ -45,8 +69,13 @@ def configure() -> None:
         raise SystemExit("Generate /data/homeserver.yaml with the Synapse image first.")
 
     domain = os.environ.get("MATRIX_DOMAIN", "")
-    if not DOMAIN_PATTERN.fullmatch(domain):
-        raise SystemExit("MATRIX_DOMAIN must be a stable, fully qualified DNS name you control.")
+    if not is_deployable_domain(domain):
+        raise SystemExit(
+            "MATRIX_DOMAIN must be a stable public DNS name you control; "
+            "documentation and local-only names are not deployable."
+        )
+
+    import yaml
 
     config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     if not isinstance(config, dict):
@@ -79,6 +108,7 @@ def configure() -> None:
     config["federation_domain_whitelist"] = []
     config["trusted_key_servers"] = []
     config["suppress_key_server_warning"] = True
+    config["max_upload_size"] = "34M"
 
     push = config.get("push") or {}
     push["include_content"] = False

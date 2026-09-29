@@ -2,6 +2,7 @@ import SwiftUI
 
 @main
 struct PrivateMessengerApp: App {
+    @UIApplicationDelegateAdaptor(PrivateMessengerAppDelegate.self) private var appDelegate
     @StateObject private var messenger = MessengerStore()
     @Environment(\.scenePhase) private var scenePhase
 

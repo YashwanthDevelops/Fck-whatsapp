@@ -47,6 +47,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -68,6 +69,7 @@ import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import dev.friendline.messenger.push.PushRegistrationStatus
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import dev.friendline.messenger.data.ConversationSummary
@@ -164,18 +166,27 @@ fun ConversationListScreen(
     connection: String,
     conversations: List<ConversationSummary>,
     readReceiptsEnabled: Boolean,
+    pushNotificationsEnabled: Boolean,
+    pushRegistrationStatus: PushRegistrationStatus,
+    pushNotificationsConfigured: Boolean,
     error: String?,
     onOpen: (String) -> Unit,
     onNew: () -> Unit,
     onLogout: () -> Unit,
     onReadReceiptsChange: (Boolean) -> Unit,
+    onPushNotificationsChange: (Boolean) -> Unit,
+    onRetryPushNotifications: () -> Unit,
+    onOpenNotificationSettings: () -> Unit,
     onClearError: () -> Unit,
+    isBusy: Boolean = false,
+    onJoinVerification: ((String) -> Unit)? = null,
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var showPrivacySettings by rememberSaveable { mutableStateOf(false) }
     val focusManager = LocalFocusManager.current
     val visible = remember(conversations, query) {
-        conversations.filter { row ->
+        conversations.filterNot { row -> row.isVerificationControl && row.membership != "INVITED" }
+            .filter { row ->
             query.isBlank() || row.title.contains(query, ignoreCase = true) || row.preview.contains(query, ignoreCase = true)
         }
     }
@@ -238,7 +249,8 @@ fun ConversationListScreen(
             Spacer(Modifier.height(14.dp))
             if (error != null) ErrorText(error, onClearError)
             when {
-                visible.isEmpty() && conversations.isEmpty() -> EmptyConversations(
+                visible.isEmpty() && conversations.none { it.membership == "INVITED" && it.isVerificationControl } &&
+                    conversations.none { !it.isVerificationControl } -> EmptyConversations(
                     isConnected = connection.equals("Connected", ignoreCase = true),
                     onNew = onNew,
                 )
@@ -255,7 +267,15 @@ fun ConversationListScreen(
                 }
                 else -> LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
                     itemsIndexed(visible, key = { _, row -> row.roomId }) { index, conversation ->
-                        ConversationRow(conversation, onClick = { onOpen(conversation.roomId) })
+                        if (conversation.isVerificationControl && conversation.membership == "INVITED") {
+                            VerificationInvitationRow(
+                                conversation = conversation,
+                                onJoin = onJoinVerification?.let { join -> { join(conversation.roomId) } },
+                                isBusy = isBusy,
+                            )
+                        } else {
+                            ConversationRow(conversation, onClick = { onOpen(conversation.roomId) })
+                        }
                         if (index != visible.lastIndex) HorizontalDivider(color = MaterialTheme.colorScheme.outline)
                     }
                 }
@@ -288,12 +308,111 @@ fun ConversationListScreen(
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    HorizontalDivider()
+                    Row(
+                        modifier = Modifier.fillMaxWidth().semantics(mergeDescendants = true) {},
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Message notifications", style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                if (pushNotificationsConfigured || pushRegistrationStatus == PushRegistrationStatus.REMOVAL_PENDING ||
+                                    pushRegistrationStatus == PushRegistrationStatus.REMOVING
+                                ) pushRegistrationStatus.displayText
+                                else PushRegistrationStatus.DISABLED.displayText,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = pushNotificationsConfigured && pushNotificationsEnabled,
+                            onCheckedChange = onPushNotificationsChange,
+                            enabled = pushNotificationsConfigured,
+                        )
+                    }
+                    if (pushNotificationsConfigured && pushRegistrationStatus == PushRegistrationStatus.PERMISSION_REQUIRED) {
+                        TextButton(onClick = onOpenNotificationSettings) {
+                            Text("Open notification settings")
+                        }
+                    }
+                    if (pushRegistrationStatus == PushRegistrationStatus.REMOVAL_PENDING ||
+                        pushRegistrationStatus == PushRegistrationStatus.FAILED ||
+                        pushRegistrationStatus == PushRegistrationStatus.PROVIDER_UNAVAILABLE
+                    ) {
+                        TextButton(onClick = onRetryPushNotifications) {
+                            Text(if (pushRegistrationStatus == PushRegistrationStatus.REMOVAL_PENDING) "Retry cleanup" else "Retry notification setup")
+                        }
+                    }
                 }
             },
             confirmButton = {
                 TextButton(onClick = { showPrivacySettings = false }) { Text("Done") }
             },
         )
+    }
+}
+
+@Composable
+private fun VerificationInvitationRow(
+    conversation: ConversationSummary,
+    onJoin: (() -> Unit)?,
+    isBusy: Boolean,
+) {
+    val peerLabel = conversation.verificationPeerUserId
+        ?.substringBefore(':')
+        ?.removePrefix("@")
+        ?.takeIf(String::isNotBlank)
+    val title = peerLabel?.let { "Verify device with $it" } ?: "Device verification invitation"
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    title,
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    "VERIFY",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+            Text(
+                "The homeserver can read verification protocol events in this channel. Message and media contents, and room keys, are never sent through this channel. Compare the same code in person or through another trusted channel before confirming.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Button(
+                onClick = { onJoin?.invoke() },
+                enabled = onJoin != null && !isBusy,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (isBusy && onJoin != null) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(10.dp))
+                    Text("Joining verification channel…")
+                } else {
+                    Text("Join verification channel")
+                }
+            }
+            if (onJoin == null) {
+                Text(
+                    "Joining is unavailable until secure verification-channel support is connected.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
     }
 }
 

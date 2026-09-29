@@ -27,9 +27,22 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: Private Messenger
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: Connect to your private development homeserver on the local network.
         INFOPLIST_KEY_NSMicrophoneUsageDescription: Record voice messages for encrypted conversations. Audio is encrypted on this device before it is sent.
+        INFOPLIST_KEY_MatrixPushEnabled: "$(MATRIX_PUSH_ENABLED)"
+        INFOPLIST_KEY_MatrixPushDomain: "$(MATRIX_PUSH_DOMAIN)"
+        INFOPLIST_KEY_MatrixPushAppID: "$(MATRIX_PUSH_APP_ID)"
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UIUserInterfaceStyle: Automatic
+        CODE_SIGN_ENTITLEMENTS: PrivateMessenger.entitlements
+        MATRIX_PUSH_ENABLED: NO
+        MATRIX_PUSH_DOMAIN: ""
+        MATRIX_PUSH_APP_ID: dev.friendline.messenger.ios
+        APS_ENVIRONMENT: development
       configs:
         debug:
           INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: YES
+          APS_ENVIRONMENT: development
+          MATRIX_PUSH_APP_ID: dev.friendline.messenger.ios.dev
+        release:
+          APS_ENVIRONMENT: production
+          MATRIX_PUSH_APP_ID: dev.friendline.messenger.ios

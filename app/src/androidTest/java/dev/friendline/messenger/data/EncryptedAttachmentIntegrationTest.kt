@@ -38,9 +38,6 @@ class EncryptedAttachmentIntegrationTest {
             }?.roomId ?: error("The proof account has no joined encrypted conversation")
             repository.openConversation(roomId)
 
-            val contentUri = FileProvider.getUriForFile(context, "${context.packageName}.files", fixture)
-            repository.sendAttachment(roomId, contentUri.toString())
-
             assertAttachmentRoundTrip(repository, roomId, fixture, AttachmentKind.FILE)
 
             val imageBytes = createTinyPng()

@@ -1,10 +1,39 @@
+import java.net.URI
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val pushEnabled = providers.gradleProperty("privateMessengerPushEnabled")
+    .map { it.toBooleanStrict() }
+    .getOrElse(false)
+val pushMatrixDomain = providers.gradleProperty("privateMessengerMatrixDomain")
+    .orNull
+    ?.trim()
+    .orEmpty()
+val validPushMatrixDomain = pushMatrixDomain.isNotEmpty() && runCatching {
+    val uri = URI("https://$pushMatrixDomain")
+    uri.scheme == "https" && !uri.host.isNullOrBlank() && uri.rawUserInfo == null &&
+        uri.rawQuery == null && uri.rawFragment == null && uri.rawPath.isNullOrEmpty()
+}.getOrDefault(false)
+require(!pushEnabled || validPushMatrixDomain) {
+    "privateMessengerPushEnabled requires privateMessengerMatrixDomain to be a DNS name (without scheme or path)."
+}
+
+// A missing local Firebase config leaves push unavailable without affecting ordinary builds.
+val hasGoogleServicesConfig = file("google-services.json").isFile ||
+    fileTree("src").matching { include("**/google-services.json") }.files.isNotEmpty()
+val effectivePushEnabled = pushEnabled && validPushMatrixDomain && hasGoogleServicesConfig
+if (effectivePushEnabled) {
+    apply(plugin = "com.google.gms.google-services")
+}
+
 val localDebugKeystore = providers.environmentVariable("PRIVATE_MESSENGER_DEBUG_KEYSTORE").orNull
 val localDebugKeystorePassword = providers.environmentVariable("PRIVATE_MESSENGER_DEBUG_KEYSTORE_PASSWORD").orNull ?: "android"
+
+fun buildConfigString(value: String): String =
+    "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
 
 android {
     namespace = "dev.friendline.messenger"
@@ -21,6 +50,8 @@ android {
         versionCode = 1
         versionName = "0.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField("boolean", "PUSH_ENABLED", effectivePushEnabled.toString())
+        buildConfigField("String", "PUSH_MATRIX_DOMAIN", buildConfigString(pushMatrixDomain))
     }
 
     flavorDimensions += "lane"
@@ -74,6 +105,7 @@ android {
 
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2026.09.00")
+    implementation(platform("com.google.firebase:firebase-bom:34.19.0"))
     implementation(composeBom)
     implementation("androidx.activity:activity-compose:1.13.0")
     implementation("androidx.core:core-ktx:1.18.0")
@@ -84,6 +116,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.11.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+    implementation("com.google.firebase:firebase-messaging")
     implementation("org.matrix.rustcomponents:sdk-android:26.09.9")
 
     debugImplementation("androidx.compose.ui:ui-tooling")

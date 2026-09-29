@@ -15,12 +15,16 @@ struct Conversation: Identifiable, Equatable {
     let unreadCount: Int
     let isEncrypted: Bool
     let isGroup: Bool
+    let isInvitation: Bool
+    let isVerificationControl: Bool
+    let verificationPeerUserId: String?
 }
 
 struct ChatMessage: Identifiable, Equatable {
     let id: String
     let eventId: String?
     let isRemote: Bool
+    let canMarkAsRead: Bool
     let sender: String
     let body: String
     let timestamp: UInt64
@@ -28,6 +32,8 @@ struct ChatMessage: Identifiable, Equatable {
     let sendState: String
     let canRetry: Bool
     let canReply: Bool
+    let canEdit: Bool
+    let canRedact: Bool
     let replyToEventId: String?
     let reactions: [MessageReaction]
     let hasBeenRead: Bool
@@ -44,6 +50,7 @@ enum AttachmentKind: Equatable {
 struct ChatAttachment: Equatable {
     let fileName: String
     let mimeType: String
+    let sizeBytes: UInt64?
     let sourceJson: String
     let kind: AttachmentKind
     let operationId: String?
@@ -156,9 +163,13 @@ private final class MessengerVerificationDelegate: SessionVerificationController
 }
 
 enum MessengerMediaStorage {
-    static func directory() throws -> URL {
-        var root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+    private static var rootURL: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("PrivateMessengerMedia", isDirectory: true)
+    }
+
+    static func directory() throws -> URL {
+        let root = rootURL
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
@@ -180,7 +191,10 @@ enum MessengerMediaStorage {
     }
 
     static func removeTemporaryMedia(at url: URL) {
-        guard url.deletingLastPathComponent().standardizedFileURL == (try? directory().standardizedFileURL) else { return }
+        // Cleanup must not depend on `directory()` succeeding: that method also
+        // reapplies file protection, and a protection error must not strand a
+        // just-written plaintext download or legacy upload file.
+        guard url.deletingLastPathComponent().standardizedFileURL == rootURL.standardizedFileURL else { return }
         try? FileManager.default.removeItem(at: url)
     }
 
@@ -191,7 +205,10 @@ enum MessengerMediaStorage {
     }
 
     static func removeAll() {
-        guard let root = try? directory() else { return }
+        // As above, cleanup remains available if directory protection setup
+        // failed during the operation that created a temporary plaintext file.
+        let root = rootURL
+        guard FileManager.default.fileExists(atPath: root.path) else { return }
         for item in (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {
             try? FileManager.default.removeItem(at: item)
         }
@@ -206,9 +223,14 @@ struct PendingAttachmentManifest: Codable, Equatable {
     let displayFileName: String
     let audioDuration: TimeInterval?
     let sdkEventOrTransactionId: String?
+    let sdkSendAttempted: Bool?
+    let sdkAttachmentSendCompleted: Bool?
+    let sdkUploadSource: String?
 
     init(operationId: String, roomId: String, userId: String, homeserverUrl: String,
-         displayFileName: String, audioDuration: TimeInterval?, sdkEventOrTransactionId: String? = nil) {
+         displayFileName: String, audioDuration: TimeInterval?, sdkEventOrTransactionId: String? = nil,
+         sdkSendAttempted: Bool? = nil, sdkAttachmentSendCompleted: Bool? = nil,
+         sdkUploadSource: String? = nil) {
         self.operationId = operationId
         self.roomId = roomId
         self.userId = userId
@@ -216,6 +238,9 @@ struct PendingAttachmentManifest: Codable, Equatable {
         self.displayFileName = displayFileName
         self.audioDuration = audioDuration
         self.sdkEventOrTransactionId = sdkEventOrTransactionId
+        self.sdkSendAttempted = sdkSendAttempted
+        self.sdkAttachmentSendCompleted = sdkAttachmentSendCompleted
+        self.sdkUploadSource = sdkUploadSource
     }
 }
 
@@ -245,6 +270,8 @@ private enum MessengerProtectedMetadata {
 }
 
 enum MessengerAttachmentOutbox {
+    static let maximumUploadPayloadBytes = 32 * 1024 * 1024
+    private static let maximumLegacyQueuePayloadBytes: UInt64 = 100 * 1024 * 1024
     private static let folderName = "MediaOutbox"
     private static let manifestName = "pending-attachment.json"
     private static let marker = "\u{2063}"
@@ -258,11 +285,14 @@ enum MessengerAttachmentOutbox {
         let operationId = UUID().uuidString.lowercased()
         let displayName = MessengerMediaStorage.safeFileName(displayFileName)
         let values = try source.resourceValues(forKeys: [.fileSizeKey])
-        guard (values.fileSize ?? 0) <= 100 * 1024 * 1024 else { throw MessengerError.attachmentTooLarge }
+        guard let sourceByteCount = values.fileSize, sourceByteCount > 0 else {
+            throw MessengerError.attachmentUnavailable
+        }
+        guard sourceByteCount <= maximumUploadPayloadBytes else { throw MessengerError.attachmentTooLarge }
         let directory = try operationDirectory(operationId: operationId, create: true)
         let staged = directory.appendingPathComponent("payload.sealed")
         do {
-            let plaintext = try Data(contentsOf: source, options: [.mappedIfSafe])
+            let plaintext = try readBoundedData(from: source, maximumBytes: maximumUploadPayloadBytes)
             let key = try DeviceVault().loadMediaOutboxKey()
             let associatedData = Data("\(operationId)|\(displayName)".utf8)
             let sealed = try AES.GCM.seal(plaintext, using: SymmetricKey(data: key), authenticating: associatedData)
@@ -323,18 +353,60 @@ enum MessengerAttachmentOutbox {
 
     static func materializeForUpload(_ manifest: PendingAttachmentManifest) throws -> URL {
         let encryptedURL = try fileURL(for: manifest)
+        let values = try encryptedURL.resourceValues(forKeys: [.fileSizeKey])
+        guard let fileSize = values.fileSize, fileSize > 0,
+              UInt64(fileSize) <= maximumLegacyQueuePayloadBytes + 64 else {
+            throw MessengerError.attachmentTooLarge
+        }
         let sealedData = try Data(contentsOf: encryptedURL, options: [.mappedIfSafe])
         let box = try AES.GCM.SealedBox(combined: sealedData)
         let key = try DeviceVault().loadMediaOutboxKey()
         let associatedData = Data("\(manifest.operationId)|\(manifest.displayFileName)".utf8)
         let plaintext = try AES.GCM.open(box, using: SymmetricKey(data: key), authenticating: associatedData)
+        guard !plaintext.isEmpty, UInt64(plaintext.count) <= maximumLegacyQueuePayloadBytes else {
+            throw MessengerError.attachmentTooLarge
+        }
         let uploadDirectory = try MessengerMediaStorage.directory()
         let destination = uploadDirectory.appendingPathComponent(
             uploadFileName(operationId: manifest.operationId, displayFileName: manifest.displayFileName)
         )
-        try plaintext.write(to: destination, options: [.atomic])
-        try MessengerMediaStorage.protectPrivateFile(at: destination)
-        return destination
+        do {
+            try plaintext.write(to: destination, options: [.atomic])
+            try MessengerMediaStorage.protectPrivateFile(at: destination)
+            return destination
+        } catch {
+            // The write can succeed before setting complete file protection
+            // fails. Remove any partial or unprotected plaintext before
+            // propagating the error to the recovery path.
+            MessengerMediaStorage.removeTemporaryMedia(at: destination)
+            throw error
+        }
+    }
+
+    static func loadUploadData(_ manifest: PendingAttachmentManifest, maximumBytes: UInt64) throws -> Data {
+        guard maximumBytes > 0 else { throw MessengerError.attachmentTooLarge }
+        let encryptedURL = try fileURL(for: manifest)
+        let values = try encryptedURL.resourceValues(forKeys: [.fileSizeKey])
+        guard let fileSize = values.fileSize, fileSize > 0 else { throw MessengerError.attachmentUnavailable }
+        let maximumArchiveBytes = maximumBytes.addingReportingOverflow(64)
+        guard !maximumArchiveBytes.overflow,
+              UInt64(fileSize) <= maximumArchiveBytes.partialValue else {
+            throw MessengerError.attachmentTooLarge
+        }
+
+        let sealedData = try Data(contentsOf: encryptedURL, options: [.mappedIfSafe])
+        let box = try AES.GCM.SealedBox(combined: sealedData)
+        let key = try DeviceVault().loadMediaOutboxKey()
+        let associatedData = Data("\(manifest.operationId)|\(manifest.displayFileName)".utf8)
+        let plaintext = try AES.GCM.open(box, using: SymmetricKey(data: key), authenticating: associatedData)
+        guard !plaintext.isEmpty, UInt64(plaintext.count) <= maximumBytes else {
+            throw MessengerError.attachmentTooLarge
+        }
+        return plaintext
+    }
+
+    static func sdkUploadFileName(for manifest: PendingAttachmentManifest) -> String {
+        uploadFileName(operationId: manifest.operationId, displayFileName: manifest.displayFileName)
     }
 
     static func temporaryUploadURL(for manifest: PendingAttachmentManifest) throws -> URL {
@@ -491,6 +563,22 @@ enum MessengerAttachmentOutbox {
         return marker + String(String.UnicodeScalarView(encodedMarker)) + MessengerMediaStorage.safeFileName(displayFileName)
     }
 
+    private static func readBoundedData(from source: URL, maximumBytes: Int) throws -> Data {
+        guard maximumBytes > 0 else { throw MessengerError.attachmentTooLarge }
+        let handle = try FileHandle(forReadingFrom: source)
+        defer { try? handle.close() }
+        var data = Data()
+        while data.count <= maximumBytes {
+            let remainingWithOverflowByte = maximumBytes + 1 - data.count
+            let chunk = try handle.read(upToCount: min(1_048_576, remainingWithOverflowByte)) ?? Data()
+            if chunk.isEmpty { break }
+            data.append(chunk)
+            guard data.count <= maximumBytes else { throw MessengerError.attachmentTooLarge }
+        }
+        guard !data.isEmpty else { throw MessengerError.attachmentUnavailable }
+        return data
+    }
+
     private struct OutboxMetadata: Codable {
         let displayFileName: String
     }
@@ -521,6 +609,7 @@ enum MessengerAttachmentOutbox {
 
 private struct DeliveryAcknowledgementLedger: Codable, Equatable {
     var accountKey: String
+    var snapshotFormatVersion = 2
     var pendingByRoom: [String: Set<String>] = [:]
     // Targets whose ACK already has a durable local echo in the Matrix SDK
     // send queue. Keep these separate from `sent`: queue insertion is not
@@ -530,12 +619,21 @@ private struct DeliveryAcknowledgementLedger: Codable, Equatable {
     var sent: Set<String> = []
     // Target event IDs for which an ACK was received from the peer.
     var received: Set<String> = []
+    // Recipient snapshots for outgoing events still identified by their local
+    // Matrix transaction ID. `RoomSendQueueUpdate.sentEvent` moves these to the
+    // stable server event ID after the homeserver accepts the send.
+    var expectedMembersByTransactionByRoom: [String: [String: Set<String>]] = [:]
     var expectedMembersByRoom: [String: [String: Set<String>]] = [:]
     var acknowledgedMembersByRoom: [String: [String: Set<String>]] = [:]
+    // ACKs can arrive before the send queue promotes our local transaction ID
+    // to a server event ID. Keep these encrypted-at-rest and tightly bounded
+    // until a recipient snapshot is available for validation.
+    var provisionalAcknowledgements: [ProvisionalDeliveryAcknowledgement] = []
 
     private enum CodingKeys: String, CodingKey {
-        case accountKey, pendingByRoom, queuedByRoom, sent, received
-        case expectedMembersByRoom, acknowledgedMembersByRoom
+        case accountKey, snapshotFormatVersion, pendingByRoom, queuedByRoom, sent, received
+        case expectedMembersByTransactionByRoom, expectedMembersByRoom, acknowledgedMembersByRoom
+        case provisionalAcknowledgements
     }
 
     init(accountKey: String) {
@@ -545,15 +643,60 @@ private struct DeliveryAcknowledgementLedger: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         accountKey = try values.decode(String.self, forKey: .accountKey)
+        snapshotFormatVersion = try values.decodeIfPresent(Int.self, forKey: .snapshotFormatVersion) ?? 0
         pendingByRoom = try values.decodeIfPresent([String: Set<String>].self, forKey: .pendingByRoom) ?? [:]
         // This key was added after the initial ledger format. Existing protected
         // ledgers remain readable and are upgraded the next time they change.
         queuedByRoom = try values.decodeIfPresent([String: Set<String>].self, forKey: .queuedByRoom) ?? [:]
         sent = try values.decodeIfPresent(Set<String>.self, forKey: .sent) ?? []
         received = try values.decodeIfPresent(Set<String>.self, forKey: .received) ?? []
-        expectedMembersByRoom = try values.decodeIfPresent([String: [String: Set<String>]].self, forKey: .expectedMembersByRoom) ?? [:]
-        acknowledgedMembersByRoom = try values.decodeIfPresent([String: [String: Set<String>]].self, forKey: .acknowledgedMembersByRoom) ?? [:]
+        if snapshotFormatVersion >= 2 {
+            expectedMembersByTransactionByRoom = try values.decodeIfPresent(
+                [String: [String: Set<String>]].self,
+                forKey: .expectedMembersByTransactionByRoom
+            ) ?? [:]
+            expectedMembersByRoom = try values.decodeIfPresent([String: [String: Set<String>]].self, forKey: .expectedMembersByRoom) ?? [:]
+            acknowledgedMembersByRoom = try values.decodeIfPresent([String: [String: Set<String>]].self, forKey: .acknowledgedMembersByRoom) ?? [:]
+        } else {
+            // Older snapshots were assembled from mutable room membership and
+            // are not safe to present as delivery evidence.
+            expectedMembersByTransactionByRoom = [:]
+            expectedMembersByRoom = [:]
+            acknowledgedMembersByRoom = [:]
+            received = []
+        }
+        provisionalAcknowledgements = try values.decodeIfPresent(
+            [ProvisionalDeliveryAcknowledgement].self,
+            forKey: .provisionalAcknowledgements
+        ) ?? []
+        provisionalAcknowledgements = Array(provisionalAcknowledgements.filter {
+            $0.eventId.hasPrefix("$") && $0.eventId.utf8.count <= 1_024
+        }.suffix(256)).map { value in
+            ProvisionalDeliveryAcknowledgement(
+                roomId: value.roomId,
+                eventId: value.eventId,
+                senderIds: Set(value.senderIds.filter { $0.utf8.count <= 1_024 }.prefix(16)),
+                recordedAt: value.recordedAt
+            )
+        }
     }
+}
+
+private struct ProvisionalDeliveryAcknowledgement: Codable, Equatable {
+    let roomId: String
+    let eventId: String
+    var senderIds: Set<String>
+    let recordedAt: UInt64
+}
+
+private struct DeliverySnapshotReservation {
+    let id: UUID
+    let recipientIds: Set<String>?
+}
+
+private struct ActiveDeliverySnapshotBinding {
+    let transactionId: String
+    var eventId: String?
 }
 
 func deliveryStatusLabel(
@@ -572,6 +715,15 @@ func deliveryStatusLabel(
     return acknowledged.isSuperset(of: expectedMemberIds)
         ? "Delivered to all \(expectedMemberIds.count)"
         : "Delivered to \(acknowledged.count) of \(expectedMemberIds.count)"
+}
+
+func addDeliveryAcknowledgement(
+    expectedMemberIds: Set<String>,
+    acknowledgedMemberIds: Set<String>,
+    acknowledgingMemberId: String
+) -> Set<String>? {
+    guard expectedMemberIds.contains(acknowledgingMemberId) else { return nil }
+    return acknowledgedMemberIds.intersection(expectedMemberIds).union([acknowledgingMemberId])
 }
 
 private struct SessionRecord: Codable {
@@ -606,9 +758,37 @@ private struct SessionRecord: Codable {
     }
 }
 
+private struct MatrixPusherIdentity: Codable, Equatable {
+    let homeserverUrl: String
+    let userId: String
+    let pushToken: String
+    let appId: String
+}
+
+private struct PendingPushRemoval: Codable {
+    let pusher: MatrixPusherIdentity
+    let resumeRegistration: Bool
+}
+
+private struct DeliveryAckTimelineSubscription {
+    let timeline: Timeline
+    let observer: TaskHandle
+    let token: UUID
+}
+
 @MainActor
 final class MessengerStore: ObservableObject {
+    private static let verificationControlRoomName = "Device verification"
+    private static let verificationControlRoomTopic = "org.friendline.verification-control.v1"
+    private static let verificationPeerJoinTimeout: Duration = .seconds(120)
+    private static let verificationPeerJoinPoll: Duration = .milliseconds(500)
+    private static let verificationRoomRouteSyncTimeout: Duration = .seconds(30)
+    private static let verificationRoomRouteSyncPoll: Duration = .milliseconds(500)
+#if DEBUG
     @Published var homeserver = "http://127.0.0.1:8008"
+#else
+    @Published var homeserver = ""
+#endif
     @Published var username = ""
     @Published var password = ""
     @Published private(set) var userId: String?
@@ -629,6 +809,8 @@ final class MessengerStore: ObservableObject {
     @Published private(set) var searchHasMore = false
     @Published private(set) var searchLoading = false
     @Published private(set) var readReceiptsEnabled = false
+    @Published private(set) var pushNotificationsEnabled = false
+    @Published private(set) var pushRegistrationStatus: PushRegistrationResult = .notEnabled
     @Published private(set) var isSendingAttachment = false
     @Published private(set) var pendingAttachmentURL: URL?
     @Published private(set) var pendingAttachmentDisplayName = ""
@@ -642,22 +824,37 @@ final class MessengerStore: ObservableObject {
     @Published private(set) var verificationEmojis: [VerificationSasEmoji] = []
     @Published private(set) var verificationDecimals: [UInt16] = []
     @Published private(set) var verificationIsBusy = false
+    @Published private(set) var isWaitingForVerificationChannelPeer = false
     @Published private(set) var isBusy = false
     @Published private(set) var isSigningOut = false
+    @Published private(set) var invitationActionsInProgress = Set<String>()
     @Published var errorMessage: String?
+
+    var canDiscardPendingAttachment: Bool {
+        !pendingAttachmentIsInSendQueue || pendingAttachmentSendHandle != nil
+    }
 
     private var client: Client?
     private var syncService: SyncService?
     private var syncObserver: TaskHandle?
     private var sendQueueStatusHandle: TaskHandle?
+    private var sendQueueUpdatesHandle: TaskHandle?
     private var activeTimeline: Timeline?
     private var timelineObserver: TaskHandle?
+    private var deliveryAckTimelineSubscriptions: [String: DeliveryAckTimelineSubscription] = [:]
+    private var deliveryAckObserverTokens: [String: UUID] = [:]
+    private var readReceiptEventIdsByRoom: [String: Set<String>] = [:]
     private var typingObserver: TaskHandle?
     private var refreshTask: Task<Void, Never>?
+    private var verificationPeerPrewarmScheduled = Set<String>()
     private var draftTask: Task<Void, Never>?
+    private var roomOpenGeneration = UUID()
+    private var replyTargetRoomId: String?
     private var typingStopTask: Task<Void, Never>?
     private var phaseTransitionTask: Task<Void, Never>?
     private var foregroundResumeRetryTask: Task<Void, Never>?
+    private var pushRegistrationTask: Task<Void, Never>?
+    private var pushRegistrationGeneration = UUID()
     private var searchDebounceTask: Task<Void, Never>?
     private var searchService: SearchService?
     private var searchResultsHandle: TaskHandle?
@@ -672,7 +869,18 @@ final class MessengerStore: ObservableObject {
     private var deliveryAckRetryTasks: [String: Task<Void, Never>] = [:]
     private var deliveryAckSendHandles: [String: SendHandle] = [:]
     private var deliveryAckFailureRecoverability: [String: Bool] = [:]
-    private var expectedDeliveryMemberIdsByRoom: [String: Set<String>] = [:]
+    private var pendingDeliverySnapshotReservationsByRoom: [String: [DeliverySnapshotReservation]] = [:]
+    private var deliverySnapshotBindingWaitersByRoom: [String: [UUID: CheckedContinuation<Bool, Never>]] = [:]
+    private var boundDeliverySnapshotReservationIds = Set<UUID>()
+    private var activeDeliverySnapshotBindingsByRoom: [String: [UUID: ActiveDeliverySnapshotBinding]] = [:]
+    private var deliverySnapshotCorrelationDisabledRoomIds = Set<String>()
+    // Track snapshots first correlated during this client session so a later
+    // ambiguity can invalidate every potentially misbound send, including one
+    // whose local-echo reservation has already completed.
+    private var deliverySnapshotTransactionIdsByRoom: [String: Set<String>] = [:]
+    private var deliverySnapshotEventIdsByRoom: [String: Set<String>] = [:]
+    private var roomSendGateOwners = Set<String>()
+    private var roomSendGateWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
     private var persistentStorageReady = false
     private var clientPausedForBackground = false
     private var syncServiceStoppedForBackground = false
@@ -688,6 +896,8 @@ final class MessengerStore: ObservableObject {
     private var pendingAttachment: PendingAttachmentManifest?
     private var pendingAttachmentRoomId: String?
     private var pendingAttachmentAudioDuration: TimeInterval?
+    private var pendingAttachmentSendHandle: SendHandle?
+    private var pendingAttachmentFailureRecoverable: Bool?
     private var attachmentOperation: Task<Void, Never>?
     private var attachmentOperationId: UUID?
     private var activeAttachmentHandle: SendAttachmentJoinHandle?
@@ -706,6 +916,18 @@ final class MessengerStore: ObservableObject {
         } catch {
             errorMessage = "Secure local storage could not be verified. Restart the app before signing in."
         }
+        pushNotificationsEnabled = (try? vault.loadPushNotificationsEnabled()) ?? false
+        pushRegistrationStatus = NativePushNotifications.isConfigured
+            ? (pushNotificationsEnabled ? .registering : .notEnabled)
+            : .disabled
+        if (try? vault.loadPendingPushRemoval()) != nil {
+            pushRegistrationStatus = .removalPending
+            if let pending = try? vault.loadPendingPushRemoval() {
+                pushNotificationsEnabled = pending.resumeRegistration
+                try? vault.savePushNotificationsEnabled(pending.resumeRegistration)
+            }
+        }
+        if pushNotificationsEnabled || (try? vault.loadPendingPushRemoval()) != nil { attachPushTokenObserver() }
         // Decrypted previews and recordings are transient. Pending uploads have a
         // separate protected outbox and survive process restarts.
         MessengerMediaStorage.removeAll()
@@ -758,11 +980,21 @@ final class MessengerStore: ObservableObject {
         }
         guard let record = try? vault.loadSession() else { return }
         readReceiptsEnabled = (try? vault.loadReadReceiptsEnabled()) ?? false
+        pushNotificationsEnabled = (try? vault.loadPushNotificationsEnabled()) ?? false
+        pushRegistrationStatus = NativePushNotifications.isConfigured
+            ? (pushNotificationsEnabled ? .registering : .notEnabled)
+            : .disabled
+        if let pending = try? vault.loadPendingPushRemoval() {
+            pushNotificationsEnabled = pending.resumeRegistration
+            try? vault.savePushNotificationsEnabled(pending.resumeRegistration)
+            pushRegistrationStatus = .removalPending
+        }
         isBusy = true
         do {
             let matrix = try await buildClient(homeserverUrl: record.homeserverUrl)
             try await matrix.restoreSession(session: record.sdkSession)
             await matrix.encryption().waitForE2eeInitializationTasks()
+            try protectMatrixStorage()
             try vault.saveStoreKeyIfNeeded()
             try vault.saveMediaOutboxKeyIfNeeded()
             try prepareAccountStorage(userId: record.userId, homeserverUrl: record.homeserverUrl)
@@ -770,8 +1002,18 @@ final class MessengerStore: ObservableObject {
             userId = record.userId
             homeserver = record.homeserverUrl
             await configureVerification(matrix)
+            if (try? vault.loadPendingPushRemoval()) != nil || !pushNotificationsEnabled {
+                let result = await unregisterPushRegistration(using: matrix, resumeRegistration: pushNotificationsEnabled)
+                pushRegistrationStatus = result == .removed && !pushNotificationsEnabled ? .notEnabled : result
+            }
             await beginSync(matrix)
             isBusy = false
+            if pushNotificationsEnabled && (try? vault.loadPendingPushRemoval()) == nil {
+                attachPushTokenObserver()
+                schedulePushRegistration(refreshAPNs: true)
+            } else if (try? vault.loadPendingPushRemoval()) != nil {
+                attachPushTokenObserver()
+            }
             if !isSigningOut { beginRoomRefresh() }
         } catch {
             isBusy = false
@@ -793,10 +1035,34 @@ final class MessengerStore: ObservableObject {
             return
         }
 
+        var unresolvedPusher: MatrixPusherIdentity?
+        do {
+            guard try vault.loadSession() == nil else {
+                errorMessage = "Sign out of the saved account before signing in to another account."
+                return
+            }
+            if let pending = try vault.loadPendingPushRemoval() {
+                unresolvedPusher = pending.pusher
+            } else {
+                unresolvedPusher = try vault.loadRegisteredPushPusher()
+            }
+            _ = try vault.ensureInstallGeneration(
+                localStateExists: FileManager.default.fileExists(atPath: Self.applicationDataRoot().path)
+            )
+            persistentStorageReady = true
+        } catch {
+            persistentStorageReady = false
+            errorMessage = "Secure local storage could not be verified. Restart the app before signing in."
+            return
+        }
+
         isBusy = true
         errorMessage = nil
+        var freshStoreMayExist = true
+        var freshClient: Client?
         do {
             let matrix = try await buildClient(homeserverUrl: validatedHomeserverUrl)
+            freshClient = matrix
             try await matrix.login(
                 username: username.trimmingCharacters(in: .whitespacesAndNewlines),
                 password: password,
@@ -805,22 +1071,85 @@ final class MessengerStore: ObservableObject {
             )
             await matrix.encryption().waitForE2eeInitializationTasks()
             let session = try matrix.session()
+            if let unresolvedPusher, !sameMatrixAccount(unresolvedPusher, session: session) {
+                throw VaultError.pushRemovalAccountMismatch
+            }
+            try protectMatrixStorage()
             try vault.save(session: SessionRecord(session))
             try vault.saveMediaOutboxKeyIfNeeded()
             try prepareAccountStorage(userId: session.userId, homeserverUrl: validatedHomeserverUrl)
             readReceiptsEnabled = (try? vault.loadReadReceiptsEnabled()) ?? false
+            pushNotificationsEnabled = (try? vault.loadPushNotificationsEnabled()) ?? false
+            pushRegistrationStatus = NativePushNotifications.isConfigured
+                ? (pushNotificationsEnabled ? .registering : .notEnabled)
+                : .disabled
+            if let pending = try vault.loadPendingPushRemoval() {
+                pushNotificationsEnabled = pending.resumeRegistration
+                try vault.savePushNotificationsEnabled(pending.resumeRegistration)
+                pushRegistrationStatus = .removalPending
+            }
             client = matrix
             userId = session.userId
             homeserver = validatedHomeserverUrl
             password = ""
             await configureVerification(matrix)
+            if (try vault.loadPendingPushRemoval()) != nil || !pushNotificationsEnabled {
+                let result = await unregisterPushRegistration(using: matrix, resumeRegistration: pushNotificationsEnabled)
+                pushRegistrationStatus = result == .removed && !pushNotificationsEnabled ? .notEnabled : result
+            }
             await beginSync(matrix)
             isBusy = false
+            if pushNotificationsEnabled {
+                attachPushTokenObserver()
+                schedulePushRegistration(refreshAPNs: true)
+            }
+            freshStoreMayExist = false
             if !isSigningOut { beginRoomRefresh() }
         } catch {
             isBusy = false
-            errorMessage = "Couldn't sign in. Check the homeserver, Matrix ID, and password, then try again."
+            if freshStoreMayExist {
+                if let freshClient { try? await freshClient.logout() }
+                client = nil
+                userId = nil
+                var cleanupFailed = false
+                do {
+                    try vault.clearFreshSignInArtifacts()
+                } catch {
+                    cleanupFailed = true
+                }
+                do {
+                    try removeFreshSignInStorage()
+                } catch {
+                    cleanupFailed = true
+                }
+                if cleanupFailed {
+                    vault.invalidateInstallGenerationDefault()
+                    persistentStorageReady = false
+                    errorMessage = "Sign in failed and secure local cleanup needs verification. Restart the app before signing in again."
+                    return
+                }
+                persistentStorageReady = true
+            }
+            if let vaultError = error as? VaultError, case .pushRemovalAccountMismatch = vaultError {
+                errorMessage = "This device has a pending alert removal for another account. Sign in to the saved account first."
+            } else {
+                errorMessage = "Couldn't sign in. Check the homeserver, Matrix ID, and password, then try again."
+            }
         }
+    }
+
+    private func waitForEncryptedRoom(client: Client, roomId: String) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(15)
+        while clock.now < deadline {
+            guard !Task.isCancelled else { throw CancellationError() }
+            if let room = try client.getRoom(roomId: roomId) {
+                let state = try await room.latestEncryptionState()
+                if state == .encrypted { return }
+            }
+            try await Task.sleep(for: .milliseconds(500))
+        }
+        throw MessengerError.encryptedRoomCreationFailed
     }
 
     func createConversation(matrixIds: String, name: String, isGroup: Bool) async {
@@ -861,10 +1190,7 @@ final class MessengerStore: ObservableObject {
                 joinRuleOverride: .invite
             )
             let roomId = try await client.createRoom(request: request)
-            guard let createdRoom = client.rooms().first(where: { $0.id() == roomId }),
-                  createdRoom.encryptionState() == .encrypted else {
-                throw MessengerError.encryptedRoomCreationFailed
-            }
+            try await waitForEncryptedRoom(client: client, roomId: roomId)
             await refreshConversations()
             await openConversation(roomId)
             isBusy = false
@@ -874,11 +1200,167 @@ final class MessengerStore: ObservableObject {
         }
     }
 
+    func acceptRoomInvitation(_ roomId: String) async {
+        guard !invitationActionsInProgress.contains(roomId), beginClientOperation() else { return }
+        invitationActionsInProgress.insert(roomId)
+        defer {
+            invitationActionsInProgress.remove(roomId)
+            endClientOperation()
+        }
+        guard let client, let room = client.rooms().first(where: { $0.id() == roomId }) else { return }
+        do {
+            let before = try await room.roomInfo()
+            guard before.membership == .invited else {
+                errorMessage = "This invitation is no longer available. Refresh the conversation list."
+                await refreshConversations()
+                return
+            }
+            guard before.topic != Self.verificationControlRoomTopic else {
+                errorMessage = "Join this device-verification channel from its dedicated invitation card."
+                return
+            }
+            guard before.encryptionState == .encrypted else {
+                errorMessage = "This invitation is not encrypted, so it cannot be joined in Private Messenger. Ask the inviter to create an encrypted conversation."
+                return
+            }
+            try await room.join()
+            let after = try await room.roomInfo()
+            guard after.membership == .joined, after.encryptionState == .encrypted else {
+                errorMessage = "The encrypted invitation could not be verified after joining. Try again after syncing."
+                await refreshConversations()
+                return
+            }
+            await refreshConversations()
+            await openConversation(roomId)
+        } catch {
+            errorMessage = "Couldn't accept this encrypted invitation. Try again when connected."
+            await refreshConversations()
+        }
+    }
+
+    func joinVerificationControlRoom(_ roomId: String) async {
+        guard !invitationActionsInProgress.contains(roomId), beginClientOperation() else { return }
+        invitationActionsInProgress.insert(roomId)
+        defer {
+            invitationActionsInProgress.remove(roomId)
+            endClientOperation()
+        }
+        guard let client, let room = client.rooms().first(where: { $0.id() == roomId }) else {
+            errorMessage = "This verification invitation is no longer available. Refresh the conversation list."
+            return
+        }
+
+        do {
+            let info = try await room.roomInfo()
+            guard info.topic == Self.verificationControlRoomTopic,
+                  info.membership == .invited,
+                  info.encryptionState == .notEncrypted,
+                  info.joinRule == .invite,
+                  info.historyVisibility == .joined,
+                  info.joinedMembersCount + info.invitedMembersCount <= 2,
+                  let peerUserId = info.inviter?.userId else {
+                errorMessage = "This invitation is not a valid private verification channel. Leave it unopened and ask your contact to resend it."
+                return
+            }
+
+            guard try await isPeerMemberOfEncryptedConversation(peerUserId, outside: roomId, on: client) else {
+                errorMessage = "Only join a verification channel sent by someone in an existing encrypted conversation."
+                return
+            }
+
+            // The SDK can fetch an identity from the homeserver when it is not
+            // already tracked. It does not provide a forced refresh for a
+            // cached identity, so this is a best-effort prewarm, not a stale-key refresh.
+            try await prewarmVerificationPeer(peerUserId, on: client, retryIfAlreadyAttempted: true)
+            try await room.join()
+
+            let joinedInfo = try await room.roomInfo()
+            guard joinedInfo.topic == Self.verificationControlRoomTopic,
+                  joinedInfo.membership == .joined,
+                  joinedInfo.encryptionState == .notEncrypted,
+                  joinedInfo.joinRule == .invite,
+                  joinedInfo.historyVisibility == .joined,
+                  joinedInfo.joinedMembersCount + joinedInfo.invitedMembersCount <= 2 else {
+                errorMessage = "The verification channel did not join with the expected private protocol-only settings."
+                await refreshConversations()
+                return
+            }
+            try await selectVerificationControlRoom(peerUserId, roomId: roomId, on: client)
+            await refreshConversations()
+        } catch {
+            errorMessage = "Couldn't join this verification channel. Confirm it came from someone in an existing encrypted conversation, then sync and try again."
+            await refreshConversations()
+        }
+    }
+
+    func declineRoomInvitation(_ roomId: String) async {
+        guard !invitationActionsInProgress.contains(roomId), beginClientOperation() else { return }
+        invitationActionsInProgress.insert(roomId)
+        defer {
+            invitationActionsInProgress.remove(roomId)
+            endClientOperation()
+        }
+        guard let client, let room = client.rooms().first(where: { $0.id() == roomId }) else { return }
+        do {
+            let info = try await room.roomInfo()
+            guard info.membership == .invited else {
+                await refreshConversations()
+                return
+            }
+            try await room.leave()
+            await refreshConversations()
+        } catch {
+            errorMessage = "Couldn't decline this invitation. Try again when connected."
+            await refreshConversations()
+        }
+    }
+
     func openConversation(_ roomId: String) async {
         guard beginClientOperation() else { return }
         defer { endClientOperation() }
         guard let client,
               let room = client.rooms().first(where: { $0.id() == roomId }) else { return }
+
+        do {
+            let info = try await room.roomInfo()
+            guard info.membership == .joined else {
+                errorMessage = "Accept this invitation before opening the conversation."
+                return
+            }
+            guard info.topic != Self.verificationControlRoomTopic else {
+                errorMessage = "Device-verification channels are protocol-only and cannot be opened as conversations."
+                return
+            }
+            guard info.encryptionState == .encrypted else {
+                errorMessage = "This conversation is not encrypted, so it cannot be opened."
+                return
+            }
+        } catch {
+            errorMessage = "Couldn't verify this conversation's membership and encryption. Try again after syncing."
+            return
+        }
+
+        let generation = UUID()
+        roomOpenGeneration = generation
+        isBusy = true
+        if let previousRoomId = currentRoomId {
+            let previousDraft = draft
+            let previousDraftTask = draftTask
+            draftTask?.cancel()
+            draftTask = nil
+            typingStopTask?.cancel()
+            typingStopTask = nil
+            if let previousDraftTask { await previousDraftTask.value }
+            guard roomOpenGeneration == generation, !isSigningOut else { return }
+            await setTyping(false, roomId: previousRoomId)
+            await persistDraft(roomId: previousRoomId, text: previousDraft)
+            guard roomOpenGeneration == generation, !isSigningOut else { return }
+            if previousRoomId != roomId, replyTargetRoomId == previousRoomId {
+                replyTarget = nil
+                replyTargetRoomId = nil
+            }
+        }
+
         timelineObserver?.cancel()
         typingObserver?.cancel()
         activeTimeline?.close()
@@ -891,23 +1373,29 @@ final class MessengerStore: ObservableObject {
         currentRoomIsGroup = false
         currentPeerUserId = nil
         currentPeerTrust = .unknown
-        isBusy = true
         do {
             let info = try await room.roomInfo()
+            guard roomOpenGeneration == generation, !isSigningOut else { return }
             currentRoomTitle = info.displayName ?? roomId
-            currentRoomIsGroup = !info.isDirect
-            let expectedMembers: Set<String>
+            currentRoomIsGroup = info.joinedMembersCount + info.invitedMembersCount > 2
+            let membership: (joinedRecipients: Set<String>, activeHumanMembers: Set<String>)
             if currentRoomEncrypted {
-                expectedMembers = try await activeHumanMemberIds(in: room)
+                membership = try await humanMembershipSnapshot(in: room)
+                guard roomOpenGeneration == generation, !isSigningOut else { return }
             } else {
-                expectedMembers = []
+                membership = (joinedRecipients: [], activeHumanMembers: [])
             }
-            expectedDeliveryMemberIdsByRoom[roomId] = expectedMembers
-            if currentRoomEncrypted, expectedMembers.count == 1, let peerUserId = expectedMembers.first {
+            if currentRoomEncrypted, membership.activeHumanMembers.count == 1,
+               let peerUserId = membership.activeHumanMembers.first {
                 currentPeerUserId = peerUserId
                 await refreshCurrentPeerTrust(fallbackToServer: true)
+                guard roomOpenGeneration == generation, !isSigningOut else { return }
             }
             let timeline = try await room.timeline()
+            guard roomOpenGeneration == generation, !isSigningOut else {
+                timeline.close()
+                return
+            }
             activeTimeline = timeline
             let listener = TimelineObserver { [weak self] diff in
                 Task { @MainActor in
@@ -915,18 +1403,25 @@ final class MessengerStore: ObservableObject {
                     self.apply(diff: diff, roomId: roomId)
                 }
             }
-            timelineObserver = await timeline.addListener(listener: listener)
+            let observer = await timeline.addListener(listener: listener)
+            guard roomOpenGeneration == generation, !isSigningOut else {
+                observer.cancel()
+                timeline.close()
+                return
+            }
+            timelineObserver = observer
             let typing = TypingObserver { [weak self] ids in
                 Task { @MainActor in self?.typingUsers = ids.filter { $0 != self?.userId } }
             }
             typingObserver = room.subscribeToTypingNotifications(listener: typing)
-            if readReceiptsEnabled { try? await timeline.markAsRead(receiptType: .read) }
+            guard roomOpenGeneration == generation, !isSigningOut else { return }
             draft = try await room.loadComposerDraft(threadRoot: nil)?.plainText ?? ""
+            guard roomOpenGeneration == generation, !isSigningOut else { return }
             isBusy = false
         } catch {
+            guard roomOpenGeneration == generation else { return }
             currentRoomId = nil
             currentRoomIsGroup = false
-            expectedDeliveryMemberIdsByRoom[roomId] = nil
             pendingAttachmentURL = nil
             pendingAttachmentForCurrentRoom = false
             isBusy = false
@@ -937,9 +1432,14 @@ final class MessengerStore: ObservableObject {
     func closeConversation() {
         let roomId = currentRoomId
         let savedDraft = draft
+        let previousDraftTask = draftTask
         draftTask?.cancel()
+        draftTask = nil
         typingStopTask?.cancel()
+        typingStopTask = nil
+        roomOpenGeneration = UUID()
         Task {
+            if let previousDraftTask { await previousDraftTask.value }
             await setTyping(false, roomId: roomId)
             await persistDraft(roomId: roomId, text: savedDraft)
         }
@@ -959,9 +1459,11 @@ final class MessengerStore: ObservableObject {
         currentRoomIsGroup = false
         currentPeerUserId = nil
         currentPeerTrust = .unknown
+        isBusy = false
         messages = []
         draft = ""
         replyTarget = nil
+        replyTargetRoomId = nil
         messageSearchQuery = ""
         typingUsers = []
     }
@@ -971,16 +1473,351 @@ final class MessengerStore: ObservableObject {
         do {
             try vault.saveReadReceiptsEnabled(enabled)
             readReceiptsEnabled = enabled
-            if enabled, let activeTimeline {
-                Task { @MainActor [weak self] in
-                    guard let self, self.beginClientOperation() else { return }
-                    defer { self.endClientOperation() }
-                    try? await activeTimeline.markAsRead(receiptType: .read)
-                }
-            }
         } catch {
             errorMessage = "Couldn't save your privacy setting."
         }
+    }
+
+    func markVisibleIncomingMessagesRead(_ messageIds: Set<String>) {
+        guard !isSigningOut, !clientPausedForBackground,
+              requestedClientSceneState != .background,
+              readReceiptsEnabled, currentRoomEncrypted,
+              let roomId = currentRoomId,
+              let timeline = activeTimeline else { return }
+        let generation = roomOpenGeneration
+        let eventIds = Set(messages.compactMap { message -> String? in
+            guard messageIds.contains(message.id), message.canMarkAsRead,
+                  message.isRemote, !message.isOwn else { return nil }
+            return message.eventId
+        })
+        for eventId in eventIds where !readReceiptEventIdsByRoom[roomId, default: []].contains(eventId) {
+            readReceiptEventIdsByRoom[roomId, default: []].insert(eventId)
+            Task { @MainActor [weak self] in
+                guard let self, self.beginClientOperation() else { return }
+                defer { self.endClientOperation() }
+                guard !self.isSigningOut, !self.clientPausedForBackground,
+                      self.requestedClientSceneState != .background, self.readReceiptsEnabled,
+                      self.currentRoomId == roomId, self.roomOpenGeneration == generation else {
+                    self.readReceiptEventIdsByRoom[roomId]?.remove(eventId)
+                    return
+                }
+                do {
+                    try await timeline.sendReadReceipt(receiptType: .read, eventId: eventId)
+                } catch {
+                    self.readReceiptEventIdsByRoom[roomId]?.remove(eventId)
+                }
+            }
+        }
+    }
+
+    func setPushNotificationsEnabled(_ enabled: Bool) async {
+        guard !isSigningOut else { return }
+        if enabled && !NativePushNotifications.isConfigured {
+            pushRegistrationStatus = .disabled
+            return
+        }
+
+        pushRegistrationGeneration = UUID()
+        let pendingRegistration = pushRegistrationTask
+        pushRegistrationTask = nil
+        pendingRegistration?.cancel()
+        if let pendingRegistration { await pendingRegistration.value }
+
+        if !enabled {
+            let hasPendingRemoval: Bool
+            do {
+                hasPendingRemoval = try preparePendingPushRemoval(using: client, resumeRegistration: false)
+            } catch {
+                pushRegistrationStatus = .removalPending
+                errorMessage = "Couldn't save the alert removal request. Keep this account signed in and retry."
+                return
+            }
+            do {
+                try vault.savePushNotificationsEnabled(false)
+            } catch {
+                errorMessage = "Couldn't save your notification setting. The alert removal will still be retried."
+            }
+            pushNotificationsEnabled = false
+            APNSTokenStore.shared.onTokenChange = nil
+            await NativePushNotifications.clearDeliveredNotifications()
+            let result = hasPendingRemoval
+                ? await attemptPendingPushRemoval(using: client)
+                : .removed
+            pushRegistrationStatus = result == .removed ? .notEnabled : .removalPending
+            if result != .removed {
+                errorMessage = "Couldn't remove this device from message alerts. Keep this account signed in and retry."
+            }
+            return
+        }
+
+        do {
+            try vault.savePushNotificationsEnabled(true)
+        } catch {
+            errorMessage = "Couldn't save your notification setting."
+            pushRegistrationStatus = .failed
+            return
+        }
+        pushNotificationsEnabled = true
+
+        attachPushTokenObserver()
+        pushRegistrationStatus = .registering
+        let generation = pushRegistrationGeneration
+        do {
+            let authorized = try await NativePushNotifications.requestPermissionAndRegister()
+            guard pushNotificationsEnabled, !isSigningOut, generation == pushRegistrationGeneration else { return }
+            guard authorized else {
+                pushRegistrationStatus = .permissionRequired
+                return
+            }
+            schedulePushRegistration(refreshAPNs: false)
+        } catch {
+            guard pushNotificationsEnabled, !isSigningOut, generation == pushRegistrationGeneration else { return }
+            pushRegistrationStatus = .failed
+        }
+    }
+
+    func refreshPushNotificationsIfNeeded() {
+        guard !isSigningOut else { return }
+        guard pushNotificationsEnabled else {
+            guard NativePushNotifications.isConfigured else {
+                pushRegistrationStatus = .disabled
+                return
+            }
+            Task { @MainActor [weak self] in
+                guard let self, !self.isSigningOut else { return }
+                let result = await self.unregisterPushRegistration(using: self.client, resumeRegistration: false)
+                self.pushRegistrationStatus = result == .removed ? .notEnabled : .removalPending
+            }
+            return
+        }
+        schedulePushRegistration(refreshAPNs: true)
+    }
+
+    func retryPendingPushRemoval() async {
+        guard !isSigningOut else { return }
+        let result = await unregisterPushRegistration(using: client, resumeRegistration: pushNotificationsEnabled)
+        if result == .removed, pushNotificationsEnabled {
+            schedulePushRegistration(refreshAPNs: false)
+        } else {
+            pushRegistrationStatus = result == .removed ? .notEnabled : result
+        }
+        if result != .removed {
+            errorMessage = "Couldn't remove this device from message alerts. Keep this account signed in and retry."
+        }
+    }
+
+    private func attachPushTokenObserver() {
+        APNSTokenStore.shared.onTokenChange = { [weak self] token in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isSigningOut else { return }
+                let hasPendingRemoval = (try? self.vault.loadPendingPushRemoval()) != nil
+                guard self.pushNotificationsEnabled || hasPendingRemoval else { return }
+                guard token != nil else {
+                    if !hasPendingRemoval { self.pushRegistrationStatus = .tokenUnavailable }
+                    return
+                }
+                if self.pushNotificationsEnabled {
+                    self.schedulePushRegistration(refreshAPNs: false)
+                } else {
+                    let result = await self.unregisterPushRegistration(using: self.client, resumeRegistration: false)
+                    self.pushRegistrationStatus = result == .removed ? .notEnabled : .removalPending
+                }
+            }
+        }
+    }
+
+    private func schedulePushRegistration(refreshAPNs: Bool) {
+        guard !isSigningOut, pushNotificationsEnabled else { return }
+        guard NativePushNotifications.isConfigured else {
+            pushRegistrationStatus = .disabled
+            return
+        }
+        guard client != nil else {
+            pushRegistrationStatus = .tokenUnavailable
+            return
+        }
+
+        pushRegistrationGeneration = UUID()
+        let generation = pushRegistrationGeneration
+        let previous = pushRegistrationTask
+        previous?.cancel()
+        pushRegistrationStatus = .registering
+        pushRegistrationTask = Task { @MainActor [weak self] in
+            if let previous { await previous.value }
+            guard let self, !Task.isCancelled, self.pushRegistrationGeneration == generation,
+                  self.pushNotificationsEnabled, !self.isSigningOut else { return }
+            do {
+                if let pending = try self.vault.loadPendingPushRemoval() {
+                    try self.vault.savePendingPushRemoval(
+                        PendingPushRemoval(pusher: pending.pusher, resumeRegistration: true)
+                    )
+                }
+            } catch {
+                self.pushRegistrationStatus = .removalPending
+                return
+            }
+            let removalResult = await self.attemptPendingPushRemoval(using: self.client)
+            guard removalResult == .removed else {
+                self.pushRegistrationStatus = .removalPending
+                return
+            }
+            if refreshAPNs {
+                await NativePushNotifications.refreshAPNsRegistrationIfAuthorized()
+            }
+            await self.registerPushForActiveSession(generation: generation)
+        }
+    }
+
+    private func registerPushForActiveSession(generation: UUID) async {
+        guard !isSigningOut, pushNotificationsEnabled, generation == pushRegistrationGeneration else { return }
+        guard NativePushNotifications.isConfigured else {
+            pushRegistrationStatus = .disabled
+            return
+        }
+        guard let activeClient = client, let session = try? activeClient.session() else {
+            pushRegistrationStatus = .tokenUnavailable
+            return
+        }
+
+        guard let pushToken = NativePushNotifications.currentToken, !pushToken.isEmpty else {
+            pushRegistrationStatus = .tokenUnavailable
+            return
+        }
+        let pusher = MatrixPusherIdentity(
+            homeserverUrl: session.homeserverUrl,
+            userId: session.userId,
+            pushToken: pushToken,
+            appId: NativePushNotifications.appID
+        )
+        var priorPusher: MatrixPusherIdentity?
+        do {
+            if let oldPusher = try vault.loadRegisteredPushPusher(), oldPusher != pusher {
+                guard sameMatrixAccount(oldPusher, session: session) else {
+                    pushRegistrationStatus = .removalPending
+                    return
+                }
+                try vault.savePendingPushRemoval(PendingPushRemoval(pusher: oldPusher, resumeRegistration: true))
+                let removalResult = await attemptPendingPushRemoval(using: activeClient)
+                guard removalResult == .removed else {
+                    pushRegistrationStatus = .removalPending
+                    return
+                }
+            } else {
+                priorPusher = try vault.loadRegisteredPushPusher()
+            }
+            // Save before the network request so a process interruption after the
+            // server accepts registration cannot leave an untracked pusher.
+            try vault.saveRegisteredPushPusher(pusher)
+        } catch {
+            pushRegistrationStatus = .failed
+            return
+        }
+
+        let result = await NativePushNotifications.register(
+            homeserverURL: session.homeserverUrl,
+            accessToken: session.accessToken,
+            pushToken: pushToken
+        )
+        guard client === activeClient, !isSigningOut, pushNotificationsEnabled,
+              generation == pushRegistrationGeneration else { return }
+        if result == .permissionRequired {
+            do {
+                if let priorPusher { try vault.saveRegisteredPushPusher(priorPusher) }
+                else { try vault.clearRegisteredPushPusher() }
+            } catch {
+                pushRegistrationStatus = .removalPending
+                return
+            }
+        }
+        pushRegistrationStatus = result
+    }
+
+    private func preparePendingPushRemoval(using activeClient: Client?, resumeRegistration: Bool) throws -> Bool {
+        let session = try? activeClient?.session()
+        if let pending = try vault.loadPendingPushRemoval() {
+            if let session, !sameMatrixAccount(pending.pusher, session: session) {
+                throw VaultError.pushRemovalAccountMismatch
+            }
+            try vault.savePendingPushRemoval(
+                PendingPushRemoval(pusher: pending.pusher, resumeRegistration: resumeRegistration)
+            )
+            return true
+        }
+
+        let knownPusher = try vault.loadRegisteredPushPusher()
+        if let knownPusher {
+            if let session, !sameMatrixAccount(knownPusher, session: session) {
+                throw VaultError.pushRemovalAccountMismatch
+            }
+            try vault.savePendingPushRemoval(
+                PendingPushRemoval(pusher: knownPusher, resumeRegistration: resumeRegistration)
+            )
+            return true
+        }
+
+        guard let activeClient, let session, let pushToken = NativePushNotifications.currentToken,
+              !pushToken.isEmpty else { return false }
+        let pusher = MatrixPusherIdentity(
+            homeserverUrl: session.homeserverUrl,
+            userId: session.userId,
+            pushToken: pushToken,
+            appId: NativePushNotifications.appID
+        )
+        _ = activeClient
+        try vault.savePendingPushRemoval(
+            PendingPushRemoval(pusher: pusher, resumeRegistration: resumeRegistration)
+        )
+        return true
+    }
+
+    private func attemptPendingPushRemoval(using activeClient: Client?) async -> PushRegistrationResult {
+        let pending: PendingPushRemoval
+        do {
+            guard let saved = try vault.loadPendingPushRemoval() else { return .removed }
+            pending = saved
+        } catch {
+            return .removalPending
+        }
+        guard let activeClient, let session = try? activeClient.session(),
+              sameMatrixAccount(pending.pusher, session: session) else {
+            return .removalPending
+        }
+
+        pushRegistrationStatus = .removing
+        let result = await NativePushNotifications.unregister(
+            homeserverURL: pending.pusher.homeserverUrl,
+            accessToken: session.accessToken,
+            pushToken: pending.pusher.pushToken,
+            appID: pending.pusher.appId
+        )
+        guard result == .removed else { return .removalPending }
+        do {
+            if !pending.resumeRegistration {
+                try vault.savePushNotificationsEnabled(false)
+            }
+            try vault.completePendingPushRemoval()
+            return .removed
+        } catch {
+            return .removalPending
+        }
+    }
+
+    private func unregisterPushRegistration(
+        using activeClient: Client?,
+        resumeRegistration: Bool
+    ) async -> PushRegistrationResult {
+        do {
+            guard try preparePendingPushRemoval(using: activeClient, resumeRegistration: resumeRegistration) else {
+                return .removed
+            }
+        } catch {
+            return .removalPending
+        }
+        return await attemptPendingPushRemoval(using: activeClient)
+    }
+
+    private func sameMatrixAccount(_ pusher: MatrixPusherIdentity, session: Session) -> Bool {
+        pusher.homeserverUrl == session.homeserverUrl && pusher.userId == session.userId
     }
 
     func requestDeviceVerification() async {
@@ -1004,10 +1841,14 @@ final class MessengerStore: ObservableObject {
     func requestPeerVerification() async {
         guard beginClientOperation() else { return }
         defer { endClientOperation() }
-        guard let verificationController, let peerUserId = currentPeerUserId,
-              currentRoomEncrypted, !verificationIsBusy,
+        guard let client, let verificationController, let peerUserId = currentPeerUserId,
+              let sourceRoomId = currentRoomId, currentRoomEncrypted, !verificationIsBusy,
               verificationStep == .idle || verificationStep == .verified || verificationStep == .failed || verificationStep == .cancelled else {
             errorMessage = "Open an encrypted one-to-one conversation to verify its other member."
+            return
+        }
+        guard let sourceRoom = client.rooms().first(where: { $0.id() == sourceRoomId }) else {
+            errorMessage = "The encrypted conversation is no longer available. Sync and try again."
             return
         }
         resetVerificationPresentation()
@@ -1017,10 +1858,28 @@ final class MessengerStore: ObservableObject {
         verificationStep = .waitingForPeer
         verificationIsBusy = true
         defer { verificationIsBusy = false }
-        do { try await verificationController.requestUserVerification(userId: peerUserId) }
-        catch {
+        do {
+            let sourceInfo = try await sourceRoom.roomInfo()
+            let members = try await humanMembershipSnapshot(in: sourceRoom)
+            guard sourceInfo.membership == .joined,
+                  sourceInfo.encryptionState == .encrypted,
+                  members.activeHumanMembers == Set([peerUserId]) else {
+                throw MessengerError.messageUnavailable
+            }
+
+            let controlRoomId = try await ensureVerificationControlRoom(for: peerUserId, on: client)
+            try await selectVerificationControlRoom(peerUserId, roomId: controlRoomId, on: client)
+            isWaitingForVerificationChannelPeer = true
+            defer { isWaitingForVerificationChannelPeer = false }
+            guard try await waitForVerificationPeer(peerUserId, toJoin: controlRoomId, on: client) else {
+                throw VerificationControlChannelError.peerDidNotJoin
+            }
+            try await prewarmVerificationPeer(peerUserId, on: client, retryIfAlreadyAttempted: true)
+            try await assertVerificationControlRoomSelected(peerUserId, roomId: controlRoomId, on: client)
+            try await verificationController.requestUserVerification(userId: peerUserId)
+        } catch {
             verificationStep = .failed
-            errorMessage = "Couldn't request verification. Ask the other person to open this conversation and accept."
+            errorMessage = "Couldn't request verification. Ask the other person to join the private verification invitation, then retry. Compare the SAS code out of band before confirming."
         }
     }
 
@@ -1158,20 +2017,331 @@ final class MessengerStore: ObservableObject {
         verificationDeviceId = ""
         verificationEmojis = []
         verificationDecimals = []
+        isWaitingForVerificationChannelPeer = false
         verificationStep = .idle
     }
 
-    private func activeHumanMemberIds(in room: Room) async throws -> Set<String> {
-        guard let userId else { return [] }
+    private func ensureVerificationControlRoom(for peerUserId: String, on client: Client) async throws -> String {
+        for room in client.rooms() {
+            guard let info = try? await room.roomInfo() else { continue }
+            guard info.topic == Self.verificationControlRoomTopic,
+                  info.membership == .joined,
+                  info.encryptionState == .notEncrypted,
+                  info.joinRule == .invite,
+                  info.historyVisibility == .joined,
+                  info.joinedMembersCount + info.invitedMembersCount <= 2 else { continue }
+            guard let members = try? await humanMembershipSnapshot(in: room) else { continue }
+            guard members.activeHumanMembers == Set([peerUserId]) else { continue }
+            return room.id()
+        }
+
+        let roomId = try await client.createRoom(request: CreateRoomParameters(
+            name: Self.verificationControlRoomName,
+            topic: Self.verificationControlRoomTopic,
+            isEncrypted: false,
+            isDirect: true,
+            visibility: .private,
+            preset: .privateChat,
+            invite: [peerUserId],
+            joinRuleOverride: .invite,
+            historyVisibilityOverride: .joined
+        ))
+        guard let room = client.rooms().first(where: { $0.id() == roomId }) else {
+            throw VerificationControlChannelError.roomUnavailable
+        }
+        let info = try await room.roomInfo()
+        let members = try await humanMembershipSnapshot(in: room)
+        guard info.topic == Self.verificationControlRoomTopic,
+              info.membership == .joined,
+              info.encryptionState == .notEncrypted,
+              info.joinRule == .invite,
+              info.historyVisibility == .joined,
+              info.joinedMembersCount + info.invitedMembersCount <= 2,
+              members.activeHumanMembers == Set([peerUserId]) else {
+            throw VerificationControlChannelError.invalidRoom
+        }
+        return roomId
+    }
+
+    private func selectVerificationControlRoom(_ peerUserId: String, roomId: String, on client: Client) async throws {
+        var mapping = try await directRoomMapping(on: client)
+        mapping[peerUserId] = [roomId]
+        let data = try JSONSerialization.data(withJSONObject: mapping, options: [.sortedKeys])
+        guard let content = String(data: data, encoding: .utf8) else {
+            throw VerificationControlChannelError.invalidDirectMapping
+        }
+        try await client.setAccountData(eventType: "m.direct", content: content)
+
+        // The homeserver write completes before Matrix sync updates the SDK's local account-data
+        // and room caches. Wait for both caches to converge before the SDK selects a DM for SAS.
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.verificationRoomRouteSyncTimeout)
+        while clock.now < deadline {
+            let saved = try await directRoomMapping(on: client)
+            if (saved[peerUserId] as? [String]) == [roomId],
+               try client.getDmRoom(userId: peerUserId)?.id() == roomId {
+                return
+            }
+            try await Task.sleep(for: Self.verificationRoomRouteSyncPoll)
+        }
+        throw VerificationControlChannelError.directRoomNotSelected
+    }
+
+    private func assertVerificationControlRoomSelected(_ peerUserId: String, roomId: String, on client: Client) async throws {
+        let mapping = try await directRoomMapping(on: client)
+        guard (mapping[peerUserId] as? [String]) == [roomId],
+              try client.getDmRoom(userId: peerUserId)?.id() == roomId else {
+            throw VerificationControlChannelError.directRoomNotSelected
+        }
+    }
+
+    private func directRoomMapping(on client: Client) async throws -> [String: Any] {
+        guard let content = try await client.accountData(eventType: "m.direct") else { return [:] }
+        guard let data = content.data(using: .utf8),
+              let mapping = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw VerificationControlChannelError.invalidDirectMapping
+        }
+        return mapping
+    }
+
+    private func directPeer(for roomId: String, in mapping: [String: Any]) -> String? {
+        for (peerUserId, value) in mapping where (value as? [String])?.contains(roomId) == true {
+            return peerUserId
+        }
+        return nil
+    }
+
+    private func prewarmVerificationPeer(
+        _ peerUserId: String,
+        on client: Client,
+        retryIfAlreadyAttempted: Bool = false
+    ) async throws {
+        if retryIfAlreadyAttempted {
+            verificationPeerPrewarmScheduled.insert(peerUserId)
+        } else if !verificationPeerPrewarmScheduled.insert(peerUserId).inserted {
+            return
+        }
+        do {
+            // Matrix Rust SDK FFI is cache-first. fallbackToServer fetches only
+            // when the identity is absent; it cannot force-refresh stale cache data.
+            _ = try await client.encryption().userIdentity(userId: peerUserId, fallbackToServer: true)
+        } catch {
+            verificationPeerPrewarmScheduled.remove(peerUserId)
+            throw error
+        }
+    }
+
+    private func isPeerMemberOfEncryptedConversation(
+        _ peerUserId: String,
+        outside excludedRoomId: String,
+        on client: Client
+    ) async throws -> Bool {
+        for room in client.rooms() where room.id() != excludedRoomId && room.encryptionState() == .encrypted {
+            guard let info = try? await room.roomInfo() else { continue }
+            guard info.membership == .joined, info.encryptionState == .encrypted else { continue }
+            guard let members = try? await humanMembershipSnapshot(in: room) else { continue }
+            if members.activeHumanMembers.contains(peerUserId) { return true }
+        }
+        return false
+    }
+
+    private func waitForVerificationPeer(_ peerUserId: String, toJoin roomId: String, on client: Client) async throws -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.verificationPeerJoinTimeout)
+        while clock.now < deadline {
+            guard let room = client.rooms().first(where: { $0.id() == roomId }) else {
+                try await Task.sleep(for: Self.verificationPeerJoinPoll)
+                continue
+            }
+            let info = try await room.roomInfo()
+            guard info.topic == Self.verificationControlRoomTopic,
+                  info.membership == .joined,
+                  info.encryptionState == .notEncrypted,
+                  info.joinRule == .invite,
+                  info.historyVisibility == .joined,
+                  info.joinedMembersCount + info.invitedMembersCount <= 2 else {
+                throw VerificationControlChannelError.invalidRoom
+            }
+            if info.joinedMembersCount >= 2 {
+                let members = try await humanMembershipSnapshot(in: room)
+                guard members.activeHumanMembers.contains(peerUserId) else {
+                    throw VerificationControlChannelError.unexpectedParticipant
+                }
+                return true
+            }
+            try await Task.sleep(for: Self.verificationPeerJoinPoll)
+        }
+        return false
+    }
+
+    private func humanMembershipSnapshot(in room: Room) async throws -> (joinedRecipients: Set<String>, activeHumanMembers: Set<String>) {
+        guard let userId else { throw MessengerError.messageUnavailable }
         let iterator = try await room.members()
-        var memberIds = Set<String>()
+        var joinedRecipients = Set<String>()
+        var activeHumanMembers = Set<String>()
         while let chunk = iterator.nextChunk(chunkSize: 64) {
-            for member in chunk where member.userId != userId && !member.isServiceMember &&
-                (member.membership == .join || member.membership == .invite) {
-                memberIds.insert(member.userId)
+            for member in chunk where member.userId != userId && !member.isServiceMember {
+                if member.membership == .join {
+                    joinedRecipients.insert(member.userId)
+                    activeHumanMembers.insert(member.userId)
+                } else if member.membership == .invite {
+                    // Preserve the existing peer-verification behavior for an
+                    // invited direct-room peer. Invited users are not delivery
+                    // recipients until they have joined and can decrypt events.
+                    activeHumanMembers.insert(member.userId)
+                }
             }
         }
-        return memberIds
+        return (joinedRecipients: joinedRecipients, activeHumanMembers: activeHumanMembers)
+    }
+
+    private func acquireRoomSendGate(_ roomId: String) async {
+        guard roomSendGateOwners.contains(roomId) else {
+            roomSendGateOwners.insert(roomId)
+            return
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            roomSendGateWaiters[roomId, default: []].append(continuation)
+        }
+    }
+
+    private func releaseRoomSendGate(_ roomId: String) {
+        if var waiters = roomSendGateWaiters[roomId], !waiters.isEmpty {
+            let next = waiters.removeFirst()
+            roomSendGateWaiters[roomId] = waiters.isEmpty ? nil : waiters
+            next.resume()
+        } else {
+            roomSendGateOwners.remove(roomId)
+            roomSendGateWaiters[roomId] = nil
+        }
+    }
+
+    private func withTrackedRoomQueueWrite<Result>(
+        roomId: String,
+        room: Room? = nil,
+        capturesDeliverySnapshot: Bool = false,
+        operation: () async throws -> Result
+    ) async throws -> Result {
+        await acquireRoomSendGate(roomId)
+        defer { releaseRoomSendGate(roomId) }
+
+        guard sendQueueUpdatesHandle != nil,
+              !deliverySnapshotCorrelationDisabledRoomIds.contains(roomId) else {
+            return try await operation()
+        }
+
+        var recipientIds: Set<String>?
+        if capturesDeliverySnapshot, let room,
+           let membership = try? await humanMembershipSnapshot(in: room) {
+            recipientIds = membership.joinedRecipients
+        }
+        let reservation = DeliverySnapshotReservation(id: UUID(), recipientIds: recipientIds)
+        pendingDeliverySnapshotReservationsByRoom[roomId, default: []].append(reservation)
+
+        let result: Result
+        do {
+            result = try await operation()
+        } catch {
+            removePendingDeliverySnapshotReservation(reservation.id, in: roomId)
+            disableDeliverySnapshotCorrelation(in: roomId)
+            throw error
+        }
+
+        if !(await waitForDeliverySnapshotBinding(reservation.id, in: roomId)) {
+            disableDeliverySnapshotCorrelation(in: roomId)
+        } else {
+            if var bindings = activeDeliverySnapshotBindingsByRoom[roomId] {
+                bindings[reservation.id] = nil
+                activeDeliverySnapshotBindingsByRoom[roomId] = bindings.isEmpty ? nil : bindings
+            }
+        }
+        return result
+    }
+
+    private func removePendingDeliverySnapshotReservation(_ reservationId: UUID, in roomId: String) {
+        guard var reservations = pendingDeliverySnapshotReservationsByRoom[roomId] else { return }
+        reservations.removeAll { $0.id == reservationId }
+        pendingDeliverySnapshotReservationsByRoom[roomId] = reservations.isEmpty ? nil : reservations
+    }
+
+    private func waitForDeliverySnapshotBinding(_ reservationId: UUID, in roomId: String) async -> Bool {
+        if boundDeliverySnapshotReservationIds.remove(reservationId) != nil { return true }
+        if deliverySnapshotCorrelationDisabledRoomIds.contains(roomId) { return false }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            deliverySnapshotBindingWaitersByRoom[roomId, default: [:]][reservationId] = continuation
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(2))
+                guard let self,
+                      let waiter = self.deliverySnapshotBindingWaitersByRoom[roomId]?.removeValue(forKey: reservationId) else { return }
+                if self.deliverySnapshotBindingWaitersByRoom[roomId]?.isEmpty == true {
+                    self.deliverySnapshotBindingWaitersByRoom[roomId] = nil
+                }
+                waiter.resume(returning: false)
+                self.disableDeliverySnapshotCorrelation(in: roomId)
+            }
+        }
+    }
+
+    private func disableDeliverySnapshotCorrelation(in roomId: String) {
+        deliverySnapshotCorrelationDisabledRoomIds.insert(roomId)
+        pendingDeliverySnapshotReservationsByRoom[roomId] = nil
+        let activeBindings = activeDeliverySnapshotBindingsByRoom.removeValue(forKey: roomId) ?? [:]
+        var updated = deliveryAckLedger
+        var transactions = updated.expectedMembersByTransactionByRoom[roomId] ?? [:]
+        var events = updated.expectedMembersByRoom[roomId] ?? [:]
+        var acknowledged = updated.acknowledgedMembersByRoom[roomId] ?? [:]
+        for binding in activeBindings.values {
+            transactions[binding.transactionId] = nil
+            if let eventId = binding.eventId {
+                events[eventId] = nil
+                acknowledged[eventId] = nil
+                updated.received.remove(eventId)
+                updated.provisionalAcknowledgements.removeAll {
+                    $0.roomId == roomId && $0.eventId == eventId
+                }
+            }
+        }
+        updated.expectedMembersByTransactionByRoom[roomId] = transactions.isEmpty ? nil : transactions
+        updated.expectedMembersByRoom[roomId] = events.isEmpty ? nil : events
+        updated.acknowledgedMembersByRoom[roomId] = acknowledged.isEmpty ? nil : acknowledged
+
+        // A NewLocalEvent observed while a reservation was waiting may have
+        // consumed the wrong reservation. Its binding can have outlived the
+        // caller's wait and may already have been promoted to an event ID.
+        // Purge every snapshot correlated in this session, not just active
+        // bindings, so an ambiguous mapping can never authorize an ACK.
+        let correlatedTransactions = deliverySnapshotTransactionIdsByRoom.removeValue(forKey: roomId) ?? []
+        var expectedByTransaction = updated.expectedMembersByTransactionByRoom[roomId] ?? [:]
+        for transactionId in correlatedTransactions {
+            expectedByTransaction[transactionId] = nil
+        }
+        updated.expectedMembersByTransactionByRoom[roomId] = expectedByTransaction.isEmpty ? nil : expectedByTransaction
+
+        let correlatedEvents = deliverySnapshotEventIdsByRoom.removeValue(forKey: roomId) ?? []
+        var expectedByEvent = updated.expectedMembersByRoom[roomId] ?? [:]
+        var acknowledgementsByEvent = updated.acknowledgedMembersByRoom[roomId] ?? [:]
+        for eventId in correlatedEvents {
+            expectedByEvent[eventId] = nil
+            acknowledgementsByEvent[eventId] = nil
+            updated.received.remove(eventId)
+        }
+        updated.expectedMembersByRoom[roomId] = expectedByEvent.isEmpty ? nil : expectedByEvent
+        updated.acknowledgedMembersByRoom[roomId] = acknowledgementsByEvent.isEmpty ? nil : acknowledgementsByEvent
+        if !correlatedEvents.isEmpty {
+            updated.provisionalAcknowledgements.removeAll {
+                $0.roomId == roomId && correlatedEvents.contains($0.eventId)
+            }
+        }
+        deliverySnapshotTransactionIdsByRoom[roomId] = nil
+        deliverySnapshotEventIdsByRoom[roomId] = nil
+        if updated != deliveryAckLedger {
+            deliveryAckLedger = updated
+            deliveryAckLedgerDirty = true
+        }
+        let waiters = deliverySnapshotBindingWaitersByRoom.removeValue(forKey: roomId) ?? [:]
+        for waiter in waiters.values { waiter.resume(returning: false) }
+        if deliveryAckLedgerDirty { queuePendingDeliveryAcknowledgements(in: roomId) }
+        refreshDeliveryStates()
     }
 
     private func refreshCurrentPeerTrust(fallbackToServer: Bool = false) async {
@@ -1341,16 +2511,26 @@ final class MessengerStore: ObservableObject {
             }
         }
         draftTask?.cancel()
+        draftTask = nil
+        guard let roomId else { return }
+        let savedText = value
         draftTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(350))
+            do { try await Task.sleep(for: .milliseconds(350)) }
+            catch { return }
             guard !Task.isCancelled else { return }
-            await self?.persistDraft()
+            await self?.persistDraft(roomId: roomId, text: savedText)
         }
     }
 
     func setReplyTarget(_ message: ChatMessage?) {
-        guard message == nil || (message?.canReply == true && message?.eventId != nil) else { return }
+        guard let message else {
+            replyTarget = nil
+            replyTargetRoomId = nil
+            return
+        }
+        guard message.canReply, message.eventId != nil, let roomId = currentRoomId else { return }
         replyTarget = message
+        replyTargetRoomId = roomId
     }
 
     func toggleReaction(_ message: ChatMessage, key: String) async {
@@ -1363,8 +2543,60 @@ final class MessengerStore: ObservableObject {
         let identifier: EventOrTransactionId = message.isRemote
             ? .eventId(eventId: message.eventId ?? message.id)
             : .transactionId(transactionId: message.id)
-        do { _ = try await timeline.toggleReaction(itemId: identifier, key: key) }
+        do {
+            _ = try await withTrackedRoomQueueWrite(roomId: roomId) {
+                try await timeline.toggleReaction(itemId: identifier, key: key)
+            }
+        }
         catch { errorMessage = "Couldn't send that encrypted reaction. Try again after syncing." }
+    }
+
+    func editMessage(_ message: ChatMessage, newBody: String) async {
+        guard beginClientOperation() else { return }
+        defer { endClientOperation() }
+        let body = newBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty, message.canEdit, message.isOwn,
+              let roomId = currentRoomId,
+              let room = client?.rooms().first(where: { $0.id() == roomId }),
+              room.encryptionState() == .encrypted,
+              let timeline = activeTimeline,
+              let content = timeline.createMessageContent(
+                msgType: .text(content: TextMessageContent(body: body, formatted: nil))
+              ) else { return }
+        let identifier: EventOrTransactionId = message.isRemote
+            ? .eventId(eventId: message.eventId ?? message.id)
+            : .transactionId(transactionId: message.id)
+        do {
+            try await withTrackedRoomQueueWrite(roomId: roomId) {
+                try await timeline.edit(
+                    eventOrTransactionId: identifier,
+                    newContent: .roomMessage(content: content)
+                )
+            }
+        } catch {
+            errorMessage = "Couldn't edit this encrypted message. Try again after syncing."
+        }
+    }
+
+    func redactMessage(_ message: ChatMessage) async {
+        guard beginClientOperation() else { return }
+        defer { endClientOperation() }
+        guard message.canRedact, message.isOwn, message.isRemote,
+              let roomId = currentRoomId,
+              let room = client?.rooms().first(where: { $0.id() == roomId }),
+              room.encryptionState() == .encrypted,
+              let timeline = activeTimeline,
+              let eventId = message.eventId else { return }
+        do {
+            try await withTrackedRoomQueueWrite(roomId: roomId) {
+                try await timeline.redactEvent(
+                    eventOrTransactionId: .eventId(eventId: eventId),
+                    reason: nil
+                )
+            }
+        } catch {
+            errorMessage = "Couldn't remove this encrypted message. Try again after syncing."
+        }
     }
 
     func sendMessage(_ text: String) async {
@@ -1380,47 +2612,80 @@ final class MessengerStore: ObservableObject {
             return
         }
         errorMessage = nil
-        let replyEventId = replyTarget?.eventId
+        let replyEventId = replyTargetRoomId == roomId ? replyTarget?.eventId : nil
         do {
             let text = TextMessageContent(body: body, formatted: nil)
             guard let content = timeline.createMessageContent(msgType: .text(content: text)) else {
                 throw MessengerError.messageUnavailable
             }
-            if let replyEventId {
-                _ = try await timeline.sendReply(msg: content, eventId: replyEventId)
-            } else {
-                _ = try await timeline.send(msg: content)
+            try await withTrackedRoomQueueWrite(
+                roomId: roomId,
+                room: room,
+                capturesDeliverySnapshot: true
+            ) {
+                if let replyEventId {
+                    try await timeline.sendReply(msg: content, eventId: replyEventId)
+                } else {
+                    _ = try await timeline.send(msg: content)
+                }
             }
-            replyTarget = nil
-            await setTyping(false, roomId: roomId)
-            try await room.clearComposerDraft(threadRoot: nil)
-            draft = ""
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            await refreshConversations()
         } catch {
-            draft = body
+            if currentRoomId == roomId { draft = body }
             errorMessage = "Couldn't send this message. It is still in the composer; try again."
+            return
         }
+
+        // The SDK send call has already accepted the event into its local send
+        // queue. A later draft-store failure must not make the UI claim that
+        // sending failed or restore the text as if it were unsent.
+        await setTyping(false, roomId: roomId)
+        var draftClearFailed = false
+        do { try await room.clearComposerDraft(threadRoot: nil) }
+        catch { draftClearFailed = true }
+        if currentRoomId == roomId {
+            if let replyEventId, replyTargetRoomId == roomId, replyTarget?.eventId == replyEventId {
+                replyTarget = nil
+                replyTargetRoomId = nil
+            }
+            draft = ""
+        }
+        if draftClearFailed {
+            errorMessage = "Message sent, but the saved draft could not be cleared. Check the conversation before sending it again."
+        }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        await refreshConversations()
     }
 
     func sendAttachment(fileURL: URL, forRoomId expectedRoomId: String, audioDuration: TimeInterval? = nil) async {
+        let discardUnretainedInput: () -> Void = { [self] in
+            guard fileURL.lastPathComponent == "payload.sealed" else {
+                // Voice recordings are temporary plaintext files owned by this
+                // app. Imported files live in the encrypted outbox, and URLs
+                // outside our private cache are intentionally left untouched.
+                MessengerMediaStorage.removeTemporaryMedia(at: fileURL)
+                return
+            }
+            guard pendingAttachmentURL != fileURL else { return }
+            if let staged = try? MessengerAttachmentOutbox.describe(fileURL),
+               pendingAttachment?.operationId == staged.operationId {
+                return
+            }
+            MessengerAttachmentOutbox.removeStagedFile(at: fileURL)
+        }
+
         guard beginClientOperation() else {
-            if pendingAttachmentURL != fileURL { MessengerAttachmentOutbox.removeStagedFile(at: fileURL) }
+            discardUnretainedInput()
             return
         }
         defer { endClientOperation() }
         guard !isSendingAttachment else {
-            if pendingAttachmentURL != fileURL { MessengerAttachmentOutbox.removeStagedFile(at: fileURL) }
+            discardUnretainedInput()
             return
         }
         guard currentRoomId == expectedRoomId,
               let room = client?.rooms().first(where: { $0.id() == expectedRoomId }),
               room.encryptionState() == .encrypted else {
-            if fileURL.lastPathComponent == "payload.sealed",
-               let staged = try? MessengerAttachmentOutbox.describe(fileURL),
-               pendingAttachment?.operationId != staged.operationId {
-                MessengerAttachmentOutbox.removeStagedFile(at: fileURL)
-            }
+            discardUnretainedInput()
             errorMessage = "Attachments can only be sent in an encrypted conversation."
             return
         }
@@ -1435,9 +2700,11 @@ final class MessengerStore: ObservableObject {
                 MessengerMediaStorage.removeTemporaryMedia(at: fileURL)
             }
         } catch MessengerError.attachmentTooLarge {
-            errorMessage = "This attachment is larger than the 100 MB app limit."
+            discardUnretainedInput()
+            errorMessage = "This attachment is larger than the 32 MiB app limit."
             return
         } catch {
+            discardUnretainedInput()
             errorMessage = "That attachment could not be saved securely on this device."
             return
         }
@@ -1467,7 +2734,10 @@ final class MessengerStore: ObservableObject {
                 userId: userId,
                 homeserverUrl: homeserver,
                 displayFileName: staged.displayFileName,
-                audioDuration: audioDuration
+                audioDuration: audioDuration,
+                sdkSendAttempted: false,
+                sdkAttachmentSendCompleted: false,
+                sdkUploadSource: "data"
             )
             do {
                 try MessengerAttachmentOutbox.savePending(created)
@@ -1515,86 +2785,114 @@ final class MessengerStore: ObservableObject {
               let room = client.rooms().first(where: { $0.id() == roomId }),
               room.encryptionState() == .encrypted,
               let timeline = activeTimeline else { return }
+        let replyEventId = replyTargetRoomId == roomId ? replyTarget?.eventId : nil
 
         isSendingAttachment = true
         pendingAttachmentURL = try? MessengerAttachmentOutbox.fileURL(for: manifest)
         errorMessage = nil
-        var uploadURL: URL?
-        var eventQueued = false
-        var didSend = false
+        var sendAttemptMarked = false
         defer {
             isSendingAttachment = false
             activeAttachmentHandle = nil
-            if didSend {
-                clearPendingAttachment(manifest)
-            } else if !eventQueued, let uploadURL {
-                MessengerMediaStorage.removeTemporaryMedia(at: uploadURL)
-            }
         }
 
         do {
             try Task.checkCancellation()
-            let uploadSource = try MessengerAttachmentOutbox.materializeForUpload(manifest)
-            uploadURL = uploadSource
-            let values = try uploadSource.resourceValues(forKeys: [.fileSizeKey])
-            let byteCount = UInt64(max(0, values.fileSize ?? 0))
             let serverLimit = try await client.getMaxMediaUploadSize()
             try Task.checkCancellation()
-            let limit = min(serverLimit > 0 ? serverLimit : 100 * 1024 * 1024, 100 * 1024 * 1024)
-            guard byteCount <= limit else { throw MessengerError.attachmentTooLarge }
+            let appLimit = UInt64(MessengerAttachmentOutbox.maximumUploadPayloadBytes)
+            let limit = min(serverLimit > 0 ? serverLimit : appLimit, appLimit)
+            let uploadData = try MessengerAttachmentOutbox.loadUploadData(manifest, maximumBytes: limit)
+            let byteCount = UInt64(uploadData.count)
 
-            let mimeType = UTType(filenameExtension: uploadSource.pathExtension)?.preferredMIMEType
+            let mimeType = UTType(filenameExtension: URL(fileURLWithPath: manifest.displayFileName).pathExtension)?.preferredMIMEType
                 ?? "application/octet-stream"
             let parameters = UploadParameters(
-                source: .file(filename: uploadSource.path),
+                source: .data(
+                    bytes: uploadData,
+                    filename: MessengerAttachmentOutbox.sdkUploadFileName(for: manifest)
+                ),
                 caption: nil,
                 formattedCaption: nil,
                 mentions: nil,
-                inReplyTo: replyTarget?.eventId
+                inReplyTo: replyEventId
             )
 
+            try Task.checkCancellation()
             if mimeType.lowercased().hasPrefix("image/") {
                 let info = ImageInfo(height: nil, width: nil, mimetype: mimeType, size: byteCount,
                                      thumbnailInfo: nil, thumbnailSource: nil, blurhash: nil, isAnimated: nil)
-                let handle = try timeline.sendImage(params: parameters, thumbnailSource: nil, imageInfo: info)
-                eventQueued = true
-                pendingAttachmentIsInSendQueue = true
+                try markPendingAttachmentSendAttempt(manifest)
+                sendAttemptMarked = true
+                let handle = try await withTrackedRoomQueueWrite(
+                    roomId: roomId,
+                    room: room,
+                    capturesDeliverySnapshot: true
+                ) {
+                    try timeline.sendImage(params: parameters, thumbnailSource: nil, imageInfo: info)
+                }
                 activeAttachmentHandle = handle
                 try await handle.join()
             } else if mimeType.lowercased().hasPrefix("video/") {
                 let info = VideoInfo(duration: nil, height: nil, width: nil, mimetype: mimeType, size: byteCount,
                                      thumbnailInfo: nil, thumbnailSource: nil, blurhash: nil)
-                let handle = try timeline.sendVideo(params: parameters, thumbnailSource: nil, videoInfo: info)
-                eventQueued = true
-                pendingAttachmentIsInSendQueue = true
+                try markPendingAttachmentSendAttempt(manifest)
+                sendAttemptMarked = true
+                let handle = try await withTrackedRoomQueueWrite(
+                    roomId: roomId,
+                    room: room,
+                    capturesDeliverySnapshot: true
+                ) {
+                    try timeline.sendVideo(params: parameters, thumbnailSource: nil, videoInfo: info)
+                }
                 activeAttachmentHandle = handle
                 try await handle.join()
             } else if mimeType.lowercased().hasPrefix("audio/") {
                 let info = AudioInfo(duration: manifest.audioDuration, size: byteCount, mimetype: mimeType)
-                let handle = try timeline.sendAudio(params: parameters, audioInfo: info)
-                eventQueued = true
-                pendingAttachmentIsInSendQueue = true
+                try markPendingAttachmentSendAttempt(manifest)
+                sendAttemptMarked = true
+                let handle = try await withTrackedRoomQueueWrite(
+                    roomId: roomId,
+                    room: room,
+                    capturesDeliverySnapshot: true
+                ) {
+                    try timeline.sendAudio(params: parameters, audioInfo: info)
+                }
                 activeAttachmentHandle = handle
                 try await handle.join()
             } else {
                 let info = FileInfo(mimetype: mimeType, size: byteCount,
                                     thumbnailInfo: nil, thumbnailSource: nil)
-                let handle = try timeline.sendFile(params: parameters, fileInfo: info)
-                eventQueued = true
-                pendingAttachmentIsInSendQueue = true
+                try markPendingAttachmentSendAttempt(manifest)
+                sendAttemptMarked = true
+                let handle = try await withTrackedRoomQueueWrite(
+                    roomId: roomId,
+                    room: room,
+                    capturesDeliverySnapshot: true
+                ) {
+                    try timeline.sendFile(params: parameters, fileInfo: info)
+                }
                 activeAttachmentHandle = handle
                 try await handle.join()
             }
 
+            markPendingAttachmentSendCompleted(manifest)
             try Task.checkCancellation()
-            didSend = true
-            replyTarget = nil
             try? await room.clearComposerDraft(threadRoot: nil)
+            if currentRoomId == roomId, let replyEventId,
+               replyTargetRoomId == roomId, replyTarget?.eventId == replyEventId {
+                replyTarget = nil
+                replyTargetRoomId = nil
+            }
             await refreshConversations()
         } catch MessengerError.attachmentTooLarge {
-            errorMessage = "This attachment is larger than the homeserver upload limit (up to 100 MB)."
-            if !eventQueued { clearPendingAttachment(manifest) }
+            errorMessage = "This attachment exceeds the 32 MiB app limit or the homeserver upload limit. It remains saved on this device."
         } catch {
+            if sendAttemptMarked {
+                pendingAttachmentIsInSendQueue = pendingAttachmentIsInSendQueue ||
+                    pendingAttachment?.sdkEventOrTransactionId != nil ||
+                    pendingAttachment?.sdkAttachmentSendCompleted == true
+            }
             if Task.isCancelled {
                 errorMessage = "Attachment sending was cancelled."
             } else {
@@ -1608,7 +2906,22 @@ final class MessengerStore: ObservableObject {
         guard let manifest = pendingAttachment, pendingAttachmentURL != nil,
               currentRoomId == manifest.roomId, isRoomTimelineReady else { return }
         if pendingAttachmentIsInSendQueue {
-            retryFailedMessages()
+            if pendingAttachmentFailureRecoverable == false {
+                guard let sendHandle = pendingAttachmentSendHandle else {
+                    errorMessage = "The queued attachment retry handle is unavailable. Reopen this conversation after syncing."
+                    return
+                }
+                Task { @MainActor [weak self] in
+                    guard let self, self.beginClientOperation() else { return }
+                    defer { self.endClientOperation() }
+                    do { try await sendHandle.tryResend() }
+                    catch { self.errorMessage = "The queued attachment could not be retried. Keep it saved and try again after syncing." }
+                }
+            } else {
+                // Retry the SDK's existing transaction; never create a second
+                // attachment event for a durable pending manifest.
+                retryFailedMessages()
+            }
             return
         }
         guard let encryptedURL = try? MessengerAttachmentOutbox.fileURL(for: manifest) else { return }
@@ -1619,19 +2932,29 @@ final class MessengerStore: ObservableObject {
     }
 
     func discardPendingAttachment() {
-        guard let pendingAttachment, !pendingAttachmentIsInSendQueue else { return }
-        MessengerAttachmentOutbox.removePending(pendingAttachment)
-        if let uploadURL = try? MessengerAttachmentOutbox.temporaryUploadURL(for: pendingAttachment) {
-            MessengerMediaStorage.removeTemporaryMedia(at: uploadURL)
+        guard let manifest = pendingAttachment,
+              currentRoomId == manifest.roomId,
+              !isSigningOut, !isSendingAttachment else { return }
+        if pendingAttachmentIsInSendQueue {
+            guard let sendHandle = pendingAttachmentSendHandle else { return }
+            Task { @MainActor [weak self] in
+                guard let self, self.beginClientOperation() else { return }
+                defer { self.endClientOperation() }
+                do {
+                    let wasAborted = try await sendHandle.abort()
+                    guard self.pendingAttachment?.operationId == manifest.operationId else { return }
+                    guard wasAborted else {
+                        self.errorMessage = "The attachment was already accepted by the server and cannot be discarded yet."
+                        return
+                    }
+                    self.clearPendingAttachment(manifest)
+                } catch {
+                    self.errorMessage = "The queued attachment could not be safely discarded. It remains saved on this device."
+                }
+            }
+            return
         }
-        self.pendingAttachment = nil
-        pendingAttachmentURL = nil
-        pendingAttachmentForCurrentRoom = false
-        pendingAttachmentRoomId = nil
-        pendingAttachmentAudioDuration = nil
-        pendingAttachmentDisplayName = ""
-        pendingAttachmentIsInSendQueue = false
-        hasPendingAttachment = false
+        clearPendingAttachment(manifest)
     }
 
     func handleScenePhase(isActive: Bool, isBackground: Bool) {
@@ -1641,6 +2964,7 @@ final class MessengerStore: ObservableObject {
             sendQueuesEnabled = false
         } else if isActive {
             requestedClientSceneState = .foreground
+            refreshPushNotificationsIfNeeded()
         } else {
             return
         }
@@ -1684,6 +3008,7 @@ final class MessengerStore: ObservableObject {
                     refreshTask = nil
                     await syncService?.stop()
                     guard generation == syncGeneration else { return }
+                    stopDeliveryAcknowledgementObservers()
                     syncServiceStoppedForBackground = true
                     guard !isSigningOut else { return }
                 }
@@ -1783,6 +3108,14 @@ final class MessengerStore: ObservableObject {
         guard beginClientOperation() else { return nil }
         defer { endClientOperation() }
         guard let client else { return nil }
+        guard let advertisedSize = attachment.sizeBytes, advertisedSize > 0 else {
+            errorMessage = "This attachment cannot be downloaded because its size is missing or invalid."
+            return nil
+        }
+        guard advertisedSize <= Self.maximumAttachmentBytes else {
+            errorMessage = "This attachment is larger than the 100 MB viewing limit."
+            return nil
+        }
         var stagedDestination: URL?
         do {
             let root = try MessengerMediaStorage.directory()
@@ -1795,12 +3128,21 @@ final class MessengerStore: ObservableObject {
                 tempDir: root.path
             )
             let sourceURL = URL(fileURLWithPath: try handle.path())
+            let downloadedSize = try sourceURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+            guard downloadedSize > 0,
+                  UInt64(downloadedSize) <= Self.maximumAttachmentBytes else {
+                throw MessengerError.attachmentTooLarge
+            }
             let destination = root.appendingPathComponent("view-\(UUID().uuidString)-\(MessengerMediaStorage.safeFileName(attachment.fileName))")
             stagedDestination = destination
             try FileManager.default.copyItem(at: sourceURL, to: destination)
             try MessengerMediaStorage.protectPrivateFile(at: destination)
             withExtendedLifetime(handle) { }
             return destination
+        } catch MessengerError.attachmentTooLarge {
+            if let stagedDestination { MessengerMediaStorage.removeTemporaryMedia(at: stagedDestination) }
+            errorMessage = "The downloaded attachment exceeded the 100 MB viewing limit."
+            return nil
         } catch {
             if let stagedDestination { MessengerMediaStorage.removeTemporaryMedia(at: stagedDestination) }
             errorMessage = "Couldn't decrypt or open this attachment. Check that this device is trusted."
@@ -1828,7 +3170,18 @@ final class MessengerStore: ObservableObject {
         defer {
             isSigningOut = false
             logoutAttemptActive = false
+            if client != nil && pushNotificationsEnabled && pushRegistrationStatus != .removalPending {
+                attachPushTokenObserver()
+                schedulePushRegistration(refreshAPNs: false)
+            }
         }
+
+        pushRegistrationGeneration = UUID()
+        let pendingPushRegistration = pushRegistrationTask
+        pushRegistrationTask = nil
+        pendingPushRegistration?.cancel()
+        APNSTokenStore.shared.onTokenChange = nil
+        if let pendingPushRegistration { await pendingPushRegistration.value }
 
         let retainedClient = client
         let retainedSyncService = syncService
@@ -1886,6 +3239,27 @@ final class MessengerStore: ObservableObject {
         await sendQueueTransitionTask?.value
         await serviceToStop?.stop()
 
+        let hasPusherToRemove: Bool
+        do {
+            hasPusherToRemove = try preparePendingPushRemoval(using: clientToStop, resumeRegistration: false)
+        } catch {
+            pushRegistrationStatus = .removalPending
+            errorMessage = "Couldn't save the alert removal request. Secure sign out is paused; keep this account signed in and retry."
+            await resumeLiveSessionAfterFailedLogout(client: clientToStop, service: serviceToStop)
+            return
+        }
+        if hasPusherToRemove {
+            try? vault.savePushNotificationsEnabled(false)
+            pushNotificationsEnabled = false
+            let removalResult = await attemptPendingPushRemoval(using: clientToStop)
+            guard removalResult == .removed else {
+                pushRegistrationStatus = .removalPending
+                errorMessage = "Couldn't remove this device from message alerts. Secure sign out is paused; keep this account signed in and retry."
+                await resumeLiveSessionAfterFailedLogout(client: clientToStop, service: serviceToStop)
+                return
+            }
+        }
+
         do {
             try vault.clear()
         } catch {
@@ -1896,6 +3270,11 @@ final class MessengerStore: ObservableObject {
             await resumeLiveSessionAfterFailedLogout(client: clientToStop, service: serviceToStop)
             return
         }
+
+        await NativePushNotifications.clearDeliveredNotifications()
+        APNSTokenStore.shared.clear()
+        pushNotificationsEnabled = false
+        pushRegistrationStatus = NativePushNotifications.isConfigured ? .notEnabled : .disabled
 
         if let verificationController {
             try? await verificationController.cancelVerification()
@@ -1914,6 +3293,8 @@ final class MessengerStore: ObservableObject {
         pendingAttachmentForCurrentRoom = false
         pendingAttachmentRoomId = nil
         pendingAttachmentAudioDuration = nil
+        pendingAttachmentSendHandle = nil
+        pendingAttachmentFailureRecoverable = nil
         pendingAttachmentDisplayName = ""
         pendingAttachmentIsInSendQueue = false
         hasPendingAttachment = false
@@ -1921,6 +3302,8 @@ final class MessengerStore: ObservableObject {
         timelineObserver?.cancel()
         syncObserver?.cancel()
         sendQueueStatusHandle?.cancel()
+        sendQueueUpdatesHandle?.cancel()
+        sendQueueUpdatesHandle = nil
         deliveryAckSendTasks.removeAll()
         deliveryAckRetryTasks.removeAll()
         deliveryAckInFlight.removeAll()
@@ -1928,6 +3311,7 @@ final class MessengerStore: ObservableObject {
         deliveryAckFailureRecoverability.removeAll()
         typingObserver?.cancel()
         activeTimeline?.close()
+        stopDeliveryAcknowledgementObservers()
         do { try await client?.logout() } catch { }
         syncService = nil
         syncServiceStoppedForBackground = false
@@ -1936,7 +3320,21 @@ final class MessengerStore: ObservableObject {
         activeTimeline = nil
         client = nil
         currentRoomId = nil
-        expectedDeliveryMemberIdsByRoom.removeAll()
+        pendingDeliverySnapshotReservationsByRoom.removeAll()
+        boundDeliverySnapshotReservationIds.removeAll()
+        activeDeliverySnapshotBindingsByRoom.removeAll()
+        deliverySnapshotCorrelationDisabledRoomIds.removeAll()
+        deliverySnapshotTransactionIdsByRoom.removeAll()
+        deliverySnapshotEventIdsByRoom.removeAll()
+        for waiters in deliverySnapshotBindingWaitersByRoom.values {
+            for waiter in waiters.values { waiter.resume(returning: false) }
+        }
+        deliverySnapshotBindingWaitersByRoom.removeAll()
+        roomSendGateOwners.removeAll()
+        for waiters in roomSendGateWaiters.values {
+            for waiter in waiters { waiter.resume() }
+        }
+        roomSendGateWaiters.removeAll()
         currentRoomIsGroup = false
         isRoomTimelineReady = false
         userId = nil
@@ -1944,6 +3342,7 @@ final class MessengerStore: ObservableObject {
         messages = []
         typingUsers = []
         replyTarget = nil
+        replyTargetRoomId = nil
         searchResults = []
         searchHasMore = false
         searchLoading = false
@@ -1951,6 +3350,7 @@ final class MessengerStore: ObservableObject {
         deliveryAckLedgerDirty = false
         deliveryAckSendHandles.removeAll()
         deliveryAckFailureRecoverability.removeAll()
+        readReceiptEventIdsByRoom.removeAll()
         connection = "Offline"
         MessengerMediaStorage.removeAll()
         MessengerAttachmentOutbox.removeAll()
@@ -2007,6 +3407,7 @@ final class MessengerStore: ObservableObject {
             isSigningOut = false
             await service.start()
             syncServiceReadyForSceneTransitions = true
+            await refreshConversations()
         } else {
             isSigningOut = false
             await beginSync(client)
@@ -2041,6 +3442,7 @@ final class MessengerStore: ObservableObject {
             .withSearchIndexStore(path: search.path, password: storeKey.base64EncodedString())
             .sqliteStore(config: store)
             .build()
+        try Self.applyPrivateFileProtection(to: root)
         matrix.enableAutomaticBackpagination()
         return matrix
     }
@@ -2086,11 +3488,28 @@ final class MessengerStore: ObservableObject {
         guard syncGeneration == generation else { return }
         sendQueueStatusHandle?.cancel()
         sendQueueStatusHandle = client.subscribeToSendQueueStatus(listener: SendQueueErrorObserver())
+        sendQueueUpdatesHandle?.cancel()
+        do {
+            let replayTracker = SendQueueReplayTracker()
+            let listener = SendQueueUpdateObserver { [weak self] roomId, update in
+                let isInitialReplay = replayTracker.isPriming
+                Task { @MainActor in
+                    self?.observeSendQueueUpdate(roomId: roomId, update: update, isInitialReplay: isInitialReplay)
+                }
+            }
+            let handle = try await client.subscribeToSendQueueUpdates(listener: listener)
+            replayTracker.finishPriming()
+            sendQueueUpdatesHandle = handle
+        } catch {
+            sendQueueUpdatesHandle = nil
+        }
         do {
             let service = try await client.syncService().finish()
             guard syncGeneration == generation else { return }
             syncService = service
             syncServiceStoppedForBackground = false
+            await refreshConversations()
+            guard syncGeneration == generation, !isSigningOut else { return }
             let observer = SyncObserver { [weak self] state in
                 Task { @MainActor in
                     guard let self, self.syncGeneration == generation, !self.isSigningOut else { return }
@@ -2105,16 +3524,9 @@ final class MessengerStore: ObservableObject {
                         }
                         self.connection = "Connected"
                         self.enqueueSendQueueTransition(enable: true, client: client, generation: generation)
-                        if let roomId = self.currentRoomId {
+                        for roomId in Array(self.deliveryAckLedger.pendingByRoom.keys) {
                             self.queuePendingDeliveryAcknowledgements(in: roomId)
                             self.retryFailedDeliveryAcknowledgements(in: roomId)
-                        }
-                        if self.readReceiptsEnabled, let timeline = self.activeTimeline {
-                            Task { @MainActor [weak self] in
-                                guard let self, self.beginClientOperation() else { return }
-                                defer { self.endClientOperation() }
-                                try? await timeline.markAsRead(receiptType: .read)
-                            }
                         }
                     case .offline, .error, .terminated:
                         self.connection = self.clientPausedForBackground ? "Offline" : "Reconnecting"
@@ -2177,9 +3589,39 @@ final class MessengerStore: ObservableObject {
         defer { endClientOperation() }
         guard let client else { return }
         var rows: [Conversation] = []
+        var joinedEncryptedRooms: [String: Room] = [:]
+        let directMapping = (try? await directRoomMapping(on: client)) ?? [:]
         for room in client.rooms() {
             do {
                 let info = try await room.roomInfo()
+                guard info.membership == .joined || info.membership == .invited else { continue }
+
+                if info.topic == Self.verificationControlRoomTopic {
+                    // Joined rooms with this exact app marker contain only the
+                    // Matrix verification handshake and never enter chat or media UI.
+                    guard info.membership == .invited,
+                          let peerUserId = info.inviter?.userId ?? directPeer(for: room.id(), in: directMapping) else {
+                        continue
+                    }
+                    try? await prewarmVerificationPeer(peerUserId, on: client)
+                    rows.append(Conversation(
+                        id: room.id(),
+                        title: Self.verificationControlRoomName,
+                        preview: "Private device-verification invitation",
+                        timestamp: 0,
+                        unreadCount: 0,
+                        isEncrypted: false,
+                        isGroup: false,
+                        isInvitation: true,
+                        isVerificationControl: true,
+                        verificationPeerUserId: peerUserId
+                    ))
+                    continue
+                }
+
+                if info.membership == .joined, info.encryptionState == .encrypted {
+                    joinedEncryptedRooms[room.id()] = room
+                }
                 let latest = await room.latestEvent()
                 let preview: String
                 let timestamp: UInt64
@@ -2201,12 +3643,105 @@ final class MessengerStore: ObservableObject {
                     timestamp: timestamp,
                     unreadCount: Int(min(info.numUnreadMessages, UInt64(Int.max))),
                     isEncrypted: info.encryptionState == .encrypted,
-                    isGroup: !info.isDirect
+                    // m.direct is redirected to the verification channel when
+                    // a trust ceremony is active. Participant counts preserve
+                    // the original one-to-one/group presentation.
+                    isGroup: info.joinedMembersCount + info.invitedMembersCount > 2,
+                    isInvitation: info.membership == .invited,
+                    isVerificationControl: false,
+                    verificationPeerUserId: nil
                 ))
-            } catch { continue }
+            } catch {
+                // Keep a live observer through transient room-info failures.
+                // A failed read is not evidence that the room was left.
+                let roomId = room.id()
+                if deliveryAckTimelineSubscriptions[roomId] != nil {
+                    joinedEncryptedRooms[roomId] = room
+                }
+                continue
+            }
         }
         conversations = rows.sorted { $0.timestamp > $1.timestamp }
+        await synchronizeDeliveryAcknowledgementObservers(for: joinedEncryptedRooms)
         if currentRoomId != nil { await refreshCurrentPeerTrust() }
+    }
+
+    private func synchronizeDeliveryAcknowledgementObservers(for rooms: [String: Room]) async {
+        guard !isSigningOut, !clientPausedForBackground, !syncServiceStoppedForBackground,
+              requestedClientSceneState != .background, syncService != nil else {
+            stopDeliveryAcknowledgementObservers()
+            return
+        }
+
+        let desiredRoomIds = Set(rooms.keys)
+        let knownRoomIds = Set(deliveryAckObserverTokens.keys).union(deliveryAckTimelineSubscriptions.keys)
+        let removedRoomIds = knownRoomIds.filter { !desiredRoomIds.contains($0) }
+        for roomId in removedRoomIds { stopDeliveryAcknowledgementObserver(in: roomId) }
+
+        for (roomId, room) in rooms where deliveryAckTimelineSubscriptions[roomId] == nil {
+            guard deliveryAckObserverTokens[roomId] == nil else { continue }
+            let token = UUID()
+            deliveryAckObserverTokens[roomId] = token
+            do {
+                let configuration = TimelineConfiguration(
+                    focus: .live(hideThreadedEvents: false),
+                    filter: .onlyMessage(types: [
+                        .audio, .emote, .file, .gallery, .image, .location, .notice,
+                        .serverNotice, .text, .video, .other
+                    ]),
+                    internalIdPrefix: "delivery-ack-\(UUID().uuidString)",
+                    dateDividerMode: .daily,
+                    trackReadReceipts: .disabled,
+                    reportUtds: false
+                )
+                let timeline = try await room.timelineWithConfiguration(configuration: configuration)
+                guard deliveryAckObserverTokens[roomId] == token,
+                      !isSigningOut, !clientPausedForBackground, !syncServiceStoppedForBackground,
+                      requestedClientSceneState != .background else {
+                    timeline.close()
+                    if deliveryAckObserverTokens[roomId] == token { deliveryAckObserverTokens[roomId] = nil }
+                    continue
+                }
+                let listener = TimelineObserver { [weak self] diff in
+                    Task { @MainActor in
+                        guard let self, !self.isSigningOut,
+                              self.deliveryAckObserverTokens[roomId] == token else { return }
+                        self.observeDeliveryAcknowledgements(diff: diff, roomId: roomId)
+                    }
+                }
+                let observer = await timeline.addListener(listener: listener)
+                guard deliveryAckObserverTokens[roomId] == token,
+                      !isSigningOut, !clientPausedForBackground, !syncServiceStoppedForBackground,
+                      requestedClientSceneState != .background else {
+                    observer.cancel()
+                    timeline.close()
+                    if deliveryAckObserverTokens[roomId] == token { deliveryAckObserverTokens[roomId] = nil }
+                    continue
+                }
+                deliveryAckTimelineSubscriptions[roomId] = DeliveryAckTimelineSubscription(
+                    timeline: timeline, observer: observer, token: token
+                )
+            } catch {
+                if deliveryAckObserverTokens[roomId] == token { deliveryAckObserverTokens[roomId] = nil }
+            }
+        }
+
+        for roomId in deliveryAckLedger.pendingByRoom.keys {
+            queuePendingDeliveryAcknowledgements(in: roomId)
+            retryFailedDeliveryAcknowledgements(in: roomId)
+        }
+    }
+
+    private func stopDeliveryAcknowledgementObserver(in roomId: String) {
+        deliveryAckObserverTokens[roomId] = nil
+        guard let subscription = deliveryAckTimelineSubscriptions.removeValue(forKey: roomId) else { return }
+        subscription.observer.cancel()
+        subscription.timeline.close()
+    }
+
+    private func stopDeliveryAcknowledgementObservers() {
+        let roomIds = Set(deliveryAckObserverTokens.keys).union(deliveryAckTimelineSubscriptions.keys)
+        for roomId in roomIds { stopDeliveryAcknowledgementObserver(in: roomId) }
     }
 
     private func persistDraft(roomId: String? = nil, text: String? = nil) async {
@@ -2227,27 +3762,27 @@ final class MessengerStore: ObservableObject {
 
     private func apply(diff: [TimelineDiff], roomId: String) {
         guard !isSigningOut, currentRoomId == roomId else { return }
-        var acknowledgements = [String]()
+        observeDeliveryAcknowledgements(diff: diff, roomId: roomId)
         for update in diff {
             switch update {
             case let .append(values):
-                for value in values { if let message = makeMessage(value, roomId: roomId, acknowledgements: &acknowledgements) { messages.append(message) } }
+                for value in values { if let message = makeMessage(value, roomId: roomId) { messages.append(message) } }
             case .clear: messages = []
             case let .pushFront(value):
-                if let message = makeMessage(value, roomId: roomId, acknowledgements: &acknowledgements) { messages.insert(message, at: 0) }
+                if let message = makeMessage(value, roomId: roomId) { messages.insert(message, at: 0) }
             case let .pushBack(value):
-                if let message = makeMessage(value, roomId: roomId, acknowledgements: &acknowledgements) { messages.append(message) }
+                if let message = makeMessage(value, roomId: roomId) { messages.append(message) }
             case .popFront: if !messages.isEmpty { messages.removeFirst() }
             case .popBack: if !messages.isEmpty { messages.removeLast() }
             case let .insert(index, value):
-                if let message = makeMessage(value, roomId: roomId, acknowledgements: &acknowledgements) { messages.insert(message, at: min(Int(index), messages.count)) }
+                if let message = makeMessage(value, roomId: roomId) { messages.insert(message, at: min(Int(index), messages.count)) }
             case let .set(index, value):
-                if Int(index) < messages.count, let message = makeMessage(value, roomId: roomId, acknowledgements: &acknowledgements) { messages[Int(index)] = message }
+                if Int(index) < messages.count, let message = makeMessage(value, roomId: roomId) { messages[Int(index)] = message }
             case let .remove(index): if Int(index) < messages.count { messages.remove(at: Int(index)) }
             case let .truncate(length): messages = Array(messages.prefix(Int(length)))
             case let .reset(values):
                 var restored = [ChatMessage]()
-                for value in values { if let message = makeMessage(value, roomId: roomId, acknowledgements: &acknowledgements) { restored.append(message) } }
+                for value in values { if let message = makeMessage(value, roomId: roomId) { restored.append(message) } }
                 messages = Array(restored.suffix(300))
             }
         }
@@ -2268,21 +3803,62 @@ final class MessengerStore: ObservableObject {
             isRoomTimelineReady = true
         }
         reconcilePendingAttachment(in: roomId)
-        if deliveryAckLedgerDirty || !acknowledgements.isEmpty || !(deliveryAckLedger.pendingByRoom[roomId] ?? []).isEmpty {
+        if deliveryAckLedgerDirty || !(deliveryAckLedger.pendingByRoom[roomId] ?? []).isEmpty {
             queuePendingDeliveryAcknowledgements(in: roomId)
-        }
-        if readReceiptsEnabled, currentRoomEncrypted, let timeline = activeTimeline {
-            Task { @MainActor [weak self] in
-                guard let self, self.beginClientOperation() else { return }
-                defer { self.endClientOperation() }
-                try? await timeline.markAsRead(receiptType: .read)
-            }
         }
     }
 
-    private func makeMessage(_ item: TimelineItem, roomId: String, acknowledgements: inout [String]) -> ChatMessage? {
+    private func observeDeliveryAcknowledgements(diff: [TimelineDiff], roomId: String) {
+        guard !isSigningOut else { return }
+        var items = [TimelineItem]()
+        for update in diff {
+            switch update {
+            case let .append(values), let .reset(values):
+                items.append(contentsOf: values)
+            case let .pushFront(value), let .pushBack(value):
+                items.append(value)
+            case let .insert(_, value), let .set(_, value):
+                items.append(value)
+            default:
+                break
+            }
+        }
+        for item in items { observeDeliveryAcknowledgement(from: item, roomId: roomId) }
+        queuePendingDeliveryAcknowledgements(in: roomId)
+    }
+
+    private func observeDeliveryAcknowledgement(from item: TimelineItem, roomId: String) {
+        guard let event = item.asEvent(), case let .msgLike(message) = event.content,
+              case let .message(content) = message.kind else { return }
+
+        if case let .other(msgtype, acknowledgedEventId) = content.msgType {
+            guard msgtype == Self.deliveryAckMsgtype else { return }
+            recordObservedDeliveryAcknowledgement(
+                roomId: roomId,
+                eventId: acknowledgedEventId,
+                senderId: event.sender,
+                sentByMe: event.isOwn,
+                isRemote: event.isRemote,
+                localSendState: event.localSendState,
+                sendHandle: event.lazyProvider.getSendHandle()
+            )
+            return
+        }
+
+        guard Self.isSupportedMessageType(content.msgType) else { return }
+        if event.isOwn {
+            return
+        }
+        guard event.isRemote, case let .eventId(eventId) = event.eventOrTransactionId else { return }
+        recordPendingDeliveryAcknowledgement(roomId: roomId, eventId: eventId)
+    }
+
+    private func makeMessage(_ item: TimelineItem, roomId: String) -> ChatMessage? {
         guard let event = item.asEvent() else { return nil }
         let body: String
+        var canMarkAsRead = false
+        var isPlainTextMessage = false
+        var canRedact = false
         var attachment: ChatAttachment? = nil
         var reactions = [MessageReaction]()
         var replyToEventId: String?
@@ -2295,20 +3871,12 @@ final class MessengerStore: ObservableObject {
             replyToEventId = message.inReplyTo?.eventId()
             switch message.kind {
             case let .message(content):
-                if case let .other(msgtype, ackEventId) = content.msgType, msgtype == Self.deliveryAckMsgtype {
-                    recordObservedDeliveryAcknowledgement(
-                        roomId: roomId,
-                        eventId: ackEventId,
-                        senderId: event.sender,
-                        sentByMe: event.isOwn,
-                        isRemote: event.isRemote,
-                        localSendState: event.localSendState,
-                        sendHandle: event.lazyProvider.getSendHandle()
-                    )
-                    return nil
-                }
+                if case let .other(msgtype, _) = content.msgType, msgtype == Self.deliveryAckMsgtype { return nil }
                 body = content.body
                 attachment = Self.attachment(from: content.msgType)
+                canMarkAsRead = Self.isSupportedMessageType(content.msgType)
+                if case .text(_) = content.msgType { isPlainTextMessage = true }
+                canRedact = event.isOwn && event.isRemote
             case .redacted: body = "Message removed"
             case .unableToDecrypt: body = "Unable to decrypt this message"
             default: return nil
@@ -2331,27 +3899,48 @@ final class MessengerStore: ObservableObject {
         case let .eventId(value): eventId = value; identifier = value
         case let .transactionId(value): eventId = nil; identifier = value
         }
-        if !event.isOwn, event.isRemote, let eventId {
-            let wasPending = deliveryAckLedger.pendingByRoom[roomId]?.contains(eventId) == true
-            recordPendingDeliveryAcknowledgement(roomId: roomId, eventId: eventId)
-            if !wasPending && !deliveryAckLedger.sent.contains(eventId) {
-                acknowledgements.append(eventId)
-            }
-        }
-        if let attachment, let operationId = attachment.operationId,
-           pendingAttachment?.operationId == operationId, event.isOwn {
-            pendingAttachmentIsInSendQueue = true
-        }
         var visibleSendState = sendState
         if event.isOwn, let eventId {
             visibleSendState = deliveryState(roomId: roomId, eventId: eventId, fallback: sendState)
         }
-        return ChatMessage(id: identifier, eventId: eventId, isRemote: event.isRemote, sender: event.sender, body: body,
+        if event.isOwn,
+           let manifest = pendingAttachment,
+           manifest.roomId == roomId,
+           (attachment?.operationId == manifest.operationId || manifest.sdkEventOrTransactionId == identifier) {
+            switch event.localSendState {
+            case .notSentYet:
+                pendingAttachmentIsInSendQueue = true
+                if let sendHandle = event.lazyProvider.getSendHandle() {
+                    pendingAttachmentSendHandle = sendHandle
+                }
+                pendingAttachmentFailureRecoverable = nil
+            case let .sendingFailed(_, recoverable):
+                pendingAttachmentIsInSendQueue = true
+                pendingAttachmentSendHandle = event.lazyProvider.getSendHandle()
+                pendingAttachmentFailureRecoverable = recoverable
+            case .sent, nil:
+                pendingAttachmentSendHandle = nil
+                pendingAttachmentFailureRecoverable = nil
+            }
+        }
+        return ChatMessage(id: identifier, eventId: eventId, isRemote: event.isRemote,
+                           canMarkAsRead: canMarkAsRead, sender: event.sender, body: body,
                            timestamp: event.timestamp, isOwn: event.isOwn, sendState: visibleSendState,
                            canRetry: canRetry, canReply: event.canBeRepliedTo && eventId != nil,
+                           canEdit: event.isOwn && event.isRemote && event.isEditable && isPlainTextMessage,
+                           canRedact: canRedact,
                            replyToEventId: replyToEventId, reactions: reactions,
                            hasBeenRead: event.isOwn && event.readReceipts.keys.contains { $0 != userId },
                            attachment: attachment)
+    }
+
+    private static func isSupportedMessageType(_ messageType: MessageType) -> Bool {
+        switch messageType {
+        case .audio, .emote, .file, .gallery, .image, .location, .notice, .text, .video:
+            return true
+        case .other:
+            return false
+        }
     }
 
     private func reconcilePendingAttachment(in roomId: String) {
@@ -2360,7 +3949,13 @@ final class MessengerStore: ObservableObject {
             $0.isOwn && ($0.attachment?.operationId == manifest.operationId ||
                          $0.id == manifest.sdkEventOrTransactionId)
         }) else {
-            if isRoomTimelineReady { pendingAttachmentIsInSendQueue = false }
+            if isRoomTimelineReady {
+                // Only a durable transaction ID or a completed SDK join keeps
+                // this in the SDK queue. An interrupted pre-queue data upload
+                // can be restarted from the encrypted app archive.
+                pendingAttachmentIsInSendQueue = manifest.sdkEventOrTransactionId != nil ||
+                    manifest.sdkAttachmentSendCompleted == true
+            }
             return
         }
         if manifest.sdkEventOrTransactionId != matching.id {
@@ -2371,7 +3966,10 @@ final class MessengerStore: ObservableObject {
                 homeserverUrl: manifest.homeserverUrl,
                 displayFileName: manifest.displayFileName,
                 audioDuration: manifest.audioDuration,
-                sdkEventOrTransactionId: matching.id
+                sdkEventOrTransactionId: matching.id,
+                sdkSendAttempted: manifest.sdkSendAttempted,
+                sdkAttachmentSendCompleted: manifest.sdkAttachmentSendCompleted,
+                sdkUploadSource: manifest.sdkUploadSource
             )
             pendingAttachment = identified
             do { try MessengerAttachmentOutbox.savePending(identified) }
@@ -2384,6 +3982,55 @@ final class MessengerStore: ObservableObject {
         }
     }
 
+    private func markPendingAttachmentSendAttempt(_ manifest: PendingAttachmentManifest) throws {
+        guard pendingAttachment?.operationId == manifest.operationId else {
+            throw MessengerError.attachmentUnavailable
+        }
+        let attempted = PendingAttachmentManifest(
+            operationId: manifest.operationId,
+            roomId: manifest.roomId,
+            userId: manifest.userId,
+            homeserverUrl: manifest.homeserverUrl,
+            displayFileName: manifest.displayFileName,
+            audioDuration: manifest.audioDuration,
+            sdkEventOrTransactionId: manifest.sdkEventOrTransactionId,
+            sdkSendAttempted: true,
+            sdkAttachmentSendCompleted: manifest.sdkAttachmentSendCompleted,
+            sdkUploadSource: "data"
+        )
+        // Record the attempt before the SDK call so restart can distinguish an
+        // unstarted archive from one whose upload may be in flight.
+        try MessengerAttachmentOutbox.savePending(attempted)
+        pendingAttachment = attempted
+        pendingAttachmentSendHandle = nil
+        pendingAttachmentFailureRecoverable = nil
+    }
+
+    private func markPendingAttachmentSendCompleted(_ manifest: PendingAttachmentManifest) {
+        guard let current = pendingAttachment, current.operationId == manifest.operationId else { return }
+        let completed = PendingAttachmentManifest(
+            operationId: current.operationId,
+            roomId: current.roomId,
+            userId: current.userId,
+            homeserverUrl: current.homeserverUrl,
+            displayFileName: current.displayFileName,
+            audioDuration: current.audioDuration,
+            sdkEventOrTransactionId: current.sdkEventOrTransactionId,
+            sdkSendAttempted: true,
+            sdkAttachmentSendCompleted: true,
+            sdkUploadSource: current.sdkUploadSource
+        )
+        // A successful SDK join means the send reached the SDK's completed
+        // stage. Keep the encrypted archive until the timeline reports Sent.
+        pendingAttachmentIsInSendQueue = true
+        do {
+            try MessengerAttachmentOutbox.savePending(completed)
+            pendingAttachment = completed
+        } catch {
+            errorMessage = "The attachment was sent, but its local recovery marker could not be updated. Keep the app open while it syncs."
+        }
+    }
+
     private func clearPendingAttachment(_ manifest: PendingAttachmentManifest) {
         MessengerAttachmentOutbox.removePending(manifest)
         let uploadTemp = try? MessengerAttachmentOutbox.temporaryUploadURL(for: manifest)
@@ -2392,6 +4039,8 @@ final class MessengerStore: ObservableObject {
         pendingAttachmentURL = nil
         pendingAttachmentRoomId = nil
         pendingAttachmentAudioDuration = nil
+        pendingAttachmentSendHandle = nil
+        pendingAttachmentFailureRecoverable = nil
         pendingAttachmentDisplayName = ""
         pendingAttachmentIsInSendQueue = false
         hasPendingAttachment = false
@@ -2403,36 +4052,41 @@ final class MessengerStore: ObservableObject {
             let sendState = deliveryState(roomId: roomId, eventId: eventId, fallback: message.sendState)
             guard sendState != message.sendState else { return message }
             return ChatMessage(id: message.id, eventId: message.eventId, isRemote: message.isRemote,
+                               canMarkAsRead: message.canMarkAsRead,
                                sender: message.sender, body: message.body, timestamp: message.timestamp,
                                isOwn: message.isOwn, sendState: sendState, canRetry: message.canRetry,
-                               canReply: message.canReply, replyToEventId: message.replyToEventId,
+                               canReply: message.canReply, canEdit: message.canEdit, canRedact: message.canRedact,
+                               replyToEventId: message.replyToEventId,
                                reactions: message.reactions, hasBeenRead: message.hasBeenRead,
                                attachment: message.attachment)
         }
     }
 
     private func deliveryState(roomId: String, eventId: String, fallback: String = "Sent") -> String {
-        let expectedMembers = deliveryAckLedger.expectedMembersByRoom[roomId]?[eventId]
-            ?? expectedDeliveryMemberIdsByRoom[roomId]
-            ?? []
+        let expectedSnapshot = deliveryAckLedger.expectedMembersByRoom[roomId]?[eventId]
+        let expectedMembers = expectedSnapshot ?? []
         let acknowledgedMembers = deliveryAckLedger.acknowledgedMembersByRoom[roomId]?[eventId] ?? []
         return deliveryStatusLabel(
             expectedMemberIds: expectedMembers,
             acknowledgedMemberIds: acknowledgedMembers,
             fallback: fallback,
-            legacyDelivered: deliveryAckLedger.received.contains(eventId),
+            legacyDelivered: expectedSnapshot != nil && deliveryAckLedger.received.contains(eventId),
         )
     }
 
     private func sendDeliveryAcknowledgement(roomId: String?, eventId: String) async throws {
-        guard !isSigningOut, let roomId, let client,
+        guard beginClientOperation() else { throw MessengerError.messageUnavailable }
+        defer { endClientOperation() }
+        guard let roomId, let client,
               let room = client.rooms().first(where: { $0.id() == roomId }),
               room.encryptionState() == .encrypted else { throw MessengerError.messageUnavailable }
         let timeline = try await room.timeline()
         guard let content = timeline.createMessageContent(msgType: .other(msgtype: Self.deliveryAckMsgtype, body: eventId)) else {
             throw MessengerError.messageUnavailable
         }
-        _ = try await timeline.send(msg: content)
+        _ = try await withTrackedRoomQueueWrite(roomId: roomId) {
+            try await timeline.send(msg: content)
+        }
     }
 
     private func prepareAccountStorage(userId: String, homeserverUrl: String) throws {
@@ -2454,6 +4108,10 @@ final class MessengerStore: ObservableObject {
             }
             if saved.accountKey == accountKey {
                 deliveryAckLedger = saved
+                if deliveryAckLedger.snapshotFormatVersion < 2 {
+                    deliveryAckLedger.snapshotFormatVersion = 2
+                    mustPersistLedger = true
+                }
             } else {
                 deliveryAckLedger = DeliveryAcknowledgementLedger(accountKey: accountKey)
                 mustPersistLedger = true
@@ -2471,6 +4129,8 @@ final class MessengerStore: ObservableObject {
             guard saved.userId == userId, saved.homeserverUrl.lowercased() == homeserverUrl.lowercased() else {
                 MessengerAttachmentOutbox.removeAll()
                 pendingAttachment = nil
+                pendingAttachmentSendHandle = nil
+                pendingAttachmentFailureRecoverable = nil
                 pendingAttachmentURL = nil
                 pendingAttachmentForCurrentRoom = false
                 pendingAttachmentRoomId = nil
@@ -2485,15 +4145,22 @@ final class MessengerStore: ObservableObject {
             pendingAttachmentAudioDuration = saved.audioDuration
             hasPendingAttachment = true
             pendingAttachmentDisplayName = saved.displayFileName
-            // Restore the SDK's original local upload path before sync starts
-            // and its durable send queue is enabled.
-            do {
-                _ = try MessengerAttachmentOutbox.materializeForUpload(saved)
-            } catch MessengerError.attachmentUnavailable {
-                errorMessage = "A saved attachment file is unavailable. Open its conversation to discard it."
+            // Older queue entries store a stable file URL in the SDK. Rebuild
+            // that private temp file before sync can resume their upload. New
+            // data-backed records never materialize a plaintext upload file.
+            if saved.sdkUploadSource != "data" {
+                do {
+                    _ = try MessengerAttachmentOutbox.materializeForUpload(saved)
+                } catch MessengerError.attachmentUnavailable {
+                    errorMessage = "A saved attachment file is unavailable. Open its conversation to discard it."
+                } catch MessengerError.attachmentTooLarge {
+                    errorMessage = "A legacy queued attachment exceeds its recovery limit. Keep the archive saved until its conversation can be reviewed."
+                }
             }
         } else {
             pendingAttachment = nil
+            pendingAttachmentSendHandle = nil
+            pendingAttachmentFailureRecoverable = nil
             pendingAttachmentRoomId = nil
             pendingAttachmentAudioDuration = nil
             pendingAttachmentURL = nil
@@ -2510,6 +4177,8 @@ final class MessengerStore: ObservableObject {
         pendingAttachmentIsInSendQueue = false
         guard let manifest = pendingAttachment, manifest.roomId == currentRoomId else { return }
         pendingAttachmentForCurrentRoom = true
+        pendingAttachmentIsInSendQueue = manifest.sdkEventOrTransactionId != nil ||
+            manifest.sdkAttachmentSendCompleted == true
         do {
             pendingAttachmentURL = try MessengerAttachmentOutbox.fileURL(for: manifest)
             pendingAttachmentDisplayName = manifest.displayFileName
@@ -2527,7 +4196,7 @@ final class MessengerStore: ObservableObject {
     }
 
     private func queuePendingDeliveryAcknowledgements(in roomId: String) {
-        guard !isSigningOut, isRoomTimelineReady, currentRoomId == roomId else { return }
+        guard !isSigningOut else { return }
         if deliveryAckLedgerDirty {
             do {
                 try persistDeliveryAcknowledgementLedger()
@@ -2537,6 +4206,10 @@ final class MessengerStore: ObservableObject {
                 return
             }
         }
+        guard !clientPausedForBackground, !syncServiceStoppedForBackground,
+              requestedClientSceneState != .background,
+              let room = client?.rooms().first(where: { $0.id() == roomId }),
+              room.encryptionState() == .encrypted else { return }
         let pending = deliveryAckLedger.pendingByRoom[roomId] ?? []
         for eventId in pending where !deliveryAckLedger.sent.contains(eventId) &&
             deliveryAckLedger.queuedByRoom[roomId]?.contains(eventId) != true {
@@ -2551,7 +4224,8 @@ final class MessengerStore: ObservableObject {
                     self.deliveryAckSendTasks[key] = nil
                 }
                 for attempt in 0..<5 {
-                    guard !Task.isCancelled, !self.isSigningOut, self.currentRoomId == roomId,
+                    guard !Task.isCancelled, !self.isSigningOut, !self.clientPausedForBackground,
+                          !self.syncServiceStoppedForBackground, self.requestedClientSceneState != .background,
                           self.deliveryAckLedger.pendingByRoom[roomId]?.contains(eventId) == true,
                           !self.deliveryAckLedger.sent.contains(eventId) else { return }
                     do {
@@ -2600,6 +4274,143 @@ final class MessengerStore: ObservableObject {
         }
     }
 
+    private func observeSendQueueUpdate(
+        roomId: String,
+        update: RoomSendQueueUpdate,
+        isInitialReplay: Bool = false
+    ) {
+        switch update {
+        case let .newLocalEvent(transactionId):
+            // The FFI replays pre-existing local echoes synchronously while the
+            // observer is being installed. They have no send-time snapshot.
+            guard !isInitialReplay,
+                  !deliverySnapshotCorrelationDisabledRoomIds.contains(roomId) else { return }
+            guard var reservations = pendingDeliverySnapshotReservationsByRoom[roomId],
+                  !reservations.isEmpty else {
+                disableDeliverySnapshotCorrelation(in: roomId)
+                return
+            }
+            let reservation = reservations.removeFirst()
+            pendingDeliverySnapshotReservationsByRoom[roomId] = reservations.isEmpty ? nil : reservations
+            activeDeliverySnapshotBindingsByRoom[roomId, default: [:]][reservation.id] = ActiveDeliverySnapshotBinding(
+                transactionId: transactionId,
+                eventId: nil
+            )
+            if let recipientIds = reservation.recipientIds {
+                var updated = deliveryAckLedger
+                var byTransaction = updated.expectedMembersByTransactionByRoom[roomId] ?? [:]
+                byTransaction[transactionId] = recipientIds
+                updated.expectedMembersByTransactionByRoom[roomId] = byTransaction
+                deliveryAckLedger = updated
+                deliveryAckLedgerDirty = true
+                deliverySnapshotTransactionIdsByRoom[roomId, default: []].insert(transactionId)
+            }
+            boundDeliverySnapshotReservationIds.insert(reservation.id)
+            if let waiter = deliverySnapshotBindingWaitersByRoom[roomId]?.removeValue(forKey: reservation.id) {
+                waiter.resume(returning: true)
+            }
+            if deliverySnapshotBindingWaitersByRoom[roomId]?.isEmpty == true {
+                deliverySnapshotBindingWaitersByRoom[roomId] = nil
+            }
+            queuePendingDeliveryAcknowledgements(in: roomId)
+
+        case let .sentEvent(transactionId, eventId):
+            if let entry = activeDeliverySnapshotBindingsByRoom[roomId]?.first(where: {
+                $0.value.transactionId == transactionId
+            }) {
+                if var bindings = activeDeliverySnapshotBindingsByRoom[roomId],
+                   var binding = bindings[entry.key] {
+                    binding.eventId = eventId
+                    bindings[entry.key] = binding
+                    activeDeliverySnapshotBindingsByRoom[roomId] = bindings
+                }
+            }
+            var updated = deliveryAckLedger
+            var byTransaction = updated.expectedMembersByTransactionByRoom[roomId] ?? [:]
+            let recipients = byTransaction[transactionId]
+            byTransaction[transactionId] = nil
+            updated.expectedMembersByTransactionByRoom[roomId] = byTransaction.isEmpty ? nil : byTransaction
+            if let recipients, updated.expectedMembersByRoom[roomId]?[eventId] == nil {
+                var expectedByEvent = updated.expectedMembersByRoom[roomId] ?? [:]
+                expectedByEvent[eventId] = recipients
+                updated.expectedMembersByRoom[roomId] = expectedByEvent
+            }
+            var hadCorrelatedSnapshot = false
+            if var snapshotTransactionIds = deliverySnapshotTransactionIdsByRoom[roomId] {
+                hadCorrelatedSnapshot = snapshotTransactionIds.remove(transactionId) != nil
+                deliverySnapshotTransactionIdsByRoom[roomId] = snapshotTransactionIds.isEmpty ? nil : snapshotTransactionIds
+            }
+            if hadCorrelatedSnapshot {
+                if recipients != nil {
+                    deliverySnapshotEventIdsByRoom[roomId, default: []].insert(eventId)
+                }
+            }
+            if updated != deliveryAckLedger {
+                deliveryAckLedger = updated
+                deliveryAckLedgerDirty = true
+            }
+            if let expectedMembers = deliveryAckLedger.expectedMembersByRoom[roomId]?[eventId] {
+                promoteProvisionalDeliveryAcknowledgements(
+                    roomId: roomId,
+                    eventId: eventId,
+                    expectedMemberIds: expectedMembers
+                )
+            }
+            refreshDeliveryStates()
+            queuePendingDeliveryAcknowledgements(in: roomId)
+
+        case let .cancelledLocalEvent(transactionId):
+            guard deliveryAckLedger.expectedMembersByTransactionByRoom[roomId]?[transactionId] != nil else { return }
+            var updated = deliveryAckLedger
+            var byTransaction = updated.expectedMembersByTransactionByRoom[roomId] ?? [:]
+            byTransaction[transactionId] = nil
+            updated.expectedMembersByTransactionByRoom[roomId] = byTransaction.isEmpty ? nil : byTransaction
+            if var snapshotTransactionIds = deliverySnapshotTransactionIdsByRoom[roomId] {
+                snapshotTransactionIds.remove(transactionId)
+                deliverySnapshotTransactionIdsByRoom[roomId] = snapshotTransactionIds.isEmpty ? nil : snapshotTransactionIds
+            }
+            deliveryAckLedger = updated
+            deliveryAckLedgerDirty = true
+            queuePendingDeliveryAcknowledgements(in: roomId)
+
+        case .replacedLocalEvent(_), .sendError(_, _, _), .retryEvent(_), .mediaUpload(_, _, _, _):
+            break
+        }
+    }
+
+    private func promoteProvisionalDeliveryAcknowledgements(
+        roomId: String,
+        eventId: String,
+        expectedMemberIds: Set<String>
+    ) {
+        guard let index = deliveryAckLedger.provisionalAcknowledgements.firstIndex(where: {
+            $0.roomId == roomId && $0.eventId == eventId
+        }) else { return }
+        let provisional = deliveryAckLedger.provisionalAcknowledgements[index]
+        var acceptedSenders = Set<String>()
+        for senderId in provisional.senderIds {
+            if let next = addDeliveryAcknowledgement(
+                expectedMemberIds: expectedMemberIds,
+                acknowledgedMemberIds: acceptedSenders,
+                acknowledgingMemberId: senderId
+            ) {
+                acceptedSenders = next
+            }
+        }
+        var updated = deliveryAckLedger
+        updated.provisionalAcknowledgements.removeAll { $0.roomId == roomId && $0.eventId == eventId }
+        if !acceptedSenders.isEmpty {
+            var byEvent = updated.acknowledgedMembersByRoom[roomId] ?? [:]
+            byEvent[eventId] = acceptedSenders
+            updated.acknowledgedMembersByRoom[roomId] = byEvent
+            updated.received.insert(eventId)
+        }
+        if updated != deliveryAckLedger {
+            deliveryAckLedger = updated
+            deliveryAckLedgerDirty = true
+        }
+    }
+
     private func recordObservedDeliveryAcknowledgement(
         roomId: String,
         eventId: String,
@@ -2609,12 +4420,25 @@ final class MessengerStore: ObservableObject {
         localSendState: EventSendState?,
         sendHandle: SendHandle?
     ) {
-        let expectedMembers = deliveryAckLedger.expectedMembersByRoom[roomId]?[eventId]
-            ?? expectedDeliveryMemberIdsByRoom[roomId]
-            ?? []
+        // ACKs are accepted only against the immutable recipient snapshot taken
+        // when our outgoing event was first observed. Current room membership
+        // must never retroactively authorize a sender for an older message.
         let previousAcknowledgements = deliveryAckLedger.acknowledgedMembersByRoom[roomId]?[eventId] ?? []
+        var nextAcknowledgements: Set<String>?
         if !sentByMe {
-            if !expectedMembers.contains(senderId) || previousAcknowledgements.contains(senderId) { return }
+            guard isRemote else { return }
+            guard let expectedMembers = deliveryAckLedger.expectedMembersByRoom[roomId]?[eventId] else {
+                recordProvisionalDeliveryAcknowledgement(roomId: roomId, eventId: eventId, senderId: senderId)
+                return
+            }
+            if let userId, senderId == userId { return }
+            guard let updatedAcknowledgements = addDeliveryAcknowledgement(
+                expectedMemberIds: expectedMembers,
+                acknowledgedMemberIds: previousAcknowledgements,
+                acknowledgingMemberId: senderId
+            ) else { return }
+            if updatedAcknowledgements == previousAcknowledgements { return }
+            nextAcknowledgements = updatedAcknowledgements
             if expectedMembers.count <= 1 && deliveryAckLedger.received.contains(eventId) { return }
         }
         var updated = deliveryAckLedger
@@ -2664,11 +4488,8 @@ final class MessengerStore: ObservableObject {
                 }
             }
         } else {
-            var expectedByEvent = updated.expectedMembersByRoom[roomId] ?? [:]
-            expectedByEvent[eventId] = expectedMembers
-            updated.expectedMembersByRoom[roomId] = expectedByEvent
             var acknowledgementsByEvent = updated.acknowledgedMembersByRoom[roomId] ?? [:]
-            acknowledgementsByEvent[eventId, default: []].insert(senderId)
+            acknowledgementsByEvent[eventId] = nextAcknowledgements ?? previousAcknowledgements
             updated.acknowledgedMembersByRoom[roomId] = acknowledgementsByEvent
             updated.received.insert(eventId)
         }
@@ -2676,6 +4497,7 @@ final class MessengerStore: ObservableObject {
             deliveryAckLedger = updated
             deliveryAckLedgerDirty = true
         }
+        if !sentByMe { refreshDeliveryStates() }
         if let retryState {
             scheduleRetryForFailedDeliveryAcknowledgement(
                 roomId: roomId,
@@ -2684,6 +4506,36 @@ final class MessengerStore: ObservableObject {
                 recoverable: retryState.recoverable
             )
         }
+    }
+
+    private func recordProvisionalDeliveryAcknowledgement(roomId: String, eventId: String, senderId: String) {
+        // ACK bodies are untrusted room content until a send-time snapshot is
+        // available to validate them. Bound the key too, so the capped entry
+        // count also caps the encrypted provisional ledger's size.
+        guard eventId.hasPrefix("$"), eventId.utf8.count <= 1_024 else { return }
+        var updated = deliveryAckLedger
+        if let index = updated.provisionalAcknowledgements.firstIndex(where: {
+            $0.roomId == roomId && $0.eventId == eventId
+        }) {
+            guard !updated.provisionalAcknowledgements[index].senderIds.contains(senderId),
+                  updated.provisionalAcknowledgements[index].senderIds.count < 16 else { return }
+            updated.provisionalAcknowledgements[index].senderIds.insert(senderId)
+        } else {
+            if updated.provisionalAcknowledgements.count >= 256 {
+                updated.provisionalAcknowledgements.removeFirst(
+                    updated.provisionalAcknowledgements.count - 255
+                )
+            }
+            updated.provisionalAcknowledgements.append(ProvisionalDeliveryAcknowledgement(
+                roomId: roomId,
+                eventId: eventId,
+                senderIds: [senderId],
+                recordedAt: UInt64(max(0, Date().timeIntervalSince1970))
+            ))
+        }
+        guard updated != deliveryAckLedger else { return }
+        deliveryAckLedger = updated
+        deliveryAckLedgerDirty = true
     }
 
     private func deliveryAckKey(roomId: String, eventId: String) -> String {
@@ -2710,7 +4562,8 @@ final class MessengerStore: ObservableObject {
             // before retrying the already queued event.
             await self.sendQueueTransitionTask?.value
             guard !self.isSigningOut, self.sendQueuesEnabled, self.connection == "Connected",
-                  !self.clientPausedForBackground, self.currentRoomId == roomId else { return }
+                  !self.clientPausedForBackground, !self.syncServiceStoppedForBackground,
+                  self.requestedClientSceneState != .background else { return }
 
             for attempt in 0..<5 {
                 guard !Task.isCancelled,
@@ -2718,7 +4571,8 @@ final class MessengerStore: ObservableObject {
                       self.deliveryAckLedger.queuedByRoom[roomId]?.contains(eventId) == true,
                       !self.deliveryAckLedger.sent.contains(eventId),
                       !self.isSigningOut, self.sendQueuesEnabled, self.connection == "Connected",
-                      !self.clientPausedForBackground, self.currentRoomId == roomId,
+                      !self.clientPausedForBackground, !self.syncServiceStoppedForBackground,
+                      self.requestedClientSceneState != .background,
                       let room = self.client?.rooms().first(where: { $0.id() == roomId }) else { return }
 
                 try? await Task.sleep(for: .seconds(Int64(1 << attempt)))
@@ -2750,6 +4604,7 @@ final class MessengerStore: ObservableObject {
                   !deliveryAckLedger.sent.contains(eventId) else { continue }
             let recoverable = deliveryAckFailureRecoverability[key] ?? true
             if connection == "Connected", !clientPausedForBackground,
+               !syncServiceStoppedForBackground, requestedClientSceneState != .background,
                deliveryAckRetryTasks[deliveryAckKey(roomId: roomId, eventId: eventId)] == nil {
                 scheduleRetryForFailedDeliveryAcknowledgement(
                     roomId: roomId,
@@ -2788,6 +4643,56 @@ final class MessengerStore: ObservableObject {
         return root
     }
 
+    private func protectMatrixStorage() throws {
+        let root = Self.applicationDataRoot().appendingPathComponent("Matrix", isDirectory: true)
+        try Self.applyPrivateFileProtection(to: root)
+    }
+
+    private static func applyPrivateFileProtection(to root: URL) throws {
+        let manager = FileManager.default
+        guard manager.fileExists(atPath: root.path) else {
+            throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadUnknownError)
+        }
+
+        func protect(_ url: URL) throws {
+            try manager.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: url.path)
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            var protectedURL = url
+            try protectedURL.setResourceValues(values)
+        }
+
+        try protect(root)
+        guard let enumerator = manager.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isSymbolicLinkKey],
+            options: []
+        ) else {
+            throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadUnknownError)
+        }
+        while let url = enumerator.nextObject() as? URL {
+            let values = try url.resourceValues(forKeys: [.isSymbolicLinkKey])
+            if values.isSymbolicLink == true {
+                enumerator.skipDescendants()
+                continue
+            }
+            try protect(url)
+        }
+    }
+
+    private func removeFreshSignInStorage() throws {
+        let manager = FileManager.default
+        let matrixRoot = Self.applicationDataRoot().appendingPathComponent("Matrix", isDirectory: true)
+        do { try manager.removeItem(at: matrixRoot) }
+        catch let error as CocoaError where error.code == .fileNoSuchFile { }
+
+        let ledger = Self.applicationDataRoot().appendingPathComponent("delivery-acknowledgements.json")
+        do { try manager.removeItem(at: ledger) }
+        catch let error as CocoaError where error.code == .fileNoSuchFile { }
+        MessengerMediaStorage.removeAll()
+        MessengerAttachmentOutbox.removeAll()
+    }
+
     static func applicationDataRoot() -> URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("PrivateMessenger", isDirectory: true)
@@ -2799,22 +4704,26 @@ final class MessengerStore: ObservableObject {
             let parsed = MessengerAttachmentOutbox.decodeUploadFileName(content.filename)
             let fileName = parsed?.displayFileName ?? content.filename
             return ChatAttachment(fileName: fileName, mimeType: content.info?.mimetype ?? inferredMimeType(fileName),
+                                  sizeBytes: content.info?.size,
                                   sourceJson: content.source.toJson(), kind: .image, operationId: parsed?.operationId)
         case let .video(content):
             let parsed = MessengerAttachmentOutbox.decodeUploadFileName(content.filename)
             let fileName = parsed?.displayFileName ?? content.filename
             return ChatAttachment(fileName: fileName, mimeType: content.info?.mimetype ?? inferredMimeType(fileName),
+                                  sizeBytes: content.info?.size,
                                   sourceJson: content.source.toJson(), kind: .video, operationId: parsed?.operationId)
         case let .audio(content):
             let parsed = MessengerAttachmentOutbox.decodeUploadFileName(content.filename)
             let fileName = parsed?.displayFileName ?? content.filename
             return ChatAttachment(fileName: fileName, mimeType: content.info?.mimetype ?? inferredMimeType(fileName),
+                                  sizeBytes: content.info?.size,
                                   sourceJson: content.source.toJson(), kind: .audio, operationId: parsed?.operationId)
         case let .file(content):
             let parsed = MessengerAttachmentOutbox.decodeUploadFileName(content.filename)
             let fileName = parsed?.displayFileName ?? content.filename
             return ChatAttachment(fileName: fileName,
                                   mimeType: content.info?.mimetype ?? inferredMimeType(fileName),
+                                  sizeBytes: content.info?.size,
                                   sourceJson: content.source.toJson(), kind: .file, operationId: parsed?.operationId)
         default:
             return nil
@@ -2827,11 +4736,17 @@ final class MessengerStore: ObservableObject {
     }
 
     private static let deliveryAckMsgtype = "org.friendline.delivery"
+    private static let maximumAttachmentBytes: UInt64 = 100 * 1024 * 1024
 }
 
 private enum MessengerError: Error {
     case messageUnavailable, attachmentTooLarge, attachmentUnavailable, insecureHomeserver
     case encryptedRoomCreationFailed
+}
+
+private enum VerificationControlChannelError: Error {
+    case roomUnavailable, invalidRoom, invalidDirectMapping, directMappingNotSaved
+    case directRoomNotSelected, peerDidNotJoin, unexpectedParticipant
 }
 
 enum VoiceNoteError: Error {
@@ -3024,6 +4939,29 @@ private final class SendQueueErrorObserver: SendQueueRoomErrorListener, @uncheck
     }
 }
 
+private final class SendQueueUpdateObserver: SendQueueRoomUpdateListener, @unchecked Sendable {
+    private let handler: @Sendable (String, RoomSendQueueUpdate) -> Void
+    init(handler: @escaping @Sendable (String, RoomSendQueueUpdate) -> Void) { self.handler = handler }
+    func onUpdate(roomId: String, update: RoomSendQueueUpdate) { handler(roomId, update) }
+}
+
+private final class SendQueueReplayTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var priming = true
+
+    var isPriming: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return priming
+    }
+
+    func finishPriming() {
+        lock.lock()
+        priming = false
+        lock.unlock()
+    }
+}
+
 private final class TimelineObserver: TimelineListener, @unchecked Sendable {
     private let handler: @Sendable ([TimelineDiff]) -> Void
     init(handler: @escaping @Sendable ([TimelineDiff]) -> Void) { self.handler = handler }
@@ -3061,6 +4999,9 @@ private struct DeviceVault {
     private let sessionAccount = "matrix-session"
     private let storeKeyAccount = "matrix-store-key"
     private let readReceiptsAccount = "read-receipts-enabled"
+    private let pushNotificationsAccount = "push-notifications-enabled"
+    private let registeredPushPusherAccount = "matrix-push-registration"
+    private let pendingPushRemovalAccount = "matrix-push-removal"
     private let mediaOutboxKeyAccount = "media-outbox-key"
     private let localMetadataKeyAccount = "local-metadata-key"
     private let installGenerationAccount = "install-generation"
@@ -3072,9 +5013,13 @@ private struct DeviceVault {
         let containerMarker = try loadContainerGeneration()
         let hasSession = try get(account: sessionAccount) != nil
         let hasStoreKey = try get(account: storeKeyAccount) != nil
-        let matrixDatabase = Self.applicationDataRoot().appendingPathComponent("Matrix", isDirectory: true)
-            .appendingPathComponent("matrix.db")
-        let sessionHasMatchingStore = !hasSession || (hasStoreKey && FileManager.default.fileExists(atPath: matrixDatabase.path))
+        let matrixRoot = Self.applicationDataRoot().appendingPathComponent("Matrix", isDirectory: true)
+        let matrixDatabase = matrixRoot.appendingPathComponent("matrix.db")
+        let hasMatrixStorage = FileManager.default.fileExists(atPath: matrixRoot.path)
+        let hasMatrixDatabase = FileManager.default.fileExists(atPath: matrixDatabase.path)
+        let sessionHasMatchingStore = hasSession
+            ? (hasStoreKey && hasMatrixDatabase)
+            : (!hasStoreKey && !hasMatrixStorage)
         if let keychainGeneration, let defaultsGeneration, let containerMarker,
            keychainGeneration == defaultsGeneration, keychainGeneration == containerMarker,
            sessionHasMatchingStore {
@@ -3167,9 +5112,52 @@ private struct DeviceVault {
         try put(Data([enabled ? 1 : 0]), account: readReceiptsAccount)
     }
 
+    func loadPushNotificationsEnabled() throws -> Bool {
+        guard let value = try get(account: pushNotificationsAccount), value.count == 1 else { return false }
+        return value[0] == 1
+    }
+
+    func savePushNotificationsEnabled(_ enabled: Bool) throws {
+        try put(Data([enabled ? 1 : 0]), account: pushNotificationsAccount)
+    }
+
+    func loadRegisteredPushPusher() throws -> MatrixPusherIdentity? {
+        guard let data = try get(account: registeredPushPusherAccount) else { return nil }
+        return try JSONDecoder().decode(MatrixPusherIdentity.self, from: data)
+    }
+
+    func saveRegisteredPushPusher(_ pusher: MatrixPusherIdentity) throws {
+        try put(JSONEncoder().encode(pusher), account: registeredPushPusherAccount)
+    }
+
+    func loadPendingPushRemoval() throws -> PendingPushRemoval? {
+        guard let data = try get(account: pendingPushRemovalAccount) else { return nil }
+        return try JSONDecoder().decode(PendingPushRemoval.self, from: data)
+    }
+
+    func savePendingPushRemoval(_ pending: PendingPushRemoval) throws {
+        try put(JSONEncoder().encode(pending), account: pendingPushRemovalAccount)
+    }
+
+    func completePendingPushRemoval() throws {
+        try deleteTransactionally([registeredPushPusherAccount, pendingPushRemovalAccount])
+    }
+
+    func clearRegisteredPushPusher() throws {
+        try delete(account: registeredPushPusherAccount)
+    }
+
+    func clearFreshSignInArtifacts() throws {
+        try deleteTransactionally([storeKeyAccount, mediaOutboxKeyAccount, localMetadataKeyAccount, sessionAccount])
+    }
+
     func clear() throws {
-        let accounts = [storeKeyAccount, readReceiptsAccount, mediaOutboxKeyAccount,
-                        localMetadataKeyAccount, sessionAccount]
+        let accounts = [storeKeyAccount, readReceiptsAccount, pushNotificationsAccount, mediaOutboxKeyAccount,
+                        localMetadataKeyAccount, registeredPushPusherAccount, pendingPushRemovalAccount, sessionAccount]
+        try deleteTransactionally(accounts)
+    }
+
+    private func deleteTransactionally(_ accounts: [String]) throws {
         let snapshot = try accounts.map { account in (account, try get(account: account)) }
         var attempted = Set<String>()
         do {
@@ -3204,7 +5192,7 @@ private struct DeviceVault {
     }
 
     private func clearAllIncludingInstallGeneration() throws {
-        try deleteAccounts([sessionAccount, storeKeyAccount, readReceiptsAccount,
+        try deleteAccounts([sessionAccount, storeKeyAccount, readReceiptsAccount, pushNotificationsAccount,
                            mediaOutboxKeyAccount, localMetadataKeyAccount, installGenerationAccount])
         UserDefaults.standard.removeObject(forKey: Self.installGenerationDefaultsKey)
     }
@@ -3271,7 +5259,18 @@ private struct DeviceVault {
     }
 
     private func put(_ data: Data, account: String) throws {
-        try delete(account: account)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        let update: [String: Any] = [
+            kSecValueData as String: data
+        ]
+        let updateStatus = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+        if updateStatus == errSecSuccess { return }
+        guard updateStatus == errSecItemNotFound else { throw VaultError.keychain(updateStatus) }
+
         let item: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -3279,8 +5278,17 @@ private struct DeviceVault {
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
             kSecValueData as String: data
         ]
-        let status = SecItemAdd(item as CFDictionary, nil)
-        guard status == errSecSuccess else { throw VaultError.keychain(status) }
+        let addStatus = SecItemAdd(item as CFDictionary, nil)
+        if addStatus == errSecSuccess { return }
+        // Another writer could add the item after our update observed it missing.
+        // Resolve that race with an in-place update so the existing pusher record
+        // is never lost in a delete/add crash window.
+        if addStatus == errSecDuplicateItem {
+            let retryStatus = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+            guard retryStatus == errSecSuccess else { throw VaultError.keychain(retryStatus) }
+            return
+        }
+        throw VaultError.keychain(addStatus)
     }
 
     private func delete(account: String) throws {
@@ -3300,4 +5308,5 @@ private enum VaultError: Error {
     case missingStoreKey
     case installGenerationUnavailable
     case clearRollbackFailed
+    case pushRemovalAccountMismatch
 }

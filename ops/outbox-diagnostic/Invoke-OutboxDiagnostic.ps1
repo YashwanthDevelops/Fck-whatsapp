@@ -2,7 +2,8 @@
 [CmdletBinding()]
 param(
     [switch] $LoginOnly,
-    [switch] $ForceBuild
+    [switch] $ForceBuild,
+    [switch] $PeerAcceptance
 )
 
 $ErrorActionPreference = "Stop"
@@ -211,12 +212,14 @@ function Invoke-DiagnosticInstrumentation {
         [string] $Username,
         [string] $Password,
         [string] $RecipientUserId,
+        [string] $ClassName = "dev.friendline.messenger.data.OfflineOutboxIntegrationTest",
+        [string[]] $ExtraArguments = @(),
         [switch] $LoginOnly
     )
 
     $arguments = @(
         "-s", $Device, "shell", "am", "instrument", "-w",
-        "-e", "class", "dev.friendline.messenger.data.OfflineOutboxIntegrationTest",
+        "-e", "class", $ClassName,
         "-e", "stage", $Stage,
         "-e", "marker", $Marker
     )
@@ -231,11 +234,64 @@ function Invoke-DiagnosticInstrumentation {
             $arguments += @("-e", "login_only", "true")
         }
     }
+    if ($ExtraArguments.Count -gt 0) {
+        $arguments += $ExtraArguments
+    }
     $arguments += "$testApplicationId/androidx.test.runner.AndroidJUnitRunner"
 
     $output = & $adb @arguments 2>&1
     $exitCode = $LASTEXITCODE
     $safeOutput = [string]::Join([Environment]::NewLine, [string[]] $output)
+    $verificationObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_verification_observation=(true|false)\|(true|false)\|(true|false)\|(true|false)"
+    )
+    if ($verificationObservation.Success) {
+        Write-Output "OUTBOX_DIAG_VERIFY_OBSERVATION newTimelineItem=$($verificationObservation.Groups[1].Value) requestLike=$($verificationObservation.Groups[2].Value) undecryptable=$($verificationObservation.Groups[3].Value) unexpectedInvite=$($verificationObservation.Groups[4].Value)"
+    }
+    $verificationControlObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_verification_control=(true|false)\|(true|false)"
+    )
+    if ($verificationControlObservation.Success) {
+        Write-Output "OUTBOX_DIAG_VERIFY_CONTROL inviteSeen=$($verificationControlObservation.Groups[1].Value) hiddenAfterJoin=$($verificationControlObservation.Groups[2].Value)"
+    }
+    $verificationStageObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_verification_stage=([A-Za-z0-9_-]+)\|([A-Za-z0-9_-]+)"
+    )
+    if ($verificationStageObservation.Success) {
+        Write-Output "OUTBOX_DIAG_VERIFY_STAGE sender=$($verificationStageObservation.Groups[1].Value) recipient=$($verificationStageObservation.Groups[2].Value)"
+    }
+    $peerTrustObservation = [regex]::Match($safeOutput, "outbox_diag_peer_trust=(true|false)\|(true|false)")
+    if ($peerTrustObservation.Success) {
+        Write-Output "OUTBOX_DIAG_PEER_TRUST senderTrustsRecipient=$($peerTrustObservation.Groups[1].Value) recipientTrustsSender=$($peerTrustObservation.Groups[2].Value)"
+    }
+    $backgroundDeliveryObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_background_delivery=(true|false)\|(queued|sending|sent|delivered|retry|other)\|(true|false)\|(true|false|other)"
+    )
+    if ($backgroundDeliveryObservation.Success) {
+        Write-Output "OUTBOX_DIAG_BACKGROUND_DELIVERY senderMessage=$($backgroundDeliveryObservation.Groups[1].Value) senderState=$($backgroundDeliveryObservation.Groups[2].Value) recipientSawMessage=$($backgroundDeliveryObservation.Groups[3].Value) recipientConnected=$($backgroundDeliveryObservation.Groups[4].Value)"
+    }
+    $ackMessageObservation = [regex]::Match($safeOutput, "outbox_diag_ack_messages=(\d{1,3})\|(\d{1,3})")
+    if ($ackMessageObservation.Success) {
+        Write-Output "OUTBOX_DIAG_ACK_MESSAGES sender=$($ackMessageObservation.Groups[1].Value) recipient=$($ackMessageObservation.Groups[2].Value)"
+    }
+    $ackTraceObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_ack_trace=(true|false)\|(true|false)\|(missing|none|pending|enqueuing|queued|sent|failed|other)\|(true|false)\|(\d{1,2})\|(\d{1,2})\|(\d{1,2})\|(true|false)\|(true|false)\|(missing|none|pending|enqueuing|queued|sent|failed|other)\|(true|false)\|(\d{1,2})\|(\d{1,2})\|(\d{1,2})"
+    )
+    if ($ackTraceObservation.Success) {
+        Write-Output "OUTBOX_DIAG_ACK_TRACE senderObserver=$($ackTraceObservation.Groups[1].Value) senderRecord=$($ackTraceObservation.Groups[2].Value) senderState=$($ackTraceObservation.Groups[3].Value) senderSnapshot=$($ackTraceObservation.Groups[4].Value) senderExpected=$($ackTraceObservation.Groups[5].Value) senderAcked=$($ackTraceObservation.Groups[6].Value) senderProvisional=$($ackTraceObservation.Groups[7].Value) recipientObserver=$($ackTraceObservation.Groups[8].Value) recipientRecord=$($ackTraceObservation.Groups[9].Value) recipientState=$($ackTraceObservation.Groups[10].Value) recipientSnapshot=$($ackTraceObservation.Groups[11].Value) recipientExpected=$($ackTraceObservation.Groups[12].Value) recipientAcked=$($ackTraceObservation.Groups[13].Value) recipientProvisional=$($ackTraceObservation.Groups[14].Value)"
+    }
+    $ackReplayObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_ack_replay=(true|false)\|(missing|none|pending|enqueuing|queued|sent|failed|other)\|(true|false)\|(\d{1,2})\|(\d{1,2})\|(true|false)"
+    )
+    if ($ackReplayObservation.Success) {
+        Write-Output "OUTBOX_DIAG_ACK_REPLAY senderRecord=$($ackReplayObservation.Groups[1].Value) senderState=$($ackReplayObservation.Groups[2].Value) senderSnapshot=$($ackReplayObservation.Groups[3].Value) senderExpected=$($ackReplayObservation.Groups[4].Value) senderAcked=$($ackReplayObservation.Groups[5].Value) senderSawUndecryptableEvent=$($ackReplayObservation.Groups[6].Value)"
+    }
     $expectedResult = [regex]::Match(
         $safeOutput,
         "OUTBOX_DIAG_RESULT stage=$([regex]::Escape($Stage)) [^\r\n]+"
@@ -270,7 +326,7 @@ function Invoke-DiagnosticInstrumentation {
         } else {
             "test-method-not-reached"
         }
-        $progressPattern = "OUTBOX_DIAG_PROGRESS stage=$([regex]::Escape($Stage)) step=(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|verifyExactlyOnce) state=(start|complete)"
+        $progressPattern = "OUTBOX_DIAG_PROGRESS stage=$([regex]::Escape($Stage)) step=(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|verifyExactlyOnce) state=(start|complete)"
         $progressMatches = [regex]::Matches($safeOutput, $progressPattern)
         $progressEvents = @(
             foreach ($progressMatch in $progressMatches) {
@@ -278,7 +334,7 @@ function Invoke-DiagnosticInstrumentation {
             }
         )
         if ($progressEvents.Count -eq 0) {
-            $statusProgressPattern = "outbox_diag_progress=$([regex]::Escape($Stage))\|(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|verifyExactlyOnce)\|(start|complete)"
+            $statusProgressPattern = "outbox_diag_progress=$([regex]::Escape($Stage))\|(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|verifyExactlyOnce)\|(start|complete)"
             $statusProgressMatches = [regex]::Matches($safeOutput, $statusProgressPattern)
             $progressEvents = @(
                 foreach ($progressMatch in $statusProgressMatches) {
@@ -388,21 +444,62 @@ function Invoke-DiagnosticInstrumentation {
         }
         $testException = [regex]::Match(
             $safeOutput,
-            "OUTBOX_DIAG_EXCEPTION stage=([A-Za-z0-9_-]+) step=([A-Za-z0-9_-]+) state=(start|complete) category=(network|auth|store|encryption|room|timeout|other) classChain=([A-Za-z0-9_.$>]+)"
+            "OUTBOX_DIAG_EXCEPTION stage=([A-Za-z0-9_-]+) step=([A-Za-z0-9_-]+) state=(start|complete) category=(network|auth|store|encryption|room|timeout|other) fingerprint=(verification-identity-missing|verification-request-timeout|verification-sas-timeout|verification-completion-timeout|verification-request-failed|verification-control-room-selection|verification-control-room-sync|verification-control-room-members|verification-control-room-unavailable|none) classChain=([A-Za-z0-9_.$>]+)(?: senderIdentity=(missing|verified|unverified|unavailable))?(?: recipientIdentity=(missing|verified|unverified|unavailable))?"
         )
+        $hasFingerprint = $testException.Success
+        $hasIdentityStates = $testException.Success -and ($testException.Groups[7].Success -or $testException.Groups[8].Success)
+        if (-not $testException.Success) {
+            $testException = [regex]::Match(
+                $safeOutput,
+                "outbox_diag_failure=([A-Za-z0-9_-]+)\|([A-Za-z0-9_-]+)\|(start|complete)\|(network|auth|store|encryption|room|timeout|other)\|(verification-identity-missing|verification-request-timeout|verification-sas-timeout|verification-completion-timeout|verification-request-failed|verification-control-room-selection|verification-control-room-sync|verification-control-room-members|verification-control-room-unavailable|none)\|([A-Za-z0-9_.$>]+)\|(missing|verified|unverified|unavailable|none)\|(missing|verified|unverified|unavailable|none)"
+            )
+            $hasFingerprint = $testException.Success
+            $hasIdentityStates = $testException.Success
+        }
+        if (-not $testException.Success) {
+            $testException = [regex]::Match(
+                $safeOutput,
+                "outbox_diag_failure=([A-Za-z0-9_-]+)\|([A-Za-z0-9_-]+)\|(start|complete)\|(network|auth|store|encryption|room|timeout|other)\|(verification-identity-missing|verification-request-timeout|verification-sas-timeout|verification-completion-timeout|verification-request-failed|verification-control-room-selection|verification-control-room-sync|verification-control-room-members|verification-control-room-unavailable|none)\|([A-Za-z0-9_.$>]+)"
+            )
+            $hasFingerprint = $testException.Success
+            $hasIdentityStates = $false
+        }
         if (-not $testException.Success) {
             $testException = [regex]::Match(
                 $safeOutput,
                 "outbox_diag_failure=([A-Za-z0-9_-]+)\|([A-Za-z0-9_-]+)\|(start|complete)\|(network|auth|store|encryption|room|timeout|other)\|([A-Za-z0-9_.$>]+)"
             )
+            $hasFingerprint = $false
         }
         if ($testException.Success) {
             $diagnosticStage = $testException.Groups[1].Value
             $diagnosticStep = $testException.Groups[2].Value
             $diagnosticState = $testException.Groups[3].Value
             $diagnosticCategory = $testException.Groups[4].Value
-            $diagnosticClassChain = $testException.Groups[5].Value
-            Write-Output "OUTBOX_DIAG_FAILURE stage=$diagnosticStage step=$diagnosticStep state=$diagnosticState category=$diagnosticCategory classChain=$diagnosticClassChain progress=$progressSummary boundary=$boundary exitCode=$exitCode completion=$instrumentationCompletion result=$resultPresence"
+            if ($hasFingerprint) {
+                $diagnosticFingerprint = $testException.Groups[5].Value
+                $diagnosticClassChain = $testException.Groups[6].Value
+            } else {
+                $diagnosticFingerprint = "none"
+                $diagnosticClassChain = $testException.Groups[5].Value
+            }
+            $identitySummary = ""
+            if ($hasIdentityStates) {
+                $senderIdentityState = if ($testException.Groups[7].Success) { $testException.Groups[7].Value } else { "none" }
+                $recipientIdentityState = if ($testException.Groups[8].Success) { $testException.Groups[8].Value } else { "none" }
+                if ($senderIdentityState -ne "none" -or $recipientIdentityState -ne "none") {
+                    $identitySummary = " senderIdentity=$senderIdentityState recipientIdentity=$recipientIdentityState"
+                }
+            }
+            if ($diagnosticStage -eq "core" -and $diagnosticStep -match '^verification') {
+                $verificationAccess = Get-VerificationAccessDiagnosis -Step $diagnosticStep
+                Write-Output "OUTBOX_DIAG_VERIFICATION_DIAGNOSTIC request=$($verificationAccess.Request) profileFetch=$($verificationAccess.ProfileFetch)"
+                if ($diagnosticStep -eq "verificationIncomingRequest") {
+                    $verificationSdk = Get-VerificationSdkDropDiagnosis -Device $Device
+                    Write-Output "OUTBOX_DIAG_VERIFICATION_SDK $verificationSdk"
+                }
+            }
+            Write-Output "OUTBOX_DIAG_FAILURE stage=$diagnosticStage step=$diagnosticStep state=$diagnosticState category=$diagnosticCategory fingerprint=$diagnosticFingerprint classChain=$diagnosticClassChain$identitySummary progress=$progressSummary boundary=$boundary exitCode=$exitCode completion=$instrumentationCompletion result=$resultPresence"
             throw "Isolated Android outbox instrumentation failed during stage '$Stage'; raw output, IDs, and credentials were suppressed."
         }
         Write-Output "OUTBOX_DIAG_FAILURE stage=$Stage step=unknown state=unknown category=other class=InstrumentationFailure progress=$progressSummary boundary=$boundary exitCode=$exitCode completion=$instrumentationCompletion result=$resultPresence"
@@ -543,7 +640,7 @@ function Get-SynapseAccessCounts {
     foreach ($line in $rawLogLines) {
         $request = [regex]::Match(
             [string] $line,
-            '"(?<method>GET|POST)\s+(?<path>/[^"\s?]+)(?:\?[^"\s]*)?\s+HTTP/[0-9.]+"'
+            '"(?<method>GET|POST|PUT)\s+(?<path>/[^"\s?]+)(?:\?[^"\s]*)?\s+HTTP/[0-9.]+"'
         )
         if (-not $request.Success) { continue }
 
@@ -556,16 +653,20 @@ function Get-SynapseAccessCounts {
         if (-not $status.Success) { continue }
 
         $path = $request.Groups["path"].Value
-        $endpoint = if ($path -eq "/_matrix/client/versions") {
-            "versions"
-        } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/login$' -or $path -eq "/_matrix/client/login") {
-            "login"
-        } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/logout$' -or $path -eq "/_matrix/client/logout") {
-            "logout"
+        $endpoint = if ($path -match '^/_matrix/client/(?:v3|r0|unstable)/keys/query$') {
+            "keys-query"
+        } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/sendToDevice/[^/]+/[^/]+$') {
+            "send-to-device"
+        } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/rooms/[^/]+/send/[^/]+/[^/]+$') {
+            "room-send"
+        } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/sync$') {
+            "sync"
         } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/profile(?:/.*)?$') {
             "profile"
-        } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/createRoom$') {
-            "room-create"
+        } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/keys/upload$') {
+            "keys-upload"
+        } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/keys/device_signing/upload$') {
+            "device-signing-upload"
         } else {
             continue
         }
@@ -578,25 +679,128 @@ function Get-SynapseAccessCounts {
     return ,$counts
 }
 
-function Write-SynapseAccessDelta {
+function Get-SynapseAccessDeltaCounts {
     $current = Get-SynapseAccessCounts
-    if ($null -eq $current) {
-        Write-Output "OUTBOX_DIAG_SERVER_ACCESS endpoint=versions status=unknown"
-        return
-    }
+    if ($null -eq $current) { return $null }
 
-    foreach ($key in @($current.Keys | Sort-Object)) {
+    $deltas = @{}
+    foreach ($key in @($current.Keys)) {
         $fields = $key -split "\|"
-        if ($fields.Count -ne 2 -or $fields[0] -notin @("versions", "login", "logout", "profile", "room-create") -or $fields[1] -notmatch '^[1-5][0-9]{2}$') {
-            continue
-        }
+        if ($fields.Count -ne 2) { continue }
         $baselineCount = 0
         if ($null -ne $script:synapseAccessBaseline -and $script:synapseAccessBaseline.ContainsKey($key)) {
             $baselineCount = [int] $script:synapseAccessBaseline[$key]
         }
         $delta = [int] $current[$key] - $baselineCount
-        if ($delta -gt 0) {
-            Write-Output "OUTBOX_DIAG_SERVER_ACCESS endpoint=$($fields[0]) status=$($fields[1]) count=$delta"
+        if ($delta -gt 0) { $deltas[$key] = $delta }
+    }
+    return ,$deltas
+}
+
+function Get-VerificationAccessDiagnosis {
+    param([Parameter(Mandatory)] [string] $Step)
+
+    $deltas = Get-SynapseAccessDeltaCounts
+    if ($null -eq $deltas) {
+        return [pscustomobject]@{ Request = "unknown"; ProfileFetch = "unknown" }
+    }
+
+    $sendToDeviceCount = 0
+    foreach ($key in $deltas.Keys) {
+        if ($key -match '^send-to-device\|[1-5][0-9]{2}$') {
+            $sendToDeviceCount += [int] $deltas[$key]
+        }
+    }
+    if ($sendToDeviceCount -gt 0) {
+        $request = "sent"
+    } elseif ($Step -in @("verificationIncomingRequest", "verificationAccept", "verificationSafetyCode", "verificationApprove", "verificationComplete")) {
+        $request = "controller-prefiltered"
+    } elseif ($Step -in @("verificationPeerCheck", "verificationPrepareSender", "verificationPrepareRecipient", "verificationRequest")) {
+        $request = "not-sent"
+    } else {
+        $request = "unknown"
+    }
+
+    $profileCount = 0
+    $profileFailureCount = 0
+    foreach ($key in $deltas.Keys) {
+        if ($key -match '^profile\|([1-5][0-9]{2})$') {
+            $profileCount += [int] $deltas[$key]
+            if ([int] $Matches[1] -ge 400) { $profileFailureCount += [int] $deltas[$key] }
+        }
+    }
+    $profileFetch = if ($profileFailureCount -gt 0) {
+        "failed"
+    } elseif ($profileCount -gt 0) {
+        "no-failure"
+    } else {
+        "not-observed"
+    }
+    return [pscustomobject]@{ Request = $request; ProfileFetch = $profileFetch }
+}
+
+function Get-VerificationSdkDropDiagnosis {
+    param([Parameter(Mandatory)] [string] $Device)
+
+    $lines = @(& $adb -s $Device logcat -d -t 5000 2>$null)
+    if ($LASTEXITCODE -ne 0) { return "branch=logcat-unavailable" }
+
+    $startIndex = -1
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if ([string] $lines[$index] -match '\bOUTBOX_DIAG_SDK_BOUNDARY: verification-sdk-log-start\b') {
+            $startIndex = $index
+        }
+    }
+    if ($startIndex -lt 0) { return "branch=marker-not-found" }
+
+    $sdkErrors = @(
+        $lines[$startIndex..($lines.Count - 1)] |
+            Where-Object { [string] $_ -match '\bE\s+org\.matrix\.rust\.sdk:' }
+    )
+    $sdkText = [string]::Join([Environment]::NewLine, [string[]] $sdkErrors)
+
+    if ($sdkText -match 'Cannot verify other users until our own device''s cross-signing status is complete') {
+        $masterMatch = [regex]::Match($sdkText, '\bhas_master:\s*(true|false)\b')
+        $selfMatch = [regex]::Match($sdkText, '\bhas_self_signing:\s*(true|false)\b')
+        $userMatch = [regex]::Match($sdkText, '\bhas_user_signing:\s*(true|false)\b')
+        $master = if ($masterMatch.Success) { $masterMatch.Groups[1].Value } else { "unknown" }
+        $selfSigning = if ($selfMatch.Success) { $selfMatch.Groups[1].Value } else { "unknown" }
+        $userSigning = if ($userMatch.Success) { $userMatch.Groups[1].Value } else { "unknown" }
+        return "branch=cross-signing-incomplete master=$master selfSigning=$selfSigning userSigning=$userSigning"
+    }
+    if ($sdkText -match 'Failed retrieving verification request') {
+        return "branch=request-missing"
+    }
+    if ($sdkText -match 'Received verification request event but the request is in the wrong state') {
+        return "branch=request-wrong-state"
+    }
+    if ($sdkText -match 'Failed fetching user profile for verification request') {
+        return "branch=sender-profile-fetch-failed"
+    }
+    return "branch=no-sdk-drop-log"
+}
+
+function Write-SynapseAccessDelta {
+    $deltas = Get-SynapseAccessDeltaCounts
+    if ($null -eq $deltas) {
+        foreach ($endpoint in @("keys-query", "send-to-device", "room-send", "sync", "profile", "keys-upload", "device-signing-upload")) {
+            Write-Output "OUTBOX_DIAG_SERVER_ACCESS endpoint=$endpoint status=unknown count=unknown"
+        }
+        return
+    }
+
+    $reportedEndpoints = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($key in @($deltas.Keys | Sort-Object)) {
+        $fields = $key -split "\|"
+        if ($fields.Count -ne 2 -or $fields[0] -notin @("keys-query", "send-to-device", "room-send", "sync", "profile", "keys-upload", "device-signing-upload") -or $fields[1] -notmatch '^[1-5][0-9]{2}$') {
+            continue
+        }
+        Write-Output "OUTBOX_DIAG_SERVER_ACCESS endpoint=$($fields[0]) status=$($fields[1]) count=$([int] $deltas[$key])"
+        $null = $reportedEndpoints.Add($fields[0])
+    }
+    foreach ($endpoint in @("keys-query", "send-to-device", "room-send", "sync", "profile", "keys-upload", "device-signing-upload")) {
+        if (-not $reportedEndpoints.Contains($endpoint)) {
+            Write-Output "OUTBOX_DIAG_SERVER_ACCESS endpoint=$endpoint status=none count=0"
         }
     }
 }
@@ -616,6 +820,7 @@ try {
         "--env", "PRIVATE_MESSENGER_DEBUG_KEYSTORE=/workspace/.tools/private-messenger-debug.keystore",
         "--env", "PRIVATE_MESSENGER_DEBUG_KEYSTORE_PASSWORD=android",
         "gradle:9.5.0-jdk17", "gradle",
+        ":app:testOutboxDiagDebugUnitTest",
         ":app:assembleOutboxDiagDebug", ":app:assembleOutboxDiagDebugAndroidTest",
         "--no-daemon", "--console=plain"
     )
@@ -672,31 +877,67 @@ try {
     Write-Output "OUTBOX_DIAG accounts=provisioned count=2 output=redacted"
     $script:synapseAccessBaseline = Get-SynapseAccessCounts
 
-    Invoke-DiagnosticInstrumentation -Device $device -Stage "prepare" -Marker $marker `
-        -Username $senderUserId -Password $senderPassword -RecipientUserId $recipientUserId `
-        -LoginOnly:$LoginOnly
-    Invoke-AdbChecked -Arguments @("-s", $device, "shell", "am", "force-stop", $applicationId)
-
-    if ($LoginOnly) {
-        Write-Output "OUTBOX_DIAG result=login-only completed=prepare"
-    } else {
-        Invoke-DockerCompose -Arguments @("stop", "synapse")
-        $serverStoppedForOfflineStage = $true
-        if (Test-DiagnosticSynapse) {
-            throw "The isolated Synapse listener remained reachable during the offline phase."
+    if ($PeerAcceptance) {
+        if ($LoginOnly) {
+            throw "Peer acceptance runs all stages and cannot be combined with -LoginOnly."
         }
-        Write-Output "OUTBOX_DIAG server=stopped phase=offline"
+        $peerArguments = @(
+            "-e", "homeserver_url", $deviceHomeserverUrl,
+            "-e", "sender_user_id", $senderUserId,
+            "-e", "sender_password", $senderPassword,
+            "-e", "recipient_user_id", $recipientUserId,
+            "-e", "recipient_password", $peerPassword
+        )
+        $peerClass = "dev.friendline.messenger.data.AndroidPeerAcceptanceIntegrationTest"
 
-        Invoke-DiagnosticInstrumentation -Device $device -Stage "seed-offline" -Marker $marker
+        Invoke-DiagnosticInstrumentation -Device $device -ClassName $peerClass `
+            -Stage "core" -Marker $marker -ExtraArguments $peerArguments
         Invoke-AdbChecked -Arguments @("-s", $device, "shell", "am", "force-stop", $applicationId)
 
-        Invoke-DockerCompose -Arguments @("up", "-d", "synapse")
+        $null = Invoke-DockerCompose -Arguments @("stop", "synapse")
+        $serverStoppedForOfflineStage = $true
+        if (Test-DiagnosticSynapse) {
+            throw "The isolated Synapse listener remained reachable during attachment outage validation."
+        }
+        Write-Output "OUTBOX_DIAG server=stopped phase=attachment-outage"
+        Invoke-DiagnosticInstrumentation -Device $device -ClassName $peerClass `
+            -Stage "attachment-offline" -Marker $marker -ExtraArguments $peerArguments
+        Invoke-AdbChecked -Arguments @("-s", $device, "shell", "am", "force-stop", $applicationId)
+
+        $null = Invoke-DockerCompose -Arguments @("up", "-d", "synapse")
         $serverStoppedForOfflineStage = $false
         Wait-DiagnosticSynapse
-        Write-Output "OUTBOX_DIAG server=ready phase=resume"
+        Write-Output "OUTBOX_DIAG server=ready phase=attachment-resume"
+        Invoke-DiagnosticInstrumentation -Device $device -ClassName $peerClass `
+            -Stage "attachment-resume" -Marker $marker -ExtraArguments $peerArguments
+        Write-Output "OUTBOX_DIAG result=peer-acceptance completed=core,offline-attachment,retry"
+    } else {
+        Invoke-DiagnosticInstrumentation -Device $device -Stage "prepare" -Marker $marker `
+            -Username $senderUserId -Password $senderPassword -RecipientUserId $recipientUserId `
+            -LoginOnly:$LoginOnly
+        Invoke-AdbChecked -Arguments @("-s", $device, "shell", "am", "force-stop", $applicationId)
 
-        Invoke-DiagnosticInstrumentation -Device $device -Stage "resume" -Marker $marker
-        Write-Output "OUTBOX_DIAG result=passed accountData=isolated"
+        if ($LoginOnly) {
+            Write-Output "OUTBOX_DIAG result=login-only completed=prepare"
+        } else {
+            $null = Invoke-DockerCompose -Arguments @("stop", "synapse")
+            $serverStoppedForOfflineStage = $true
+            if (Test-DiagnosticSynapse) {
+                throw "The isolated Synapse listener remained reachable during the offline phase."
+            }
+            Write-Output "OUTBOX_DIAG server=stopped phase=offline"
+
+            Invoke-DiagnosticInstrumentation -Device $device -Stage "seed-offline" -Marker $marker
+            Invoke-AdbChecked -Arguments @("-s", $device, "shell", "am", "force-stop", $applicationId)
+
+            $null = Invoke-DockerCompose -Arguments @("up", "-d", "synapse")
+            $serverStoppedForOfflineStage = $false
+            Wait-DiagnosticSynapse
+            Write-Output "OUTBOX_DIAG server=ready phase=resume"
+
+            Invoke-DiagnosticInstrumentation -Device $device -Stage "resume" -Marker $marker
+            Write-Output "OUTBOX_DIAG result=passed accountData=isolated"
+        }
     }
 } finally {
     if ($composeTouched) {

@@ -8,6 +8,8 @@ services:
       POSTGRES_DB: synapse
       POSTGRES_USER: synapse
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      # Synapse requires C collation/ctype; these args only apply to a new volume.
+      POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
     secrets:
       - postgres_password
     volumes:

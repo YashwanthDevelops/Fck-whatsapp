@@ -19,7 +19,10 @@ import dev.friendline.messenger.data.ConversationSummary
 import dev.friendline.messenger.data.DeviceVerificationUiState
 import dev.friendline.messenger.data.MessageSearchHit
 import dev.friendline.messenger.data.MatrixRepository
+import dev.friendline.messenger.data.PendingVoiceNoteStillQueuedException
 import dev.friendline.messenger.data.PeerTrustStatus
+import dev.friendline.messenger.push.PushRegistrationStatus
+import dev.friendline.messenger.BuildConfig
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -46,7 +49,8 @@ private const val MAX_VOICE_NOTE_DURATION_MILLIS = 5 * 60 * 1000
 private const val MIN_VOICE_NOTE_DURATION_MILLIS = 500
 
 data class MessengerUiState(
-    val homeserver: String = "http://10.0.2.2:8008",
+    // Keep emulator-only HTTP out of release builds; users enter their private HTTPS host.
+    val homeserver: String = if (BuildConfig.DEBUG) "http://10.0.2.2:8008" else "",
     val username: String = "",
     val password: String = "",
     val userId: String? = null,
@@ -55,6 +59,7 @@ data class MessengerUiState(
     val isRecordingVoiceNote: Boolean = false,
     val voiceRecordingStartedAtMillis: Long? = null,
     val voiceNoteFilePath: String? = null,
+    val voiceNoteRoomId: String? = null,
     val voiceNoteDurationMillis: Int = 0,
     val isSendingVoiceNote: Boolean = false,
     val audioPlayback: AudioPlaybackUiState = AudioPlaybackUiState(),
@@ -69,6 +74,8 @@ data class MessengerUiState(
     val searchHasMore: Boolean = false,
     val searchLoading: Boolean = false,
     val readReceiptsEnabled: Boolean = false,
+    val pushNotificationsEnabled: Boolean = false,
+    val pushRegistrationStatus: PushRegistrationStatus = PushRegistrationStatus.NOT_ENABLED,
     val verification: DeviceVerificationUiState? = null,
     val peerTrust: PeerTrustStatus = PeerTrustStatus.UNKNOWN,
     val currentRoomId: String? = null,
@@ -137,6 +144,12 @@ class MessengerViewModel(context: Context) : ViewModel() {
         viewModelScope.launch {
             repository.readReceiptsEnabled.collect { value -> _state.update { it.copy(readReceiptsEnabled = value) } }
         }
+        viewModelScope.launch {
+            repository.pushNotificationsEnabled.collect { value -> _state.update { it.copy(pushNotificationsEnabled = value) } }
+        }
+        viewModelScope.launch {
+            repository.pushRegistrationStatus.collect { value -> _state.update { it.copy(pushRegistrationStatus = value) } }
+        }
     }
 
     fun restoreSessionIfPresent() {
@@ -166,6 +179,36 @@ class MessengerViewModel(context: Context) : ViewModel() {
     fun updatePassword(value: String) = _state.update { it.copy(password = value, error = null) }
     fun showNewConversation(show: Boolean) = _state.update { it.copy(showNewConversation = show, error = null) }
     fun clearError() = _state.update { it.copy(error = null) }
+
+    fun setPushNotificationsEnabled(enabled: Boolean) {
+        if (logoutRequested) return
+        viewModelScope.launch {
+            runCatching { repository.setPushNotificationsEnabled(enabled) }
+                .onFailure {
+                    _state.update { state -> state.copy(pushRegistrationStatus = PushRegistrationStatus.FAILED) }
+                }
+        }
+    }
+
+    fun onPushPermissionResult(granted: Boolean) {
+        if (granted) {
+            refreshPushNotifications()
+        } else {
+            _state.update { it.copy(pushRegistrationStatus = PushRegistrationStatus.PERMISSION_REQUIRED) }
+        }
+    }
+
+    fun refreshPushNotifications() {
+        if (logoutRequested) return
+        viewModelScope.launch {
+            runCatching { repository.refreshPushNotifications() }
+                .onFailure {
+                    _state.update { state -> state.copy(pushRegistrationStatus = PushRegistrationStatus.FAILED) }
+                }
+        }
+    }
+
+    fun retryPushNotifications() = refreshPushNotifications()
 
     fun signIn() {
         val snapshot = _state.value
@@ -228,8 +271,14 @@ class MessengerViewModel(context: Context) : ViewModel() {
     }
 
     fun openConversation(roomId: String) {
-        if (_state.value.currentRoomId != null && _state.value.currentRoomId != roomId) {
+        val beforeOpen = _state.value
+        if (beforeOpen.currentRoomId != null && beforeOpen.currentRoomId != roomId &&
+            !beforeOpen.isSendingVoiceNote &&
+            voiceNoteDraftCanBeSentTo(beforeOpen.voiceNoteRoomId, beforeOpen.currentRoomId)
+        ) {
             discardVoiceNote()
+        }
+        if (beforeOpen.currentRoomId != null && beforeOpen.currentRoomId != roomId) {
             stopAudioPlayback()
         }
         val conversation = repository.conversations.value.firstOrNull { it.roomId == roomId }
@@ -237,7 +286,13 @@ class MessengerViewModel(context: Context) : ViewModel() {
             _state.update {
                 it.copy(
                     isBusy = true,
-                    error = null,
+                    error = if (it.voiceNoteFilePath != null &&
+                        !voiceNoteDraftCanBeSentTo(it.voiceNoteRoomId, roomId)
+                    ) {
+                        "This voice recording belongs to another conversation. Return there or discard it before sending."
+                    } else {
+                        null
+                    },
                     currentRoomId = roomId,
                     currentRoomTitle = conversation?.title ?: "Private conversation",
                     currentRoomEncrypted = conversation?.isEncrypted == true,
@@ -264,10 +319,33 @@ class MessengerViewModel(context: Context) : ViewModel() {
         }
     }
 
+    fun joinVerificationChannel(roomId: String) {
+        if (logoutRequested || _state.value.isBusy) return
+        viewModelScope.launch {
+            _state.update { it.copy(isBusy = true, error = null) }
+            runCatching {
+                repository.joinVerificationControlRoom(roomId)
+                repository.refreshConversations()
+            }
+                .onSuccess {
+                    _state.update { it.copy(isBusy = false, error = null) }
+                }
+                .onFailure {
+                    _state.update {
+                        it.copy(
+                            isBusy = false,
+                            error = "Couldn't join this verification channel. Confirm it's from someone in an existing encrypted conversation, then sync and try again.",
+                        )
+                    }
+                }
+        }
+    }
+
     fun closeConversation() {
-        val roomId = _state.value.currentRoomId
-        val currentDraft = _state.value.composerDraft
-        if (!_state.value.isSendingVoiceNote) discardVoiceNote()
+        val snapshot = _state.value
+        val roomId = snapshot.currentRoomId
+        val currentDraft = snapshot.composerDraft
+        if (!snapshot.isSendingVoiceNote) discardVoiceNote()
         stopAudioPlayback()
         draftJob?.cancel()
         viewModelScope.launch {
@@ -284,7 +362,13 @@ class MessengerViewModel(context: Context) : ViewModel() {
                     replyTarget = null,
                     messageSearchQuery = "",
                     typingUsers = emptyList(),
-                    error = null,
+                    error = if (it.voiceNoteFilePath != null &&
+                        !voiceNoteDraftCanBeSentTo(it.voiceNoteRoomId, roomId)
+                    ) {
+                        "This voice recording belongs to another conversation. Return there or discard it before sending."
+                    } else {
+                        null
+                    },
                 )
             }
         }
@@ -340,6 +424,15 @@ class MessengerViewModel(context: Context) : ViewModel() {
         viewModelScope.launch {
             runCatching { repository.setReadReceiptsEnabled(enabled) }
                 .onFailure { _state.update { it.copy(error = "Couldn't save your privacy setting.") } }
+        }
+    }
+
+    fun markMessageAsVisible(eventId: String, timestampMillis: Long) {
+        val current = _state.value
+        val roomId = current.currentRoomId ?: return
+        if (!current.currentRoomEncrypted || !current.readReceiptsEnabled) return
+        viewModelScope.launch {
+            runCatching { repository.markMessageAsRead(roomId, eventId, timestampMillis) }
         }
     }
 
@@ -469,13 +562,21 @@ class MessengerViewModel(context: Context) : ViewModel() {
                     error = null,
                     isRecordingVoiceNote = true,
                     voiceRecordingStartedAtMillis = SystemClock.elapsedRealtime(),
+                    voiceNoteRoomId = snapshot.currentRoomId,
                     voiceNoteDurationMillis = 0,
                 )
             }
         } catch (_: Exception) {
             runCatching { recorder.release() }
             repository.deleteTemporaryMediaFile(file)
-            _state.update { it.copy(isRecordingVoiceNote = false, voiceRecordingStartedAtMillis = null, error = "Couldn't start recording. Check microphone access and try again.") }
+            _state.update {
+                it.copy(
+                    isRecordingVoiceNote = false,
+                    voiceRecordingStartedAtMillis = null,
+                    voiceNoteRoomId = null,
+                    error = "Couldn't start recording. Check microphone access and try again.",
+                )
+            }
         }
     }
 
@@ -500,6 +601,7 @@ class MessengerViewModel(context: Context) : ViewModel() {
                     isRecordingVoiceNote = false,
                     voiceRecordingStartedAtMillis = null,
                     voiceNoteFilePath = null,
+                    voiceNoteRoomId = null,
                     voiceNoteDurationMillis = 0,
                     error = "Hold record for a moment to make a voice message, or cancel to discard it.",
                 )
@@ -518,6 +620,7 @@ class MessengerViewModel(context: Context) : ViewModel() {
     }
 
     fun discardVoiceNote() {
+        val snapshot = _state.value
         val recorder = voiceRecorder
         val recordingFile = voiceRecordingFile
         voiceRecorder = null
@@ -528,12 +631,26 @@ class MessengerViewModel(context: Context) : ViewModel() {
             runCatching { recorder.release() }
         }
         recordingFile?.let(repository::deleteTemporaryMediaFile)
-        _state.value.voiceNoteFilePath?.let { path -> repository.deleteTemporaryMediaFile(File(path)) }
+        snapshot.voiceNoteFilePath?.let { path ->
+            val file = File(path)
+            val roomId = snapshot.voiceNoteRoomId ?: snapshot.currentRoomId
+            if (roomId != null) {
+                val sizeBytes = file.length()
+                val durationMillis = snapshot.voiceNoteDurationMillis.toLong()
+                viewModelScope.launch {
+                    runCatching {
+                        repository.markVoiceNoteDraftCleared(roomId, file.name, sizeBytes, durationMillis)
+                    }
+                }
+            }
+            repository.deleteTemporaryMediaFile(file)
+        }
         _state.update {
             it.copy(
                 isRecordingVoiceNote = false,
                 voiceRecordingStartedAtMillis = null,
                 voiceNoteFilePath = null,
+                voiceNoteRoomId = null,
                 voiceNoteDurationMillis = 0,
             )
         }
@@ -545,10 +662,23 @@ class MessengerViewModel(context: Context) : ViewModel() {
         val roomId = snapshot.currentRoomId ?: return
         if (!snapshot.currentRoomEncrypted || snapshot.isSendingAttachment || snapshot.isSendingVoiceNote) return
         val path = snapshot.voiceNoteFilePath ?: return
+        if (!voiceNoteDraftCanBeSentTo(snapshot.voiceNoteRoomId, roomId)) {
+            _state.update {
+                it.copy(error = "This voice recording belongs to another conversation. Return there or discard it before sending.")
+            }
+            return
+        }
         val file = File(path)
         if (!file.isFile || file.length() == 0L) {
             repository.deleteTemporaryMediaFile(file)
-            _state.update { it.copy(voiceNoteFilePath = null, voiceNoteDurationMillis = 0, error = "The voice recording expired. Record it again to send.") }
+            _state.update {
+                it.copy(
+                    voiceNoteFilePath = null,
+                    voiceNoteRoomId = null,
+                    voiceNoteDurationMillis = 0,
+                    error = "The voice recording expired. Record it again to send.",
+                )
+            }
             return
         }
         val replyTo = snapshot.replyTarget?.eventId
@@ -559,17 +689,32 @@ class MessengerViewModel(context: Context) : ViewModel() {
                 repository.sendAttachment(roomId, contentUri.toString(), replyTo, snapshot.voiceNoteDurationMillis.toLong())
             }
             result.onSuccess {
+                runCatching {
+                    repository.markVoiceNoteDraftCleared(
+                        roomId = roomId,
+                        fileName = file.name,
+                        sizeBytes = file.length(),
+                        durationMillis = snapshot.voiceNoteDurationMillis.toLong(),
+                    )
+                }
                 repository.deleteTemporaryMediaFile(file)
                 _state.update {
                     it.copy(
                         voiceNoteFilePath = null,
+                        voiceNoteRoomId = null,
                         voiceNoteDurationMillis = 0,
                         replyTarget = null,
+                        error = null,
                     )
                 }
-            }.onFailure {
+            }.onFailure { error ->
+                val message = if (error is PendingVoiceNoteStillQueuedException) {
+                    "This voice message is already queued. Wait for its status to change before trying again."
+                } else {
+                    "Couldn't send this encrypted voice message. Check your connection and try again."
+                }
                 _state.update {
-                    it.copy(error = "Couldn't send this encrypted voice message. Check your connection and try again.")
+                    it.copy(error = message)
                 }
             }
             _state.update { it.copy(isSendingAttachment = false, isSendingVoiceNote = false) }
@@ -722,6 +867,7 @@ class MessengerViewModel(context: Context) : ViewModel() {
 
     fun onReturnedToAppFromExternalViewer() {
         repository.cleanupExternalViewerFiles()
+        refreshPushNotifications()
     }
 
     fun retryFailedMessages() {
@@ -753,7 +899,15 @@ class MessengerViewModel(context: Context) : ViewModel() {
                 .onFailure {
                     logoutRequested = false
                     _state.update {
-                        it.copy(isBusy = false, error = "Secure sign-out couldn't finish. Your saved session is still available; try again.")
+                        val pushCleanupPending = repository.pushRegistrationStatus.value == PushRegistrationStatus.REMOVAL_PENDING
+                        it.copy(
+                            isBusy = false,
+                            error = if (pushCleanupPending) {
+                                "This device's push registration couldn't be removed. You are still signed in; retry cleanup in Settings before signing out."
+                            } else {
+                                "Secure sign-out couldn't finish. Your saved session is still available; try again."
+                            },
+                        )
                     }
                 }
         }
@@ -779,6 +933,9 @@ class MessengerViewModel(context: Context) : ViewModel() {
         super.onCleared()
     }
 }
+
+internal fun voiceNoteDraftCanBeSentTo(ownerRoomId: String?, selectedRoomId: String?): Boolean =
+    ownerRoomId != null && ownerRoomId == selectedRoomId
 
 class MessengerViewModelFactory(private val context: Context) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")

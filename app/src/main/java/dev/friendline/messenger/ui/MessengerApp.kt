@@ -1,13 +1,22 @@
 package dev.friendline.messenger.ui
 
+import android.content.Intent
+import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.platform.LocalContext
+import dev.friendline.messenger.push.MatrixPushClient
 
 @Composable
 fun MessengerApp(viewModel: MessengerViewModel) {
     val state by viewModel.state.collectAsState()
+    val context = LocalContext.current
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = MatrixPushClient.notificationPermissionContract(),
+    ) { granted -> viewModel.onPushPermissionResult(granted) }
 
     LaunchedEffect(Unit) { viewModel.restoreSessionIfPresent() }
 
@@ -38,6 +47,7 @@ fun MessengerApp(viewModel: MessengerViewModel) {
             onBack = viewModel::closeConversation,
             onSend = { text -> viewModel.sendText(text) },
             onSendAttachment = viewModel::sendAttachment,
+            onMessageVisible = viewModel::markMessageAsVisible,
             onStartVoiceRecording = viewModel::startVoiceRecording,
             onStopVoiceRecording = viewModel::stopVoiceRecording,
             onDiscardVoiceNote = viewModel::discardVoiceNote,
@@ -67,13 +77,30 @@ fun MessengerApp(viewModel: MessengerViewModel) {
             userId = state.userId,
             connection = state.connection,
             conversations = state.conversations,
+            isBusy = state.isBusy,
             readReceiptsEnabled = state.readReceiptsEnabled,
+            pushNotificationsEnabled = state.pushNotificationsEnabled,
+            pushRegistrationStatus = state.pushRegistrationStatus,
+            pushNotificationsConfigured = MatrixPushClient.isConfigured,
             error = state.error,
             onOpen = viewModel::openConversation,
             onNew = { viewModel.showNewConversation(true) },
             onLogout = viewModel::logout,
             onReadReceiptsChange = viewModel::setReadReceiptsEnabled,
+            onPushNotificationsChange = { enabled ->
+                viewModel.setPushNotificationsEnabled(enabled)
+                if (enabled) {
+                    MatrixPushClient.notificationPermissionToRequest(context)?.let(notificationPermissionLauncher::launch)
+                }
+            },
+            onRetryPushNotifications = viewModel::retryPushNotifications,
+            onOpenNotificationSettings = {
+                val settingsIntent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                    .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                runCatching { context.startActivity(settingsIntent) }
+            },
             onClearError = viewModel::clearError,
+            onJoinVerification = viewModel::joinVerificationChannel,
         )
         else -> LoginScreen(
             homeserver = state.homeserver,

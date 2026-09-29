@@ -35,6 +35,7 @@ config["report_stats"] = False
 config["federation_domain_whitelist"] = []
 config["trusted_key_servers"] = []
 config["suppress_key_server_warning"] = True
+config["max_upload_size"] = "34M"
 push = config.get("push") or {}
 push["include_content"] = False
 config["push"] = push

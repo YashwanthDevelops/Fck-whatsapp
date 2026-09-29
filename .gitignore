@@ -5,6 +5,9 @@
 /.tools/
 **/build/
 **/.gradle/
+__pycache__/
+*.py[cod]
+.pytest_cache/
 **/DerivedData/
 **/xcuserdata/
 *.jks
@@ -24,5 +27,7 @@
 *.p12
 *.mobileprovision
 local.properties
+# Per-project Firebase client configuration for local Android builds.
+**/google-services.json
 .DS_Store
 Thumbs.db

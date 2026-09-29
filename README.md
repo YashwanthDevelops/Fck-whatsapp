@@ -1,6 +1,6 @@
 <div align="center">
 
-# Fck-whatsapp
+# Private Messenger
 
 **Private conversations for a small circle of friends.**
 
