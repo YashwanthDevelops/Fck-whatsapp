@@ -1391,7 +1391,15 @@ final class MessengerStore: ObservableObject {
                 await refreshCurrentPeerTrust(fallbackToServer: true)
                 guard roomOpenGeneration == generation, !isSigningOut else { return }
             }
-            let timeline = try await room.timeline()
+            let timelineConfiguration = TimelineConfiguration(
+                focus: .live(hideThreadedEvents: false),
+                filter: .all,
+                internalIdPrefix: "conversation-\(UUID().uuidString)",
+                dateDividerMode: .daily,
+                trackReadReceipts: .messageLikeEvents,
+                reportUtds: true
+            )
+            let timeline = try await room.timelineWithConfiguration(configuration: timelineConfiguration)
             guard roomOpenGeneration == generation, !isSigningOut else {
                 timeline.close()
                 return
@@ -3831,8 +3839,7 @@ final class MessengerStore: ObservableObject {
         guard let event = item.asEvent(), case let .msgLike(message) = event.content,
               case let .message(content) = message.kind else { return }
 
-        if case let .other(msgtype, acknowledgedEventId) = content.msgType {
-            guard msgtype == Self.deliveryAckMsgtype else { return }
+        if let acknowledgedEventId = Self.deliveryAckTarget(from: content.msgType) {
             recordObservedDeliveryAcknowledgement(
                 roomId: roomId,
                 eventId: acknowledgedEventId,
@@ -3871,7 +3878,7 @@ final class MessengerStore: ObservableObject {
             replyToEventId = message.inReplyTo?.eventId()
             switch message.kind {
             case let .message(content):
-                if case let .other(msgtype, _) = content.msgType, msgtype == Self.deliveryAckMsgtype { return nil }
+                if Self.deliveryAckTarget(from: content.msgType) != nil { return nil }
                 body = content.body
                 attachment = Self.attachment(from: content.msgType)
                 canMarkAsRead = Self.isSupportedMessageType(content.msgType)
@@ -4081,7 +4088,10 @@ final class MessengerStore: ObservableObject {
               let room = client.rooms().first(where: { $0.id() == roomId }),
               room.encryptionState() == .encrypted else { throw MessengerError.messageUnavailable }
         let timeline = try await room.timeline()
-        guard let content = timeline.createMessageContent(msgType: .other(msgtype: Self.deliveryAckMsgtype, body: eventId)) else {
+        guard let body = Self.encodedDeliveryAckBody(eventId),
+              let content = timeline.createMessageContent(
+                msgType: .text(content: TextMessageContent(body: body, formatted: nil))
+              ) else {
             throw MessengerError.messageUnavailable
         }
         _ = try await withTrackedRoomQueueWrite(roomId: roomId) {
@@ -4736,6 +4746,34 @@ final class MessengerStore: ObservableObject {
     }
 
     private static let deliveryAckMsgtype = "org.friendline.delivery"
+    private static let deliveryAckTextPrefix = "\u{2063}org.friendline.delivery-ack.v1:"
+    private static let maximumDeliveryAckEventIdLength = 1024
+
+    private static func deliveryAckTarget(from messageType: MessageType) -> String? {
+        switch messageType {
+        case let .other(msgtype, eventId):
+            // Continue to consume acknowledgements emitted by older iOS builds.
+            return msgtype == deliveryAckMsgtype ? eventId : nil
+        case let .text(content):
+            let body = content.body
+            guard body.hasPrefix(deliveryAckTextPrefix) else { return nil }
+            let eventId = String(body.dropFirst(deliveryAckTextPrefix.count))
+            guard !eventId.isEmpty,
+                  eventId.utf16.count <= maximumDeliveryAckEventIdLength,
+                  eventId.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return nil }
+            return eventId
+        default:
+            return nil
+        }
+    }
+
+    private static func encodedDeliveryAckBody(_ eventId: String) -> String? {
+        guard !eventId.isEmpty,
+              eventId.utf16.count <= maximumDeliveryAckEventIdLength,
+              eventId.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return nil }
+        return deliveryAckTextPrefix + eventId
+    }
+
     private static let maximumAttachmentBytes: UInt64 = 100 * 1024 * 1024
 }
 

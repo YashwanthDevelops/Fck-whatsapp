@@ -36,7 +36,7 @@ fun VerificationDialog(
         DeviceVerificationStatus.WAITING_FOR_ACCEPT -> "Waiting for your friend"
         DeviceVerificationStatus.COMPARING -> if (comparing) "Compare the safety code" else "Connecting securely"
         DeviceVerificationStatus.CONFIRMING -> "Confirming verification"
-        DeviceVerificationStatus.VERIFIED -> "Identity verified"
+        DeviceVerificationStatus.VERIFIED -> "Device verified"
         DeviceVerificationStatus.CANCELLED -> "Verification cancelled"
         DeviceVerificationStatus.FAILED -> "Verification failed"
         DeviceVerificationStatus.REQUESTING -> "Starting verification"
@@ -54,7 +54,7 @@ fun VerificationDialog(
         DeviceVerificationStatus.CONFIRMING ->
             "Waiting for both devices to confirm that the full safety code matches."
         DeviceVerificationStatus.VERIFIED ->
-            "The verification completed. This conversation can now use the verified account identity when sharing encrypted room keys."
+            "The safety-code check completed for this device. Devices added later need their own verification, and the conversation still shows any remaining account-trust warning."
         DeviceVerificationStatus.CANCELLED ->
             "No trust was added. You can start another verification when both of you are ready."
         DeviceVerificationStatus.FAILED ->

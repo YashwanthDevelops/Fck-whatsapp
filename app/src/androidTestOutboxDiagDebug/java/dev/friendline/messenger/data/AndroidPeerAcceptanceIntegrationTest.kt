@@ -41,6 +41,7 @@ class AndroidPeerAcceptanceIntegrationTest {
         var step = "argument-validation"
         var sender: MatrixRepository? = null
         var recipient: MatrixRepository? = null
+        var groupPeer: MatrixRepository? = null
         var senderIdentityState: String? = null
         var recipientIdentityState: String? = null
         InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
@@ -56,13 +57,17 @@ class AndroidPeerAcceptanceIntegrationTest {
             val senderPassword = checkNotNull(args.getString("sender_password"))
             val recipientId = checkNotNull(args.getString("recipient_user_id"))
             val recipientPassword = checkNotNull(args.getString("recipient_password"))
+            val groupPeerId = checkNotNull(args.getString("group_peer_user_id"))
+            val groupPeerPassword = checkNotNull(args.getString("group_peer_password"))
             stage = checkNotNull(args.getString("stage"))
             val appContext = instrumentation.targetContext
             val stateFile = File(appContext.noBackupFilesDir, "peer-acceptance/session.json")
             val activeSender = newIsolatedRepository(appContext, "sender")
             val activeRecipient = newIsolatedRepository(appContext, "recipient")
+            val activeGroupPeer = newIsolatedRepository(appContext, "group-peer")
             sender = activeSender
             recipient = activeRecipient
+            groupPeer = activeGroupPeer
             reportProgress(instrumentation, stage, "repository-construction", "complete")
 
             when (stage) {
@@ -72,9 +77,12 @@ class AndroidPeerAcceptanceIntegrationTest {
                     senderPassword,
                     recipientId,
                     recipientPassword,
+                    groupPeerId,
+                    groupPeerPassword,
                     marker,
                     activeSender,
                     activeRecipient,
+                    activeGroupPeer,
                     stateFile,
                     instrumentation,
                     onStep = { step = it },
@@ -150,6 +158,7 @@ class AndroidPeerAcceptanceIntegrationTest {
             throw failure
         } finally {
             runCatching { recipient?.close() }
+            runCatching { groupPeer?.close() }
             runCatching { sender?.close() }
         }
     }
@@ -160,9 +169,12 @@ class AndroidPeerAcceptanceIntegrationTest {
         senderPassword: String,
         recipientId: String,
         recipientPassword: String,
+        groupPeerId: String,
+        groupPeerPassword: String,
         marker: String,
         sender: MatrixRepository,
         recipient: MatrixRepository,
+        groupPeer: MatrixRepository,
         stateFile: File,
         instrumentation: android.app.Instrumentation,
         onStep: (String) -> Unit,
@@ -172,6 +184,7 @@ class AndroidPeerAcceptanceIntegrationTest {
         reportProgress(instrumentation, "core", "repositoryLogin", "start")
         loginFresh(sender, homeserver, senderId, senderPassword)
         loginFresh(recipient, homeserver, recipientId, recipientPassword)
+        loginFresh(groupPeer, homeserver, groupPeerId, groupPeerPassword)
         reportProgress(instrumentation, "core", "repositoryLogin", "complete")
 
         onStep("createEncryptedConversation")
@@ -205,6 +218,7 @@ class AndroidPeerAcceptanceIntegrationTest {
             sender,
             recipient,
             roomId,
+            recipientId,
             onVerificationStep = { step ->
                 onStep(step)
                 reportProgress(instrumentation, "core", step, "start")
@@ -212,6 +226,9 @@ class AndroidPeerAcceptanceIntegrationTest {
             onIdentityState = onIdentityState,
         )
         reportProgress(instrumentation, "core", "verifyDiagnosticRoom", "complete")
+
+        onStep("editAndRedactEncryptedMessage")
+        verifyMessageEditingAndRedaction(roomId, marker, sender, recipient)
 
         val backgroundRoomId = sender.createEncryptedConversation(
             invitedUserIds = listOf(recipientId),
@@ -233,11 +250,12 @@ class AndroidPeerAcceptanceIntegrationTest {
         val backgroundMessage = "peer-background-room-$marker"
         onStep("sendText")
         sender.sendText(roomId, backgroundMessage)
-        onStep("awaitDelivery")
+        onStep("awaitBackgroundDelivery")
         try {
             awaitMessage(sender, "delivery acknowledgement while recipient is in another room") {
                 it.body == backgroundMessage && it.isOwn && it.deliveryState == "Delivered"
             }
+            println("OUTBOX_DIAG_BACKGROUND_ACK delivered=true")
         } catch (failure: Throwable) {
             val sentMessage = sender.messages.value.firstOrNull {
                 it.body == backgroundMessage && it.isOwn
@@ -260,6 +278,17 @@ class AndroidPeerAcceptanceIntegrationTest {
             }
             val observation = "${sentMessage != null}|$senderState|$recipientSawMessage|$recipientConnected"
             val eventId = sentMessage?.eventId
+            val senderConnected = when (sender.connection.value) {
+                "Connected" -> "true"
+                "Disconnected" -> "false"
+                else -> "other"
+            }
+            println(
+                "OUTBOX_DIAG_DELIVERY_FAILURE senderMessage=${sentMessage != null} " +
+                    "eventIdPresent=${eventId != null} senderState=$senderState " +
+                    "senderConnected=$senderConnected recipientSawMessage=$recipientSawMessage " +
+                    "recipientConnected=$recipientConnected",
+            )
             val ackTrace = eventId?.let {
                 val senderAck = sender.deliveryAckDiagnosticSnapshot(roomId, it)
                 val recipientAck = recipient.deliveryAckDiagnosticSnapshot(roomId, it)
@@ -295,6 +324,48 @@ class AndroidPeerAcceptanceIntegrationTest {
                 val senderSawUndecryptableEvent = sender.messages.value.any {
                     !it.isOwn && it.body == "Unable to decrypt this message"
                 }
+                val utdCauseSummary = sender.utdCauseCountsForDiagnostic()
+                    .toSortedMap()
+                    .entries
+                    .joinToString(",") { (cause, count) -> "$cause=${count.coerceAtMost(999)}" }
+                    .ifBlank { "none" }
+                val timelineCategorySummary = sender.timelineCategoriesForDiagnostic(roomId)
+                    .toSortedMap()
+                    .entries
+                    .joinToString(",") { (category, count) -> "$category=${count.coerceAtMost(999)}" }
+                    .ifBlank { "none" }
+                val serverEncryptedEventCounts = runCatching {
+                    sender.recentEncryptedEventCountsForDiagnostic(roomId, recipientId)
+                }.getOrDefault("0|0|0|0")
+                val serverPeerEncryptedBefore = serverEncryptedEventCounts.split('|')
+                    .getOrNull(1)?.toIntOrNull() ?: 0
+                val reciprocalBody = "peer-reciprocal-$marker"
+                val reciprocalSent = runCatching {
+                    recipient.sendText(roomId, reciprocalBody)
+                }.isSuccess
+                if (reciprocalSent) {
+                    withTimeoutOrNull(5_000) {
+                        while (sender.messages.value.none { !it.isOwn && it.body == reciprocalBody }) {
+                            delay(250)
+                        }
+                    }
+                }
+                runCatching { sender.openConversation(roomId) }
+                delay(1_000)
+                val senderReceivedReciprocal = sender.messages.value.any {
+                    !it.isOwn && it.body == reciprocalBody
+                }
+                val serverEncryptedEventCountsAfter = runCatching {
+                    sender.recentEncryptedEventCountsForDiagnostic(roomId, recipientId)
+                }.getOrDefault("0|0|0|0")
+                val serverPeerEncryptedAfter = serverEncryptedEventCountsAfter.split('|')
+                    .getOrNull(1)?.toIntOrNull() ?: 0
+                val reciprocalProbe = listOf(
+                    reciprocalSent,
+                    senderReceivedReciprocal,
+                    serverPeerEncryptedBefore,
+                    serverPeerEncryptedAfter,
+                ).joinToString("|")
                 InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
                     putString(
                         "outbox_diag_ack_replay",
@@ -302,7 +373,15 @@ class AndroidPeerAcceptanceIntegrationTest {
                             "${replayedAck.expectedRecipientCount}|${replayedAck.acknowledgedRecipientCount}|" +
                             senderSawUndecryptableEvent,
                     )
+                    putString("outbox_diag_utd_causes", utdCauseSummary)
+                    putString("outbox_diag_timeline_categories", timelineCategorySummary)
+                    putString("outbox_diag_server_event_counts", serverEncryptedEventCounts)
+                    putString("outbox_diag_reciprocal_probe", reciprocalProbe)
                 })
+                println("OUTBOX_DIAG_UTD_CAUSES observer=sender counts=$utdCauseSummary")
+                println("OUTBOX_DIAG_TIMELINE_CATEGORIES observer=sender counts=$timelineCategorySummary")
+                println("OUTBOX_DIAG_SERVER_ENCRYPTED_EVENTS statusAndCounts=$serverEncryptedEventCounts")
+                println("OUTBOX_DIAG_RECIPROCAL_PROBE sent=$reciprocalSent senderReceived=$senderReceivedReciprocal peerEncryptedBefore=$serverPeerEncryptedBefore peerEncryptedAfter=$serverPeerEncryptedAfter")
             }
             InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
                 putString("outbox_diag_background_delivery", observation)
@@ -334,27 +413,109 @@ class AndroidPeerAcceptanceIntegrationTest {
         assertEquals(recipientId, restoredRecipient)
         awaitConnected(recipient)
         recipient.openConversation(backgroundRoomId)
-        onStep("awaitDelivery")
-        awaitMessage(sender, "offline acknowledgement while recipient remains in room B") {
-            it.body == offlineMessage && it.isOwn && it.deliveryState == "Delivered"
+        onStep("awaitOfflineDeliveryAck")
+        try {
+            awaitMessage(sender, "offline acknowledgement while recipient remains in room B") {
+                it.body == offlineMessage && it.isOwn && it.deliveryState == "Delivered"
+            }
+        } catch (failure: Throwable) {
+            runCatching { sender.openConversation(roomId) }
+            delay(1_000)
+            val offlineSenderMessage = sender.messages.value.firstOrNull {
+                it.body == offlineMessage && it.isOwn
+            }
+            val offlineEventId = offlineSenderMessage?.eventId
+            val offlineSenderState = when (offlineSenderMessage?.deliveryState) {
+                "Queued" -> "queued"
+                "Sending" -> "sending"
+                "Sent" -> "sent"
+                "Delivered" -> "delivered"
+                "Retry needed" -> "retry"
+                else -> "other"
+            }
+            val offlineSenderAck = offlineEventId?.let {
+                runCatching { sender.deliveryAckDiagnosticSnapshot(roomId, it) }.getOrNull()
+            }
+            val offlineRecipientAck = offlineEventId?.let {
+                runCatching { recipient.deliveryAckDiagnosticSnapshot(roomId, it) }.getOrNull()
+            }
+            val offlineServerCounts = runCatching {
+                sender.recentEncryptedEventCountsForDiagnostic(roomId, recipientId)
+            }.getOrDefault("0|0|0|0")
+            val offlinePeerEncrypted = offlineServerCounts.split('|')
+                .getOrNull(1)?.toIntOrNull() ?: 0
+            val offlineAckState = listOf(
+                offlineSenderAck?.state ?: "missing",
+                offlineRecipientAck?.state ?: "missing",
+                offlineRecipientAck?.observerInstalled ?: false,
+                offlineSenderAck?.remoteAckMessageCount ?: 0,
+                offlinePeerEncrypted,
+            ).joinToString("|")
+            InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                putString(
+                    "outbox_diag_offline_ack",
+                    "${offlineSenderMessage != null}|${offlineEventId != null}|$offlineSenderState|$offlineAckState",
+                )
+            })
+            println(
+                "OUTBOX_DIAG_OFFLINE_ACK senderMessage=${offlineSenderMessage != null} " +
+                    "eventIdPresent=${offlineEventId != null} senderState=$offlineSenderState " +
+                    "senderAck=${offlineSenderAck?.state ?: "missing"} " +
+                    "recipientAck=${offlineRecipientAck?.state ?: "missing"} " +
+                    "recipientObserver=${offlineRecipientAck?.observerInstalled ?: false} " +
+                    "senderRemoteAckMessages=${offlineSenderAck?.remoteAckMessageCount ?: 0} " +
+                    "peerEncryptedEvents=$offlinePeerEncrypted",
+            )
+            throw failure
         }
         recipient.openConversation(roomId)
-        onStep("awaitDelivery")
+        onStep("awaitOfflineBacklog")
         val decryptedOfflineMessage = awaitMessage(recipient, "decrypted offline backlog") {
             it.body == offlineMessage && !it.isOwn
         }
+        val offlineEventId = checkNotNull(decryptedOfflineMessage.eventId)
+        sender.watchReadReceiptForDiagnostic(offlineEventId)
         recipient.setReadReceiptsEnabled(true)
+        onStep("sendReadReceipt")
         recipient.markMessageAsRead(
             roomId,
-            checkNotNull(decryptedOfflineMessage.eventId),
+            offlineEventId,
             decryptedOfflineMessage.timestampMillis,
         )
-        awaitMessage(sender, "Matrix read receipt") {
-            it.body == offlineMessage && it.isOwn && it.hasBeenRead
+        println("OUTBOX_DIAG_READ_RECEIPT_SEND returned=true")
+        onStep("awaitReadReceipt")
+        val readReceiptObserved = awaitCondition("Matrix read receipt") {
+            sender.messages.value.any {
+                it.body == offlineMessage && it.isOwn && it.hasBeenRead
+            }
         }
+        val readReceiptSnapshot = sender.readReceiptDiagnosticSnapshot()
+        val sdkReceiptCacheState = runCatching {
+            sender.peerReadReceiptCacheStateForDiagnostic(roomId, recipientId, offlineEventId)
+        }.getOrDefault("unavailable")
+        val readReceiptTrace = listOf(
+            readReceiptSnapshot.eventSeen,
+            readReceiptSnapshot.isOwnEvent,
+            readReceiptSnapshot.hasOtherReader,
+            readReceiptSnapshot.mappedReadState,
+            readReceiptSnapshot.appModelReadState,
+            readReceiptSnapshot.updateCount,
+            sdkReceiptCacheState,
+        ).joinToString("|")
+        InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+            putString("outbox_diag_read_receipt_trace", readReceiptTrace)
+        })
+        println(
+            "OUTBOX_DIAG_READ_RECEIPT_TRACE eventSeen=${readReceiptSnapshot.eventSeen} " +
+                "ownEvent=${readReceiptSnapshot.isOwnEvent} otherReader=${readReceiptSnapshot.hasOtherReader} " +
+                "mappedRead=${readReceiptSnapshot.mappedReadState} appRead=${readReceiptSnapshot.appModelReadState} " +
+                "updates=${readReceiptSnapshot.updateCount} " +
+                "sdkCache=$sdkReceiptCacheState",
+        )
+        check(readReceiptObserved) { "The sender timeline did not reflect the recipient's read receipt" }
 
         recipient.sendTypingNotice(roomId, true)
-        onStep("awaitDelivery")
+        onStep("awaitTyping")
         check(awaitCondition("typing notice", 15_000) {
             sender.typingUsers.value.contains(recipientId)
         }) { "The sender did not receive the peer's typing notice" }
@@ -389,13 +550,185 @@ class AndroidPeerAcceptanceIntegrationTest {
             recipient.searchResults.value.any { it.roomId == roomId && it.body.contains(searchMarker) }
         }) { "The recipient's local search index did not find a recent encrypted message" }
 
+        onStep("createGroupConversation")
+        reportProgress(instrumentation, "core", "createGroupConversation", "start")
+        val groupRoomId = sender.createEncryptedConversation(
+            invitedUserIds = listOf(recipientId, groupPeerId),
+            name = "Private group acceptance",
+        )
+        await("group invitations") {
+            recipient.refreshConversations()
+            groupPeer.refreshConversations()
+            recipient.conversations.value.any { it.roomId == groupRoomId } &&
+                groupPeer.conversations.value.any { it.roomId == groupRoomId }
+        }
+        recipient.joinConversation(groupRoomId)
+        groupPeer.joinConversation(groupRoomId)
+        await("all group members joined") {
+            sender.refreshConversations()
+            recipient.refreshConversations()
+            groupPeer.refreshConversations()
+            isJoinedEncrypted(sender, groupRoomId) &&
+                isJoinedEncrypted(recipient, groupRoomId) &&
+                isJoinedEncrypted(groupPeer, groupRoomId)
+        }
+        reportProgress(instrumentation, "core", "createGroupConversation", "complete")
+
+        onStep("verifyGroupPeer")
+        val groupVerificationRoomId = sender.createEncryptedConversation(
+            invitedUserIds = listOf(groupPeerId),
+            name = "Private group verification acceptance",
+        )
+        await("group peer verification invitation") {
+            groupPeer.refreshConversations()
+            groupPeer.conversations.value.any { it.roomId == groupVerificationRoomId }
+        }
+        groupPeer.joinConversation(groupVerificationRoomId)
+        await("group peer verification room joined") {
+            sender.refreshConversations()
+            groupPeer.refreshConversations()
+            isJoinedEncrypted(sender, groupVerificationRoomId) &&
+                isJoinedEncrypted(groupPeer, groupVerificationRoomId)
+        }
+        sender.openConversation(groupVerificationRoomId)
+        groupPeer.openConversation(groupVerificationRoomId)
+        verifyPeers(
+            sender,
+            groupPeer,
+            groupVerificationRoomId,
+            groupPeerId,
+            onVerificationStep = { verificationStep ->
+                onStep(verificationStep)
+                reportProgress(instrumentation, "core", verificationStep, "start")
+            },
+            onIdentityState = { account, identityState ->
+                val safeState = allowlistedIdentityState(identityState)
+                instrumentation.sendStatus(0, Bundle().apply {
+                    putString("outbox_diag_group_identity", "$account|$safeState")
+                })
+                println("OUTBOX_DIAG_GROUP_IDENTITY account=${safeToken(account)} state=$safeState")
+            },
+        )
+
+        sender.openConversation(groupRoomId)
+        recipient.openConversation(groupRoomId)
+        groupPeer.openConversation(groupRoomId)
+        groupPeer.close()
+
+        val groupMessageBody = "group-delivery-$marker"
+        onStep("sendGroupMessage")
+        sender.sendText(groupRoomId, groupMessageBody)
+        val senderGroupMessage = awaitMessage(sender, "group sender event") {
+            it.body == groupMessageBody && it.isOwn && it.eventId != null
+        }
+        awaitMessage(recipient, "first group member decrypts message") {
+            it.body == groupMessageBody && !it.isOwn && it.eventId == senderGroupMessage.eventId
+        }
+        val senderGroupEventId = checkNotNull(senderGroupMessage.eventId)
+        onStep("awaitGroupDeliveryPartial")
+        val partialDeliveryReached = awaitCondition("one-of-two group delivery acknowledgements") {
+            val snapshot = sender.deliveryAckDiagnosticSnapshot(groupRoomId, senderGroupEventId)
+            val message = sender.messages.value.firstOrNull { it.eventId == senderGroupEventId }
+            snapshot.expectedRecipientCount == 2 &&
+                snapshot.acknowledgedRecipientCount == 1 &&
+                message?.deliveryState == "Delivered to 1 of 2"
+        }
+        if (!partialDeliveryReached) {
+            val senderAck = sender.deliveryAckDiagnosticSnapshot(groupRoomId, senderGroupEventId)
+            val recipientAck = recipient.deliveryAckDiagnosticSnapshot(groupRoomId, senderGroupEventId)
+            val deliveryState = sender.messages.value.firstOrNull { it.eventId == senderGroupEventId }
+                ?.deliveryState?.let(::safeToken) ?: "missing"
+            val observation = listOf(
+                senderAck.expectedRecipientCount,
+                senderAck.acknowledgedRecipientCount,
+                deliveryState,
+                senderAck.remoteAckMessageCount,
+                recipientAck.observerInstalled,
+                recipientAck.recordPresent,
+                recipientAck.state,
+            ).joinToString("|")
+            InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                putString("outbox_diag_group_delivery_failure", observation)
+            })
+            println(
+                "OUTBOX_DIAG_GROUP_DELIVERY_FAILURE expected=${senderAck.expectedRecipientCount} " +
+                    "acknowledged=${senderAck.acknowledgedRecipientCount} delivery=$deliveryState " +
+                    "senderRemoteAckMessages=${senderAck.remoteAckMessageCount} " +
+                    "recipientObserver=${recipientAck.observerInstalled} " +
+                    "recipientAckRecord=${recipientAck.recordPresent} recipientAckState=${recipientAck.state}",
+            )
+        }
+        check(partialDeliveryReached) {
+            "The group message did not show the expected one-of-two delivery state"
+        }
+        println("OUTBOX_DIAG_GROUP_DELIVERY expected=2 acknowledged=1 delivered=false")
+
+        restoreFresh(groupPeer, homeserver, groupPeerId, groupPeerPassword)
+        groupPeer.openConversation(groupRoomId)
+        awaitMessage(groupPeer, "offline group member decrypts message after reconnect") {
+            it.body == groupMessageBody && !it.isOwn && it.eventId == senderGroupMessage.eventId
+        }
+        onStep("awaitGroupDeliveryComplete")
+        check(awaitCondition("all group delivery acknowledgements") {
+            val snapshot = sender.deliveryAckDiagnosticSnapshot(groupRoomId, senderGroupEventId)
+            val message = sender.messages.value.firstOrNull { it.eventId == senderGroupEventId }
+            snapshot.expectedRecipientCount == 2 &&
+                snapshot.acknowledgedRecipientCount == 2 &&
+                message?.deliveryState == "Delivered to all 2"
+        }) { "The group message did not become delivered after every member acknowledged it" }
+        println("OUTBOX_DIAG_GROUP_DELIVERY expected=2 acknowledged=2 delivered=true")
+
         stateFile.parentFile?.mkdirs()
         stateFile.writeText(JSONObject().put("roomId", roomId).toString())
         reportSafeResult(instrumentation, "core", "completed", "verified")
         println(
             "OUTBOX_DIAG_RESULT stage=core roomEncrypted=true recipientOfflineBacklog=true " +
-                "delivered=true read=true typing=true replies=true reactions=true search=true",
+                "delivered=true read=true typing=true replies=true reactions=true search=true groupDeliveredPerMember=true",
         )
+    }
+
+    private suspend fun verifyMessageEditingAndRedaction(
+        roomId: String,
+        marker: String,
+        sender: MatrixRepository,
+        recipient: MatrixRepository,
+    ) {
+        val originalBody = "peer-edit-original-$marker"
+        val editedBody = "peer-edit-updated-$marker"
+        sender.sendText(roomId, originalBody)
+        val ownMessage = awaitMessage(sender, "own text message is editable") {
+            it.body == originalBody && it.isOwn && it.isRemote && it.eventId != null
+        }
+        val peerMessage = awaitMessage(recipient, "peer text message is not editable") {
+            it.body == originalBody && !it.isOwn && it.isRemote && it.eventId == ownMessage.eventId
+        }
+        assertTrue("Only an acknowledged own remote text message should expose Edit", ownMessage.canEdit)
+        assertTrue("Only an acknowledged own remote message should expose Remove", ownMessage.canRedact)
+        assertFalse("A peer message must not expose Edit", peerMessage.canEdit)
+        assertFalse("A peer message must not expose Remove", peerMessage.canRedact)
+        assertTrue("The SDK repository must reject editing a peer message", runCatching {
+            recipient.editMessage(roomId, peerMessage, "unauthorized edit")
+        }.isFailure)
+        assertTrue("The SDK repository must reject removing a peer message", runCatching {
+            recipient.redactMessage(roomId, peerMessage)
+        }.isFailure)
+
+        sender.editMessage(roomId, ownMessage, editedBody)
+        val editedOwnMessage = awaitMessage(sender, "encrypted edit updates sender timeline") {
+            it.eventId == ownMessage.eventId && it.body == editedBody && it.isOwn
+        }
+        awaitMessage(recipient, "encrypted edit decrypts for recipient") {
+            it.eventId == ownMessage.eventId && it.body == editedBody && !it.isOwn
+        }
+
+        sender.redactMessage(roomId, editedOwnMessage)
+        awaitMessage(sender, "redaction updates sender timeline") {
+            it.eventId == ownMessage.eventId && it.body == "Message removed" && it.isOwn
+        }
+        awaitMessage(recipient, "redaction syncs to recipient timeline") {
+            it.eventId == ownMessage.eventId && it.body == "Message removed" && !it.isOwn
+        }
+        println("OUTBOX_DIAG_MESSAGE_MUTATION edit=true redact=true peerActionsRejected=true")
     }
 
     private suspend fun queueAttachmentWhileServerIsOffline(
@@ -560,6 +893,7 @@ class AndroidPeerAcceptanceIntegrationTest {
         sender: MatrixRepository,
         recipient: MatrixRepository,
         roomId: String,
+        peerUserId: String,
         onVerificationStep: (String) -> Unit,
         onIdentityState: (String, String) -> Unit,
     ) {
@@ -580,6 +914,7 @@ class AndroidPeerAcceptanceIntegrationTest {
         onVerificationStep("verificationRequest")
         var controlInviteSeen = false
         var controlRoomHiddenAfterJoin = false
+        var verificationControlRoomId: String? = null
         coroutineScope {
             val request = async { sender.requestPeerVerification(roomId) }
             val invitation = awaitCondition("verification-only room invitation", 45_000) {
@@ -595,6 +930,7 @@ class AndroidPeerAcceptanceIntegrationTest {
                 },
             )
             controlInviteSeen = true
+            verificationControlRoomId = controlRoomInvite.roomId
             recipient.joinVerificationControlRoom(controlRoomInvite.roomId)
             controlRoomHiddenAfterJoin = recipient.conversations.value.none {
                 it.isVerificationControl && it.membership != "INVITED"
@@ -623,20 +959,84 @@ class AndroidPeerAcceptanceIntegrationTest {
         sender.approveVerification()
         recipient.approveVerification()
         onVerificationStep("verificationComplete")
-        check(awaitCondition("verified peers", 30_000) {
+        val verificationCompleted = awaitCondition("verified peers", 45_000) {
             sender.verification.value?.status == DeviceVerificationStatus.VERIFIED &&
                 recipient.verification.value?.status == DeviceVerificationStatus.VERIFIED
-        }) { "Both fresh accounts did not complete device verification" }
+        } || (sender.verification.value?.status == DeviceVerificationStatus.VERIFIED &&
+            recipient.verification.value?.status == DeviceVerificationStatus.VERIFIED)
+        if (!verificationCompleted) {
+            fun safeStatus(repository: MatrixRepository): String = when (repository.verification.value?.status) {
+                DeviceVerificationStatus.REQUESTING -> "requesting"
+                DeviceVerificationStatus.INCOMING_REQUEST -> "incoming-request"
+                DeviceVerificationStatus.WAITING_FOR_ACCEPT -> "waiting-for-accept"
+                DeviceVerificationStatus.COMPARING -> "comparing"
+                DeviceVerificationStatus.CONFIRMING -> "confirming"
+                DeviceVerificationStatus.VERIFIED -> "verified"
+                DeviceVerificationStatus.CANCELLED -> "cancelled"
+                DeviceVerificationStatus.FAILED -> "failed"
+                null -> "missing"
+            }
+            val senderStatus = safeStatus(sender)
+            val recipientStatus = safeStatus(recipient)
+            InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                putString("outbox_diag_verification_final", "$senderStatus|$recipientStatus")
+            })
+            println("OUTBOX_DIAG_VERIFICATION_FINAL sender=$senderStatus recipient=$recipientStatus")
+            val protocolEvents = runCatching {
+                sender.verificationProtocolEventCountsForDiagnostic(
+                    checkNotNull(verificationControlRoomId),
+                    peerUserId,
+                )
+            }.getOrDefault("http=0")
+            InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                putString("outbox_diag_verification_events", protocolEvents)
+            })
+            println("OUTBOX_DIAG_VERIFY_EVENTS $protocolEvents")
+        }
+        check(verificationCompleted) { "Both fresh accounts did not complete device verification" }
         onVerificationStep("verificationPeerTrust")
-        val senderTrustsRecipient = runCatching { sender.isPeerVerified(roomId) }.getOrDefault(false)
-        val recipientTrustsSender = runCatching { recipient.isPeerVerified(roomId) }.getOrDefault(false)
+        var senderTrustsRecipient = false
+        var recipientTrustsSender = false
+        val peerIdentitiesConverged = withTimeoutOrNull(60_000) {
+            while (true) {
+                senderTrustsRecipient = runCatching { sender.isPeerVerified(roomId) }.getOrDefault(false)
+                recipientTrustsSender = runCatching { recipient.isPeerVerified(roomId) }.getOrDefault(false)
+                if (senderTrustsRecipient && recipientTrustsSender) return@withTimeoutOrNull true
+                delay(1_000)
+            }
+            @Suppress("UNREACHABLE_CODE")
+            false
+        } == true
+        val senderOwnIdentity = allowlistedIdentityState(sender.ownVerificationIdentityStateForDiagnostic())
+        val recipientOwnIdentity = allowlistedIdentityState(recipient.ownVerificationIdentityStateForDiagnostic())
+        val senderPeerIdentity = allowlistedPeerIdentityState(sender.peerVerificationIdentityStateForDiagnostic(roomId))
+        val recipientPeerIdentity = allowlistedPeerIdentityState(recipient.peerVerificationIdentityStateForDiagnostic(roomId))
         val trustObservation = "$senderTrustsRecipient|$recipientTrustsSender"
         InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
             putString("outbox_diag_peer_trust", trustObservation)
+            putString("outbox_diag_identity_convergence", "$peerIdentitiesConverged|$senderOwnIdentity|$recipientOwnIdentity")
+            putString("outbox_diag_peer_identity_state", "$senderPeerIdentity|$recipientPeerIdentity")
         })
-        println("OUTBOX_DIAG_PEER_TRUST senderTrustsRecipient=$senderTrustsRecipient recipientTrustsSender=$recipientTrustsSender")
-        check(senderTrustsRecipient && recipientTrustsSender) {
-            "The completed safety-code flow did not establish trusted peer identities on both clients"
+        println(
+            "OUTBOX_DIAG_PEER_TRUST converged=$peerIdentitiesConverged " +
+                "senderTrustsRecipient=$senderTrustsRecipient recipientTrustsSender=$recipientTrustsSender " +
+                "senderOwnIdentity=$senderOwnIdentity recipientOwnIdentity=$recipientOwnIdentity " +
+                "senderPeerIdentity=$senderPeerIdentity recipientPeerIdentity=$recipientPeerIdentity",
+        )
+        if (!peerIdentitiesConverged) {
+            val protocolEvents = runCatching {
+                sender.verificationProtocolEventCountsForDiagnostic(
+                    checkNotNull(verificationControlRoomId),
+                    peerUserId,
+                )
+            }.getOrDefault("http=0")
+            InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                putString("outbox_diag_verification_events", protocolEvents)
+            })
+            println("OUTBOX_DIAG_VERIFY_EVENTS $protocolEvents")
+        }
+        check(peerIdentitiesConverged) {
+            "The peers completed SAS, but their cross-signing trust did not converge in both directions"
         }
     }
 
@@ -959,6 +1359,11 @@ class AndroidPeerAcceptanceIntegrationTest {
 
     private fun allowlistedIdentityState(state: String): String = when (state) {
         "missing", "verified", "unverified", "unavailable" -> state
+        else -> "unavailable"
+    }
+
+    private fun allowlistedPeerIdentityState(state: String): String = when (state) {
+        "missing", "verified", "changed", "previously-verified", "unverified", "unavailable" -> state
         else -> "unavailable"
     }
 

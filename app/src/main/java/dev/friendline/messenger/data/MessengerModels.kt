@@ -26,6 +26,8 @@ data class ChatMessage(
     val deliveryState: String,
     val canRetry: Boolean = false,
     val canReply: Boolean = false,
+    val canEdit: Boolean = false,
+    val canRedact: Boolean = false,
     val replyToEventId: String? = null,
     val reactions: List<ReactionSummary> = emptyList(),
     val hasBeenRead: Boolean = false,

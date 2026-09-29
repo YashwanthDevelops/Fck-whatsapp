@@ -132,6 +132,8 @@ fun ChatScreen(
     onReply: (ChatMessage) -> Unit,
     onCancelReply: () -> Unit,
     onToggleReaction: (ChatMessage, String) -> Unit,
+    onEditMessage: (ChatMessage, String) -> Unit,
+    onRedactMessage: (ChatMessage) -> Unit,
     onVerifyPeer: () -> Unit,
     onMessageSearchQueryChange: (String) -> Unit,
     onPaginateMessageSearch: () -> Unit,
@@ -144,6 +146,9 @@ fun ChatScreen(
     var searchVisible by rememberSaveable { mutableStateOf(false) }
     var attachmentMenuExpanded by remember { mutableStateOf(false) }
     var attachmentToOpenExternally by remember { mutableStateOf<ChatMessage?>(null) }
+    var editingMessage by remember(roomId) { mutableStateOf<ChatMessage?>(null) }
+    var editingBody by remember(editingMessage?.id) { mutableStateOf(editingMessage?.body.orEmpty()) }
+    var messagePendingRedaction by remember(roomId) { mutableStateOf<ChatMessage?>(null) }
     var elapsedRecordingMillis by remember(voiceRecordingStartedAtMillis) { mutableStateOf(0) }
     val context = LocalContext.current
     val focusManager = LocalFocusManager.current
@@ -532,9 +537,15 @@ fun ChatScreen(
                         MessageLine(
                             message = message,
                             isGroup = isGroup,
+                            isEncrypted = isEncrypted,
                             onRetry = onRetry,
                             onReply = onReply,
                             onToggleReaction = onToggleReaction,
+                            onEdit = { selected ->
+                                editingBody = selected.body
+                                editingMessage = selected
+                            },
+                            onRedact = { messagePendingRedaction = it },
                             onOpenAttachment = { attachmentToOpenExternally = it },
                             audioPlayback = audioPlayback,
                             onPlayAudio = onPlayAudio,
@@ -573,6 +584,57 @@ fun ChatScreen(
             },
             dismissButton = {
                 TextButton(onClick = { attachmentToOpenExternally = null }) { Text("Cancel") }
+            },
+        )
+    }
+
+    editingMessage?.let { message ->
+        AlertDialog(
+            onDismissRequest = { editingMessage = null },
+            title = { Text("Edit message") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Your edit is sent as an encrypted message update.", style = MaterialTheme.typography.bodySmall)
+                    OutlinedTextField(
+                        value = editingBody,
+                        onValueChange = { editingBody = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        minLines = 3,
+                        maxLines = 6,
+                        label = { Text("Message") },
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = editingBody.isNotBlank() && editingBody.trim() != message.body,
+                    onClick = {
+                        editingMessage = null
+                        onEditMessage(message, editingBody)
+                    },
+                ) { Text("Save") }
+            },
+            dismissButton = {
+                TextButton(onClick = { editingMessage = null }) { Text("Cancel") }
+            },
+        )
+    }
+
+    messagePendingRedaction?.let { message ->
+        AlertDialog(
+            onDismissRequest = { messagePendingRedaction = null },
+            title = { Text("Remove this message?") },
+            text = { Text("This removes the message for everyone in this encrypted conversation.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        messagePendingRedaction = null
+                        onRedactMessage(message)
+                    },
+                ) { Text("Remove message", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { messagePendingRedaction = null }) { Text("Cancel") }
             },
         )
     }
@@ -631,9 +693,12 @@ private fun SearchResultLine(hit: MessageSearchHit, onClick: () -> Unit) {
 private fun MessageLine(
     message: ChatMessage,
     isGroup: Boolean,
+    isEncrypted: Boolean,
     onRetry: () -> Unit,
     onReply: (ChatMessage) -> Unit,
     onToggleReaction: (ChatMessage, String) -> Unit,
+    onEdit: (ChatMessage) -> Unit,
+    onRedact: (ChatMessage) -> Unit,
     onOpenAttachment: (ChatMessage) -> Unit,
     audioPlayback: AudioPlaybackUiState,
     onPlayAudio: (ChatMessage) -> Unit,
@@ -688,6 +753,12 @@ private fun MessageLine(
                 DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
                     if (message.canReply) {
                         DropdownMenuItem(text = { Text("Reply") }, onClick = { menuExpanded = false; onReply(message) })
+                    }
+                    if (isEncrypted && message.canEdit) {
+                        DropdownMenuItem(text = { Text("Edit") }, onClick = { menuExpanded = false; onEdit(message) })
+                    }
+                    if (isEncrypted && message.canRedact) {
+                        DropdownMenuItem(text = { Text("Remove message") }, onClick = { menuExpanded = false; onRedact(message) })
                     }
                     listOf("👍", "❤️", "😂", "😮").forEach { emoji ->
                         DropdownMenuItem(text = { Text("React $emoji") }, onClick = { menuExpanded = false; onToggleReaction(message, emoji) })

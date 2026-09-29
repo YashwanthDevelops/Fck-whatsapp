@@ -146,7 +146,9 @@ function Invoke-ProvisionFreshAccounts {
         [Parameter(Mandatory)] [string] $SenderLocalpart,
         [Parameter(Mandatory)] [string] $SenderPassword,
         [Parameter(Mandatory)] [string] $PeerLocalpart,
-        [Parameter(Mandatory)] [string] $PeerPassword
+        [Parameter(Mandatory)] [string] $PeerPassword,
+        [Parameter(Mandatory)] [string] $GroupPeerLocalpart,
+        [Parameter(Mandatory)] [string] $GroupPeerPassword
     )
 
     $shell = @'
@@ -155,6 +157,8 @@ IFS= read -r sender
 IFS= read -r sender_password
 IFS= read -r peer
 IFS= read -r peer_password
+IFS= read -r group_peer
+IFS= read -r group_peer_password
 register_user() {
   localpart="$1"
   password="$2"
@@ -193,13 +197,16 @@ register_user() {
 }
 register_user "$sender" "$sender_password"
 register_user "$peer" "$peer_password"
+register_user "$group_peer" "$group_peer_password"
 '@
 
     $input = @(
         $SenderLocalpart,
         $SenderPassword,
         $PeerLocalpart,
-        $PeerPassword
+        $PeerPassword,
+        $GroupPeerLocalpart,
+        $GroupPeerPassword
     )
     Invoke-DockerComposeWithInput -Arguments @("exec", "-T", "synapse", "sh", "-c", $shell) -InputLines $input
 }
@@ -263,9 +270,51 @@ function Invoke-DiagnosticInstrumentation {
     if ($verificationStageObservation.Success) {
         Write-Output "OUTBOX_DIAG_VERIFY_STAGE sender=$($verificationStageObservation.Groups[1].Value) recipient=$($verificationStageObservation.Groups[2].Value)"
     }
+    $verificationFinalObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_verification_final=(missing|requesting|incoming-request|waiting-for-accept|comparing|confirming|verified|cancelled|failed)\|(missing|requesting|incoming-request|waiting-for-accept|comparing|confirming|verified|cancelled|failed)"
+    )
+    if ($verificationFinalObservation.Success) {
+        Write-Output "OUTBOX_DIAG_VERIFICATION_FINAL sender=$($verificationFinalObservation.Groups[1].Value) recipient=$($verificationFinalObservation.Groups[2].Value)"
+    }
+    $verificationEventObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_verification_events=(http=(?:0|[1-5][0-9]{2})(?:\|(request|ready|start|accept|key|mac|done|cancel)=[0-9]{1,3},[0-9]{1,3},[0-9]{1,3}){0,8})"
+    )
+    if ($verificationEventObservation.Success) {
+        Write-Output "OUTBOX_DIAG_VERIFY_EVENTS $($verificationEventObservation.Groups[1].Value)"
+    }
     $peerTrustObservation = [regex]::Match($safeOutput, "outbox_diag_peer_trust=(true|false)\|(true|false)")
     if ($peerTrustObservation.Success) {
         Write-Output "OUTBOX_DIAG_PEER_TRUST senderTrustsRecipient=$($peerTrustObservation.Groups[1].Value) recipientTrustsSender=$($peerTrustObservation.Groups[2].Value)"
+    }
+    $identityConvergenceObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_identity_convergence=(true|false)\|(missing|verified|unverified|unavailable)\|(missing|verified|unverified|unavailable)"
+    )
+    if ($identityConvergenceObservation.Success) {
+        Write-Output "OUTBOX_DIAG_IDENTITY_CONVERGENCE bothVerified=$($identityConvergenceObservation.Groups[1].Value) senderOwnIdentity=$($identityConvergenceObservation.Groups[2].Value) recipientOwnIdentity=$($identityConvergenceObservation.Groups[3].Value)"
+    }
+    $peerIdentityStateObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_peer_identity_state=(missing|verified|changed|previously-verified|unverified|unavailable)\|(missing|verified|changed|previously-verified|unverified|unavailable)"
+    )
+    if ($peerIdentityStateObservation.Success) {
+        Write-Output "OUTBOX_DIAG_PEER_IDENTITY_STATE sender=$($peerIdentityStateObservation.Groups[1].Value) recipient=$($peerIdentityStateObservation.Groups[2].Value)"
+    }
+    $groupDeliveryObservations = [regex]::Matches(
+        $safeOutput,
+        "OUTBOX_DIAG_GROUP_DELIVERY expected=(\d{1,2}) acknowledged=(\d{1,2}) delivered=(true|false)"
+    )
+    foreach ($groupDeliveryObservation in $groupDeliveryObservations) {
+        Write-Output "OUTBOX_DIAG_GROUP_DELIVERY expected=$($groupDeliveryObservation.Groups[1].Value) acknowledged=$($groupDeliveryObservation.Groups[2].Value) delivered=$($groupDeliveryObservation.Groups[3].Value)"
+    }
+    $groupDeliveryFailureObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_group_delivery_failure=(\d{1,2})\|(\d{1,2})\|(missing|queued|sending|sent|delivered|retry|other)\|(\d{1,3})\|(true|false)\|(true|false)\|(missing|none|pending|enqueuing|queued|sent|failed|other)"
+    )
+    if ($groupDeliveryFailureObservation.Success) {
+        Write-Output "OUTBOX_DIAG_GROUP_DELIVERY_FAILURE expected=$($groupDeliveryFailureObservation.Groups[1].Value) acknowledged=$($groupDeliveryFailureObservation.Groups[2].Value) delivery=$($groupDeliveryFailureObservation.Groups[3].Value) senderRemoteAckMessages=$($groupDeliveryFailureObservation.Groups[4].Value) recipientObserver=$($groupDeliveryFailureObservation.Groups[5].Value) recipientAckRecord=$($groupDeliveryFailureObservation.Groups[6].Value) recipientAckState=$($groupDeliveryFailureObservation.Groups[7].Value)"
     }
     $backgroundDeliveryObservation = [regex]::Match(
         $safeOutput,
@@ -273,6 +322,13 @@ function Invoke-DiagnosticInstrumentation {
     )
     if ($backgroundDeliveryObservation.Success) {
         Write-Output "OUTBOX_DIAG_BACKGROUND_DELIVERY senderMessage=$($backgroundDeliveryObservation.Groups[1].Value) senderState=$($backgroundDeliveryObservation.Groups[2].Value) recipientSawMessage=$($backgroundDeliveryObservation.Groups[3].Value) recipientConnected=$($backgroundDeliveryObservation.Groups[4].Value)"
+    }
+    $deliveryFailureObservation = [regex]::Match(
+        $safeOutput,
+        "OUTBOX_DIAG_DELIVERY_FAILURE senderMessage=(true|false) eventIdPresent=(true|false) senderState=(queued|sending|sent|delivered|retry|other) senderConnected=(true|false|other) recipientSawMessage=(true|false) recipientConnected=(true|false|other)"
+    )
+    if ($deliveryFailureObservation.Success) {
+        Write-Output "OUTBOX_DIAG_DELIVERY_FAILURE senderMessage=$($deliveryFailureObservation.Groups[1].Value) eventIdPresent=$($deliveryFailureObservation.Groups[2].Value) senderState=$($deliveryFailureObservation.Groups[3].Value) senderConnected=$($deliveryFailureObservation.Groups[4].Value) recipientSawMessage=$($deliveryFailureObservation.Groups[5].Value) recipientConnected=$($deliveryFailureObservation.Groups[6].Value)"
     }
     $ackMessageObservation = [regex]::Match($safeOutput, "outbox_diag_ack_messages=(\d{1,3})\|(\d{1,3})")
     if ($ackMessageObservation.Success) {
@@ -285,12 +341,65 @@ function Invoke-DiagnosticInstrumentation {
     if ($ackTraceObservation.Success) {
         Write-Output "OUTBOX_DIAG_ACK_TRACE senderObserver=$($ackTraceObservation.Groups[1].Value) senderRecord=$($ackTraceObservation.Groups[2].Value) senderState=$($ackTraceObservation.Groups[3].Value) senderSnapshot=$($ackTraceObservation.Groups[4].Value) senderExpected=$($ackTraceObservation.Groups[5].Value) senderAcked=$($ackTraceObservation.Groups[6].Value) senderProvisional=$($ackTraceObservation.Groups[7].Value) recipientObserver=$($ackTraceObservation.Groups[8].Value) recipientRecord=$($ackTraceObservation.Groups[9].Value) recipientState=$($ackTraceObservation.Groups[10].Value) recipientSnapshot=$($ackTraceObservation.Groups[11].Value) recipientExpected=$($ackTraceObservation.Groups[12].Value) recipientAcked=$($ackTraceObservation.Groups[13].Value) recipientProvisional=$($ackTraceObservation.Groups[14].Value)"
     }
+    $readReceiptTraceObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_read_receipt_trace=(true|false)\|(true|false)\|(true|false)\|(true|false)\|(true|false)\|(\d{1,3})\|(target|missing|other|unavailable)"
+    )
+    if ($readReceiptTraceObservation.Success) {
+        Write-Output "OUTBOX_DIAG_READ_RECEIPT_TRACE eventSeen=$($readReceiptTraceObservation.Groups[1].Value) ownEvent=$($readReceiptTraceObservation.Groups[2].Value) otherReader=$($readReceiptTraceObservation.Groups[3].Value) mappedRead=$($readReceiptTraceObservation.Groups[4].Value) appRead=$($readReceiptTraceObservation.Groups[5].Value) updates=$($readReceiptTraceObservation.Groups[6].Value) sdkCache=$($readReceiptTraceObservation.Groups[7].Value)"
+    }
     $ackReplayObservation = [regex]::Match(
         $safeOutput,
         "outbox_diag_ack_replay=(true|false)\|(missing|none|pending|enqueuing|queued|sent|failed|other)\|(true|false)\|(\d{1,2})\|(\d{1,2})\|(true|false)"
     )
     if ($ackReplayObservation.Success) {
         Write-Output "OUTBOX_DIAG_ACK_REPLAY senderRecord=$($ackReplayObservation.Groups[1].Value) senderState=$($ackReplayObservation.Groups[2].Value) senderSnapshot=$($ackReplayObservation.Groups[3].Value) senderExpected=$($ackReplayObservation.Groups[4].Value) senderAcked=$($ackReplayObservation.Groups[5].Value) senderSawUndecryptableEvent=$($ackReplayObservation.Groups[6].Value)"
+    }
+    $utdCauseObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_utd_causes=([A-Z0-9_=,-]{1,768})"
+    )
+    if ($utdCauseObservation.Success) {
+        $utdCauseSummary = $utdCauseObservation.Groups[1].Value
+        $allowedUtdCauses = "UNKNOWN|SENT_BEFORE_WE_JOINED|VERIFICATION_VIOLATION|UNSIGNED_DEVICE|UNKNOWN_DEVICE|HISTORICAL_MESSAGE_AND_BACKUP_IS_DISABLED|WITHHELD_FOR_UNVERIFIED_OR_INSECURE_DEVICE|WITHHELD_BY_SENDER|HISTORICAL_MESSAGE_AND_DEVICE_IS_UNVERIFIED|OLM_ENCRYPTED|UNKNOWN_ENCRYPTED"
+        if ($utdCauseSummary -eq "none" -or $utdCauseSummary -match "^(?:$allowedUtdCauses=\d{1,3})(?:,(?:$allowedUtdCauses=\d{1,3}))*$") {
+            Write-Output "OUTBOX_DIAG_UTD_CAUSES observer=sender counts=$utdCauseSummary"
+        }
+    }
+    $timelineCategoryObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_timeline_categories=([A-Z_=,0-9]{1,256})"
+    )
+    if ($timelineCategoryObservation.Success) {
+        $timelineCategorySummary = $timelineCategoryObservation.Groups[1].Value
+        $allowedTimelineCategories = "(?:OWN_REMOTE|REMOTE)_(?:ACK|MESSAGE|OTHER_MESSAGE|OTHER_MESSAGE_KIND|UTD|REDACTED|CALL_INVITE|RTC_NOTIFICATION|ROOM_MEMBERSHIP|PROFILE_CHANGE|STATE|FAILED_MESSAGE|FAILED_STATE)"
+        if ($timelineCategorySummary -eq "none" -or $timelineCategorySummary -match "^(?:$allowedTimelineCategories=\d{1,3})(?:,(?:$allowedTimelineCategories=\d{1,3}))*$") {
+            Write-Output "OUTBOX_DIAG_TIMELINE_CATEGORIES observer=sender counts=$timelineCategorySummary"
+        }
+    }
+    $serverEventObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_server_event_counts=(\d{1,3})\|(\d{1,3})\|(\d{1,3})\|(\d{1,3})"
+    )
+    if ($serverEventObservation.Success) {
+        Write-Output "OUTBOX_DIAG_SERVER_ENCRYPTED_EVENTS httpStatus=$($serverEventObservation.Groups[1].Value) peerSender=$($serverEventObservation.Groups[2].Value) ownSender=$($serverEventObservation.Groups[3].Value) otherSender=$($serverEventObservation.Groups[4].Value)"
+    }
+    $reciprocalProbeObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_reciprocal_probe=(true|false)\|(true|false)\|(\d{1,3})\|(\d{1,3})"
+    )
+    if ($reciprocalProbeObservation.Success) {
+        Write-Output "OUTBOX_DIAG_RECIPROCAL_PROBE sent=$($reciprocalProbeObservation.Groups[1].Value) senderReceived=$($reciprocalProbeObservation.Groups[2].Value) peerEncryptedBefore=$($reciprocalProbeObservation.Groups[3].Value) peerEncryptedAfter=$($reciprocalProbeObservation.Groups[4].Value)"
+    }
+    if ($safeOutput -match 'OUTBOX_DIAG_BACKGROUND_ACK delivered=true') {
+        Write-Output "OUTBOX_DIAG_BACKGROUND_ACK delivered=true"
+    }
+    $offlineAckObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_offline_ack=(true|false)\|(true|false)\|(queued|sending|sent|delivered|retry|other)\|(missing|none|pending|enqueuing|queued|sent|failed|other)\|(missing|none|pending|enqueuing|queued|sent|failed|other)\|(true|false)\|(\d{1,3})\|(\d{1,3})"
+    )
+    if ($offlineAckObservation.Success) {
+        Write-Output "OUTBOX_DIAG_OFFLINE_ACK senderMessage=$($offlineAckObservation.Groups[1].Value) eventIdPresent=$($offlineAckObservation.Groups[2].Value) senderState=$($offlineAckObservation.Groups[3].Value) senderAck=$($offlineAckObservation.Groups[4].Value) recipientAck=$($offlineAckObservation.Groups[5].Value) recipientObserver=$($offlineAckObservation.Groups[6].Value) senderRemoteAckMessages=$($offlineAckObservation.Groups[7].Value) peerEncryptedEvents=$($offlineAckObservation.Groups[8].Value)"
     }
     $expectedResult = [regex]::Match(
         $safeOutput,
@@ -326,7 +435,7 @@ function Invoke-DiagnosticInstrumentation {
         } else {
             "test-method-not-reached"
         }
-        $progressPattern = "OUTBOX_DIAG_PROGRESS stage=$([regex]::Escape($Stage)) step=(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|verifyExactlyOnce) state=(start|complete)"
+        $progressPattern = "OUTBOX_DIAG_PROGRESS stage=$([regex]::Escape($Stage)) step=(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|createGroupConversation|verifyGroupPeer|awaitGroupDeliveryPartial|awaitGroupDeliveryComplete|sendGroupMessage|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|verificationPeerTrust|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|awaitBackgroundDelivery|awaitOfflineDeliveryAck|awaitOfflineBacklog|sendReadReceipt|awaitReadReceipt|awaitTyping|verifyExactlyOnce) state=(start|complete)"
         $progressMatches = [regex]::Matches($safeOutput, $progressPattern)
         $progressEvents = @(
             foreach ($progressMatch in $progressMatches) {
@@ -334,7 +443,7 @@ function Invoke-DiagnosticInstrumentation {
             }
         )
         if ($progressEvents.Count -eq 0) {
-            $statusProgressPattern = "outbox_diag_progress=$([regex]::Escape($Stage))\|(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|verifyExactlyOnce)\|(start|complete)"
+            $statusProgressPattern = "outbox_diag_progress=$([regex]::Escape($Stage))\|(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|createGroupConversation|verifyGroupPeer|awaitGroupDeliveryPartial|awaitGroupDeliveryComplete|sendGroupMessage|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|verificationPeerTrust|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|awaitBackgroundDelivery|awaitOfflineDeliveryAck|awaitOfflineBacklog|sendReadReceipt|awaitReadReceipt|awaitTyping|verifyExactlyOnce)\|(start|complete)"
             $statusProgressMatches = [regex]::Matches($safeOutput, $statusProgressPattern)
             $progressEvents = @(
                 foreach ($progressMatch in $statusProgressMatches) {
@@ -657,9 +766,17 @@ function Get-SynapseAccessCounts {
             "keys-query"
         } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/sendToDevice/[^/]+/[^/]+$') {
             "send-to-device"
+        } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/rooms/[^/]+/send/m\.room\.encrypted/[^/]+$') {
+            "room-send-encrypted"
+        } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/rooms/[^/]+/send/m\.room\.message/[^/]+$') {
+            "room-send-message"
+        } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/rooms/[^/]+/send/m\.key\.verification\.(?:request|ready|start|accept|key|mac|done|cancel)/[^/]+$') {
+            "room-send-verification"
         } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/rooms/[^/]+/send/[^/]+/[^/]+$') {
-            "room-send"
-        } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/sync$') {
+            "room-send-other"
+        } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/rooms/[^/]+/receipt/m\.read/[^/]+$') {
+            "read-receipt"
+        } elseif ($path -match '(^|/)sync/?$') {
             "sync"
         } elseif ($path -match '^/_matrix/client/(?:v3|r0|unstable)/profile(?:/.*)?$') {
             "profile"
@@ -675,6 +792,11 @@ function Get-SynapseAccessCounts {
         $key = "$endpoint|$statusCode"
         if (-not $counts.ContainsKey($key)) { $counts[$key] = 0 }
         $counts[$key]++
+        if ($endpoint -like "room-send-*") {
+            $totalSendKey = "room-send|$statusCode"
+            if (-not $counts.ContainsKey($totalSendKey)) { $counts[$totalSendKey] = 0 }
+            $counts[$totalSendKey]++
+        }
     }
     return ,$counts
 }
@@ -783,7 +905,7 @@ function Get-VerificationSdkDropDiagnosis {
 function Write-SynapseAccessDelta {
     $deltas = Get-SynapseAccessDeltaCounts
     if ($null -eq $deltas) {
-        foreach ($endpoint in @("keys-query", "send-to-device", "room-send", "sync", "profile", "keys-upload", "device-signing-upload")) {
+        foreach ($endpoint in @("keys-query", "send-to-device", "room-send", "room-send-encrypted", "room-send-message", "room-send-verification", "room-send-other", "read-receipt", "sync", "profile", "keys-upload", "device-signing-upload")) {
             Write-Output "OUTBOX_DIAG_SERVER_ACCESS endpoint=$endpoint status=unknown count=unknown"
         }
         return
@@ -792,13 +914,13 @@ function Write-SynapseAccessDelta {
     $reportedEndpoints = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     foreach ($key in @($deltas.Keys | Sort-Object)) {
         $fields = $key -split "\|"
-        if ($fields.Count -ne 2 -or $fields[0] -notin @("keys-query", "send-to-device", "room-send", "sync", "profile", "keys-upload", "device-signing-upload") -or $fields[1] -notmatch '^[1-5][0-9]{2}$') {
+        if ($fields.Count -ne 2 -or $fields[0] -notin @("keys-query", "send-to-device", "room-send", "room-send-encrypted", "room-send-message", "room-send-verification", "room-send-other", "read-receipt", "sync", "profile", "keys-upload", "device-signing-upload") -or $fields[1] -notmatch '^[1-5][0-9]{2}$') {
             continue
         }
         Write-Output "OUTBOX_DIAG_SERVER_ACCESS endpoint=$($fields[0]) status=$($fields[1]) count=$([int] $deltas[$key])"
         $null = $reportedEndpoints.Add($fields[0])
     }
-    foreach ($endpoint in @("keys-query", "send-to-device", "room-send", "sync", "profile", "keys-upload", "device-signing-upload")) {
+    foreach ($endpoint in @("keys-query", "send-to-device", "room-send", "room-send-encrypted", "room-send-message", "room-send-verification", "room-send-other", "read-receipt", "sync", "profile", "keys-upload", "device-signing-upload")) {
         if (-not $reportedEndpoints.Contains($endpoint)) {
             Write-Output "OUTBOX_DIAG_SERVER_ACCESS endpoint=$endpoint status=none count=0"
         }
@@ -841,15 +963,11 @@ try {
     }
 
     $deviceOutput = & $adb devices 2>$null
-    $devices = @($deviceOutput | Where-Object { $_ -match "^\S+\s+device$" })
-    if ($devices.Count -ne 1) {
-        throw "Outbox validation requires exactly one attached Android emulator."
+    $emulatorDevices = @($deviceOutput | Where-Object { $_ -match "^emulator-\d+\s+device$" })
+    if ($emulatorDevices.Count -ne 1) {
+        throw "Outbox validation requires exactly one ready Android emulator; physical devices are ignored."
     }
-    $device = ($devices[0] -split "\s+")[0]
-    $isEmulator = (& $adb -s $device shell getprop ro.kernel.qemu 2>$null | Out-String).Trim()
-    if ($isEmulator -ne "1") {
-        throw "Outbox validation requires an Android emulator for the isolated adb reverse route."
-    }
+    $device = ($emulatorDevices[0] -split "\s+")[0]
     New-DiagnosticReverseMapping -Device $device
 
     Invoke-AdbChecked -Arguments @("-s", $device, "install", "-r", $appApk.FullName)
@@ -864,17 +982,22 @@ try {
     $runId = [Guid]::NewGuid().ToString("N")
     $sender = "diag$runId"
     $peer = "peer$runId"
+    $groupPeer = "group$runId"
     $senderPassword = New-RandomPassword
     $peerPassword = New-RandomPassword
+    $groupPeerPassword = New-RandomPassword
     $marker = "outbox-$runId"
     $senderUserId = "@$sender`:$homeserverName"
     $recipientUserId = "@$peer`:$homeserverName"
+    $groupPeerUserId = "@$groupPeer`:$homeserverName"
     Invoke-ProvisionFreshAccounts `
         -SenderLocalpart $sender `
         -SenderPassword $senderPassword `
         -PeerLocalpart $peer `
-        -PeerPassword $peerPassword
-    Write-Output "OUTBOX_DIAG accounts=provisioned count=2 output=redacted"
+        -PeerPassword $peerPassword `
+        -GroupPeerLocalpart $groupPeer `
+        -GroupPeerPassword $groupPeerPassword
+    Write-Output "OUTBOX_DIAG accounts=provisioned count=3 output=redacted"
     $script:synapseAccessBaseline = Get-SynapseAccessCounts
 
     if ($PeerAcceptance) {
@@ -886,7 +1009,9 @@ try {
             "-e", "sender_user_id", $senderUserId,
             "-e", "sender_password", $senderPassword,
             "-e", "recipient_user_id", $recipientUserId,
-            "-e", "recipient_password", $peerPassword
+            "-e", "recipient_password", $peerPassword,
+            "-e", "group_peer_user_id", $groupPeerUserId,
+            "-e", "group_peer_password", $groupPeerPassword
         )
         $peerClass = "dev.friendline.messenger.data.AndroidPeerAcceptanceIntegrationTest"
 

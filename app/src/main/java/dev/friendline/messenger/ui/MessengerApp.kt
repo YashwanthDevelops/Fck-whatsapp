@@ -59,6 +59,8 @@ fun MessengerApp(viewModel: MessengerViewModel) {
             onReply = viewModel::replyTo,
             onCancelReply = viewModel::cancelReply,
             onToggleReaction = viewModel::toggleReaction,
+            onEditMessage = viewModel::editMessage,
+            onRedactMessage = viewModel::redactMessage,
             onVerifyPeer = viewModel::verifyConversationPeer,
             onMessageSearchQueryChange = viewModel::updateMessageSearchQuery,
             onPaginateMessageSearch = viewModel::paginateMessageSearch,

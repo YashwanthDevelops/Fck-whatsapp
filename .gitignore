@@ -5,6 +5,7 @@
 /.tools/
 **/build/
 **/.gradle/
+/.kotlin/
 __pycache__/
 *.py[cod]
 .pytest_cache/

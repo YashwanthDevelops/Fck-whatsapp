@@ -40,6 +40,10 @@ import org.matrix.rustcomponents.sdk.CreateRoomParameters
 import org.matrix.rustcomponents.sdk.EventOrTransactionId
 import org.matrix.rustcomponents.sdk.EventTimelineItem
 import org.matrix.rustcomponents.sdk.EventSendState
+import org.matrix.rustcomponents.sdk.EditedContent
+import org.matrix.rustcomponents.sdk.EncryptedMessage
+import org.matrix.rustcomponents.sdk.UnableToDecryptDelegate
+import org.matrix.rustcomponents.sdk.UnableToDecryptInfo
 import org.matrix.rustcomponents.sdk.FileInfo
 import org.matrix.rustcomponents.sdk.ImageInfo
 import org.matrix.rustcomponents.sdk.LatestEventValue
@@ -48,6 +52,7 @@ import org.matrix.rustcomponents.sdk.MediaSource
 import org.matrix.rustcomponents.sdk.MessageType
 import org.matrix.rustcomponents.sdk.MsgLikeKind
 import org.matrix.rustcomponents.sdk.ReceiptType
+import org.matrix.rustcomponents.sdk.ReceiptThread
 import org.matrix.rustcomponents.sdk.Room
 import org.matrix.rustcomponents.sdk.RoomHistoryVisibility
 import org.matrix.rustcomponents.sdk.RoomMessageEventContentWithoutRelation
@@ -90,6 +95,8 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.FileInputStream
 import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -125,6 +132,15 @@ internal class PendingVoiceNoteStillQueuedException :
 
 internal class MatrixVerificationIdentityUnavailable :
     IllegalStateException("This account's secure verification identity is not available yet. Try again after sync completes.")
+
+internal data class ReadReceiptDiagnosticSnapshot(
+    val eventSeen: Boolean = false,
+    val isOwnEvent: Boolean = false,
+    val hasOtherReader: Boolean = false,
+    val mappedReadState: Boolean = false,
+    val appModelReadState: Boolean = false,
+    val updateCount: Int = 0,
+)
 
 class MatrixRepository(context: Context) {
     private val appContext = context.applicationContext ?: context
@@ -199,6 +215,10 @@ class MatrixRepository(context: Context) {
     private val expectedDeliveryMemberIdsByRoom = ConcurrentHashMap<String, Set<String>>()
     private val deliveryAckObservers = ConcurrentHashMap<String, DeliveryAckObserver>()
     private val remoteAckMessageCounts = ConcurrentHashMap<String, AtomicInteger>()
+    private val diagnosticUtdCauseCounts = ConcurrentHashMap<String, AtomicInteger>()
+    private val diagnosticUtdEventIds = ConcurrentHashMap.newKeySet<String>()
+    private val diagnosticTimelineEventIdsByRoom = ConcurrentHashMap<String, MutableSet<String>>()
+    private val diagnosticTimelineCategoriesByRoom = ConcurrentHashMap<String, ConcurrentHashMap<String, AtomicInteger>>()
     private val deliverySnapshotReservationLock = Any()
     private var activeDeliverySnapshotReservation: DeliverySnapshotReservation? = null
     private val readReceiptLocks = ConcurrentHashMap<String, Mutex>()
@@ -206,6 +226,9 @@ class MatrixRepository(context: Context) {
     @Volatile private var verificationDiagnosticStage = "idle"
     private val lastVisibleReadReceiptTimestamps = ConcurrentHashMap<String, Long>()
     private val lastVisibleReadReceiptEventIds = ConcurrentHashMap<String, String>()
+    private val readReceiptDiagnosticLock = Any()
+    private var readReceiptDiagnosticEventId: String? = null
+    private var readReceiptDiagnosticSnapshot = ReadReceiptDiagnosticSnapshot()
     private val externalViewerFiles = ConcurrentHashMap.newKeySet<File>()
     private val pendingMediaLock = Any()
     private val pendingMediaRecords = LinkedHashMap<String, PendingMediaRecord>()
@@ -227,6 +250,7 @@ class MatrixRepository(context: Context) {
     private var searchPaginationListener: SearchServicePaginationStateListener? = null
     private var verificationController: SessionVerificationController? = null
     private var pendingVerificationRequest: Pair<String, String>? = null
+    @Volatile private var verificationWasInitiatedHere = false
     private var syncService: SyncService? = null
     private var syncStateHandle: TaskHandle? = null
     private var sendQueueStatusHandle: TaskHandle? = null
@@ -234,6 +258,7 @@ class MatrixRepository(context: Context) {
     private var sendQueueUpdatesListener: SendQueueRoomUpdateListener? = null
     private var typingListenerHandle: TaskHandle? = null
     @Volatile private var activeTimeline: Timeline? = null
+    @Volatile private var readReceiptRefreshJob: Job? = null
     private var timelineListenerHandle: TaskHandle? = null
     @Volatile private var activeRoomId: String? = null
     private var ownUserId: String? = null
@@ -900,9 +925,11 @@ class MatrixRepository(context: Context) {
                 }
             }
             withVerificationStage("sdk-request") {
+                verificationWasInitiatedHere = true
                 controller.requestUserVerification(peerUserId)
             }
         } catch (error: Exception) {
+            verificationWasInitiatedHere = false
             _verification.value = DeviceVerificationUiState(
                 peerUserId = peerUserId,
                 status = DeviceVerificationStatus.FAILED,
@@ -925,6 +952,182 @@ class MatrixRepository(context: Context) {
     }
 
     internal fun verificationStageForDiagnostic(): String = verificationDiagnosticStage
+
+    internal fun watchReadReceiptForDiagnostic(eventId: String) {
+        check(BuildConfig.DEBUG) { "Read-receipt diagnostics are unavailable in release builds" }
+        synchronized(readReceiptDiagnosticLock) {
+            readReceiptDiagnosticEventId = eventId
+            val existing = _messages.value.firstOrNull { it.eventId == eventId }
+            readReceiptDiagnosticSnapshot = ReadReceiptDiagnosticSnapshot(
+                eventSeen = existing != null,
+                isOwnEvent = existing?.isOwn == true,
+                hasOtherReader = existing?.hasBeenRead == true,
+                mappedReadState = existing?.hasBeenRead == true,
+                appModelReadState = existing?.hasBeenRead == true,
+            )
+        }
+    }
+
+    internal fun readReceiptDiagnosticSnapshot(): ReadReceiptDiagnosticSnapshot {
+        check(BuildConfig.DEBUG) { "Read-receipt diagnostics are unavailable in release builds" }
+        return synchronized(readReceiptDiagnosticLock) { readReceiptDiagnosticSnapshot }
+    }
+
+    internal suspend fun peerReadReceiptCacheStateForDiagnostic(
+        roomId: String,
+        peerUserId: String,
+        eventId: String,
+    ): String = withContext(Dispatchers.IO) {
+        check(BuildConfig.DEBUG) { "Read-receipt diagnostics are unavailable in release builds" }
+        val room = requireRoom(roomId)
+        try {
+            when (room.loadUserReceipt(ReceiptType.READ, ReceiptThread.Unthreaded, peerUserId)?.eventId) {
+                null -> "missing"
+                eventId -> "target"
+                else -> "other"
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            "unavailable"
+        } finally {
+            room.close()
+        }
+    }
+
+    /** Return allowlisted aggregate undecryptable-event causes for isolated debug acceptance runs. */
+    internal fun utdCauseCountsForDiagnostic(): Map<String, Int> {
+        check(BuildConfig.DEBUG) { "Encryption diagnostics are unavailable in release builds" }
+        return diagnosticUtdCauseCounts.entries.associate { (cause, count) -> cause to count.get() }
+    }
+
+    /** Return only allowlisted event-kind counts for a room in isolated debug acceptance runs. */
+    internal fun timelineCategoriesForDiagnostic(roomId: String): Map<String, Int> {
+        check(BuildConfig.DEBUG) { "Encryption diagnostics are unavailable in release builds" }
+        return diagnosticTimelineCategoriesByRoom[roomId]?.entries
+            ?.associate { (category, count) -> category to count.get() }
+            .orEmpty()
+    }
+
+    /** Query only aggregate encrypted-event counts from a room history response during debug acceptance. */
+    internal suspend fun recentEncryptedEventCountsForDiagnostic(roomId: String, peerUserId: String): String =
+        withContext(Dispatchers.IO) {
+            check(BuildConfig.DEBUG) { "Encryption diagnostics are unavailable in release builds" }
+            val session = requireClient().session()
+            val url = URL(
+                "${session.homeserverUrl.trimEnd('/')}/_matrix/client/v3/rooms/${Uri.encode(roomId)}/messages?dir=b&limit=50",
+            )
+            val connection = url.openConnection() as HttpURLConnection
+            try {
+                connection.connectTimeout = 5_000
+                connection.readTimeout = 10_000
+                connection.requestMethod = "GET"
+                connection.setRequestProperty("Authorization", "Bearer ${session.accessToken}")
+                val status = connection.responseCode
+                if (status !in 200..299) return@withContext "$status|0|0|0"
+
+                val response = connection.inputStream.bufferedReader().use { reader ->
+                    JSONObject(reader.readText())
+                }
+                val events = response.optJSONArray("chunk")
+                var peerEncrypted = 0
+                var ownEncrypted = 0
+                var otherEncrypted = 0
+                if (events != null) {
+                    for (index in 0 until events.length()) {
+                        val event = events.optJSONObject(index) ?: continue
+                        if (event.optString("type") != "m.room.encrypted") continue
+                        when (event.optString("sender")) {
+                            peerUserId -> peerEncrypted++
+                            session.userId -> ownEncrypted++
+                            else -> otherEncrypted++
+                        }
+                    }
+                }
+                "$status|${peerEncrypted.coerceAtMost(999)}|${ownEncrypted.coerceAtMost(999)}|${otherEncrypted.coerceAtMost(999)}"
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                "0|0|0|0"
+            } finally {
+                connection.disconnect()
+            }
+        }
+
+    /** Return only allowlisted verification event counts and sender roles during debug acceptance. */
+    internal suspend fun verificationProtocolEventCountsForDiagnostic(
+        roomId: String,
+        peerUserId: String,
+    ): String = withContext(Dispatchers.IO) {
+        check(BuildConfig.DEBUG) { "Verification diagnostics are unavailable in release builds" }
+        val session = requireClient().session()
+        val eventNames = listOf("request", "ready", "start", "accept", "key", "mac", "done", "cancel")
+        val counts = eventNames.associateWith { name ->
+            mutableMapOf("own" to 0, "peer" to 0, "other" to 0)
+        }
+        val url = URL(
+            "${session.homeserverUrl.trimEnd('/')}/_matrix/client/v3/rooms/${Uri.encode(roomId)}/messages?dir=b&limit=50",
+        )
+        val connection = url.openConnection() as HttpURLConnection
+        try {
+            connection.connectTimeout = 5_000
+            connection.readTimeout = 10_000
+            connection.requestMethod = "GET"
+            connection.setRequestProperty("Authorization", "Bearer ${session.accessToken}")
+            val status = connection.responseCode
+            if (status !in 200..299) return@withContext "http=$status"
+
+            val response = connection.inputStream.bufferedReader().use { reader -> JSONObject(reader.readText()) }
+            val events = response.optJSONArray("chunk")
+            if (events != null) {
+                for (index in 0 until events.length()) {
+                    val event = events.optJSONObject(index) ?: continue
+                    val type = event.optString("type")
+                    val name = when (type) {
+                        "m.key.verification.request" -> "request"
+                        "m.key.verification.ready" -> "ready"
+                        "m.key.verification.start" -> "start"
+                        "m.key.verification.accept" -> "accept"
+                        "m.key.verification.key" -> "key"
+                        "m.key.verification.mac" -> "mac"
+                        "m.key.verification.done" -> "done"
+                        "m.key.verification.cancel" -> "cancel"
+                        else -> continue
+                    }
+                    val role = when (event.optString("sender")) {
+                        session.userId -> "own"
+                        peerUserId -> "peer"
+                        else -> "other"
+                    }
+                    val roleCounts = counts.getValue(name)
+                    roleCounts[role] = (roleCounts[role] ?: 0) + 1
+                }
+            }
+            "http=200|" + eventNames.joinToString("|") { name ->
+                val roleCounts = counts.getValue(name)
+                "$name=${roleCounts.getValue("own")},${roleCounts.getValue("peer")},${roleCounts.getValue("other")}"
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            "http=0"
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun recordDiagnosticUtdCause(eventId: String, cause: String) {
+        if (!BuildConfig.DEBUG || !diagnosticUtdEventIds.add(eventId)) return
+        diagnosticUtdCauseCounts.computeIfAbsent(cause) { AtomicInteger() }.incrementAndGet()
+    }
+
+    private fun recordDiagnosticTimelineCategory(roomId: String, eventId: String, category: String) {
+        if (!BuildConfig.DEBUG) return
+        val seenEvents = diagnosticTimelineEventIdsByRoom.computeIfAbsent(roomId) { ConcurrentHashMap.newKeySet() }
+        if (!seenEvents.add(eventId)) return
+        val categoryCounts = diagnosticTimelineCategoriesByRoom.computeIfAbsent(roomId) { ConcurrentHashMap() }
+        categoryCounts.computeIfAbsent(category) { AtomicInteger() }.incrementAndGet()
+    }
 
     private fun verificationErrorMessage(failure: Throwable): String? {
         var current = failure
@@ -1004,37 +1207,44 @@ class MatrixRepository(context: Context) {
                 ),
             )
         }
-        val room = withVerificationStage("control-room-cache-lookup") {
-            matrixClient.getRoom(roomId)
-                ?: throw IllegalStateException("The verification channel is still syncing")
-        }
-        val info = withVerificationStage("control-room-room-state") { room.roomInfo() }
-        try {
-            val encrypted = withVerificationStage("control-room-encryption-state") {
-                room.encryptionState().name == "ENCRYPTED"
-            }
-            check(!encrypted) {
-                "The verification protocol room unexpectedly changed encryption state"
-            }
-            val hasProtocolMarker = withVerificationStage("control-room-topic-state") {
-                info.topic == VERIFICATION_CONTROL_ROOM_TOPIC
-            }
-            check(hasProtocolMarker) {
-                "The Matrix room does not match the Friendline verification-channel marker"
-            }
-            val participantCount = withVerificationStage("control-room-member-count") {
-                info.joinedMembersCount + info.invitedMembersCount
-            }
-            check(participantCount <= 2uL) {
-                "The verification channel includes an unexpected participant"
-            }
-            withVerificationStage("control-room-members") {
-                check(peerUserId in room.activeHumanMemberIds() || info.membership == org.matrix.rustcomponents.sdk.Membership.INVITED) {
-                    "The verification channel does not include the intended peer"
+        val stateReady = withVerificationStage("control-room-topic-state") {
+            withTimeoutOrNull(VERIFICATION_CONTROL_ROOM_STATE_TIMEOUT_MS) {
+                while (true) {
+                    val room = matrixClient.getRoom(roomId)
+                    if (room != null) {
+                        val info = room.roomInfo()
+                        try {
+                            // A create-room response can precede its state echo in the local
+                            // sync store. Wait for the protocol marker before validating and
+                            // routing any user-verification event through this room.
+                            if (info.topic == VERIFICATION_CONTROL_ROOM_TOPIC) {
+                                check(room.encryptionState().name != "ENCRYPTED") {
+                                    "The verification protocol room unexpectedly changed encryption state"
+                                }
+                                val participantCount = info.joinedMembersCount + info.invitedMembersCount
+                                check(participantCount <= 2uL) {
+                                    "The verification channel includes an unexpected participant"
+                                }
+                                check(peerUserId in room.activeHumanMemberIds() ||
+                                    info.membership == org.matrix.rustcomponents.sdk.Membership.INVITED
+                                ) {
+                                    "The verification channel does not include the intended peer"
+                                }
+                                return@withTimeoutOrNull true
+                            }
+                        } finally {
+                            info.destroy()
+                            room.close()
+                        }
+                    }
+                    delay(VERIFICATION_CONTROL_ROOM_STATE_POLL_MS)
                 }
-            }
-        } finally {
-            info.destroy()
+                @Suppress("UNREACHABLE_CODE")
+                false
+            } == true
+        }
+        check(stateReady) {
+            "The Matrix verification channel did not finish syncing its private protocol marker"
         }
         return roomId
     }
@@ -1138,9 +1348,56 @@ class MatrixRepository(context: Context) {
         }
     }
 
+    /** Return only the peer identity trust state for isolated debug acceptance runs. */
+    internal suspend fun peerVerificationIdentityStateForDiagnostic(roomId: String): String =
+        withContext(Dispatchers.IO) {
+            check(BuildConfig.DEBUG) { "Verification diagnostics are unavailable in release builds" }
+            val room = try {
+                requireRoom(roomId)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                return@withContext "unavailable"
+            }
+            val peerUserId = try {
+                room.activeHumanMemberIds().firstOrNull { it != ownUserId }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                return@withContext "unavailable"
+            } finally {
+                room.close()
+            } ?: return@withContext "missing"
+
+            val identity = try {
+                requireClient().encryption().userIdentity(peerUserId, true)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                return@withContext "unavailable"
+            } ?: return@withContext "missing"
+
+            try {
+                when {
+                    identity.hasVerificationViolation() -> "changed"
+                    identity.isVerified() -> "verified"
+                    identity.wasPreviouslyVerified() -> "previously-verified"
+                    else -> "unverified"
+                }
+            } catch (_: Exception) {
+                "unavailable"
+            } finally {
+                identity.close()
+            }
+        }
+
     suspend fun isPeerVerified(roomId: String): Boolean = withContext(Dispatchers.IO) {
-        val peerUserId = requireRoom(roomId).activeHumanMemberIds().firstOrNull { it != ownUserId }
-            ?: return@withContext false
+        val room = requireRoom(roomId)
+        val peerUserId = try {
+            room.activeHumanMemberIds().firstOrNull { it != ownUserId }
+        } finally {
+            room.close()
+        } ?: return@withContext false
         val identity = requireClient().encryption().userIdentity(peerUserId, true)
             ?: return@withContext false
         try {
@@ -1179,12 +1436,46 @@ class MatrixRepository(context: Context) {
         }
     }
 
+    /** Cross-signing signatures can arrive after the SAS flow's terminal callback. */
+    private suspend fun refreshPeerTrustAfterVerification(roomId: String) {
+        withTimeoutOrNull(PEER_TRUST_REFRESH_TIMEOUT_MS) {
+            while (!logoutInProgress && activeRoomId == roomId) {
+                val room = try {
+                    requireRoom(roomId)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    return@withTimeoutOrNull
+                }
+                try {
+                    refreshPeerTrust(room)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // Keep waiting for the next sync update; trust remains unverified until
+                    // the SDK exposes a verified identity.
+                } finally {
+                    room.close()
+                }
+                if (_peerTrust.value == PeerTrustStatus.VERIFIED || _peerTrust.value == PeerTrustStatus.CHANGED) {
+                    return@withTimeoutOrNull
+                }
+                delay(PEER_TRUST_REFRESH_POLL_MS)
+            }
+        }
+    }
+
     suspend fun acceptVerificationRequest() = withContext(Dispatchers.IO) {
         val request = checkNotNull(pendingVerificationRequest) { "There is no pending verification request" }
         val controller = getVerificationController()
-        controller.acknowledgeVerificationRequest(request.first, request.second)
-        controller.acceptVerificationRequest()
-        _verification.update { current -> current?.copy(status = DeviceVerificationStatus.COMPARING) }
+        updateVerificationProgress()
+        try {
+            controller.acknowledgeVerificationRequest(request.first, request.second)
+            controller.acceptVerificationRequest()
+        } catch (error: Exception) {
+            updateVerificationFailure(error)
+            throw error
+        }
     }
 
     suspend fun declineVerificationRequest() = withContext(Dispatchers.IO) {
@@ -1197,12 +1488,22 @@ class MatrixRepository(context: Context) {
             controller.cancelVerification()
         }
         pendingVerificationRequest = null
+        verificationWasInitiatedHere = false
         _verification.update { current -> current?.copy(status = DeviceVerificationStatus.CANCELLED) }
     }
 
     suspend fun approveVerification() = withContext(Dispatchers.IO) {
-        getVerificationController().approveVerification()
-        _verification.update { current -> current?.copy(status = DeviceVerificationStatus.CONFIRMING) }
+        val controller = getVerificationController()
+        _verification.update { current ->
+            if (current == null || current.status in VERIFICATION_TERMINAL_STATUSES) current
+            else current.copy(status = DeviceVerificationStatus.CONFIRMING)
+        }
+        try {
+            controller.approveVerification()
+        } catch (error: Exception) {
+            updateVerificationFailure(error)
+            throw error
+        }
     }
 
     fun dismissVerification() {
@@ -1220,6 +1521,7 @@ class MatrixRepository(context: Context) {
             }
 
             stage = "release-previous-timeline"
+            stopReadReceiptRefresh()
             activeRoomId = null
             val previousTimeline = activeTimeline
             activeTimeline = null
@@ -1234,7 +1536,15 @@ class MatrixRepository(context: Context) {
             stage = "refresh-peer-trust"
             refreshPeerTrust(room)
             stage = "create-timeline"
-            val timeline = room.timeline()
+            val timelineConfiguration = TimelineConfiguration(
+                TimelineFocus.Live(false),
+                TimelineFilter.All,
+                "conversation-${UUID.randomUUID()}",
+                DateDividerMode.DAILY,
+                TimelineReadReceiptTracking.MESSAGE_LIKE_EVENTS,
+                true,
+            )
+            val timeline = room.timelineWithConfiguration(timelineConfiguration)
             activeTimeline = timeline
             stage = "subscribe-timeline"
             timelineListenerHandle = timeline.addListener(object : TimelineListener {
@@ -1271,6 +1581,7 @@ class MatrixRepository(context: Context) {
                     _typingUsers.value = typingUserIds.filterNot { it == ownUserId }
                 }
             })
+            startReadReceiptRefresh(roomId, timeline)
             stage = "mark-read"
             stage = "load-draft"
             val savedDraft = room.loadComposerDraft(null)
@@ -1279,6 +1590,7 @@ class MatrixRepository(context: Context) {
         } catch (failure: CancellationException) {
             throw failure
         } catch (failure: Throwable) {
+            stopReadReceiptRefresh()
             runCatching { timelineListenerHandle?.cancel() }
             runCatching { timelineListenerHandle?.close() }
             runCatching { typingListenerHandle?.cancel() }
@@ -1319,6 +1631,7 @@ class MatrixRepository(context: Context) {
         if (roomId != null) {
             runCatching { withSendQueueGate { requireRoom(roomId).typingNotice(false) } }
         }
+        stopReadReceiptRefresh()
         activeRoomId = null
         val timeline = activeTimeline
         activeTimeline = null
@@ -1770,9 +2083,57 @@ class MatrixRepository(context: Context) {
         }
     }
 
+    suspend fun editMessage(roomId: String, message: ChatMessage, newBody: String) = withContext(Dispatchers.IO) {
+        val body = newBody.trim()
+        check(body.isNotEmpty()) { "An edited message cannot be empty" }
+        check(body != message.body) { "The edited message is unchanged" }
+        check(message.isOwn && message.isRemote && message.canEdit && message.eventId != null) {
+            "Only your sent text messages can be edited"
+        }
+        val room = requireRoom(roomId)
+        check(room.encryptionState().name == "ENCRYPTED") {
+            "Editing is disabled because this conversation is not encrypted"
+        }
+        val timeline = activeTimeline?.takeIf { activeRoomId == roomId } ?: room.timeline()
+        try {
+            val content = timeline.createMessageContent(
+                MessageType.Text(TextMessageContent(body, null)),
+            ) ?: throw IllegalStateException("This edit could not be prepared")
+            val editedContent = EditedContent.RoomMessage(content)
+            try {
+                withSendQueueGate {
+                    timeline.edit(EventOrTransactionId.EventId(message.eventId), editedContent)
+                }
+            } finally {
+                editedContent.destroy()
+            }
+        } finally {
+            if (activeTimeline !== timeline) timeline.close()
+        }
+    }
+
+    suspend fun redactMessage(roomId: String, message: ChatMessage) = withContext(Dispatchers.IO) {
+        check(message.isOwn && message.isRemote && message.canRedact && message.eventId != null) {
+            "Only your sent messages can be removed"
+        }
+        val room = requireRoom(roomId)
+        check(room.encryptionState().name == "ENCRYPTED") {
+            "Removing messages is disabled because this conversation is not encrypted"
+        }
+        val timeline = activeTimeline?.takeIf { activeRoomId == roomId } ?: room.timeline()
+        try {
+            withSendQueueGate {
+                timeline.redactEvent(EventOrTransactionId.EventId(message.eventId), null)
+            }
+        } finally {
+            if (activeTimeline !== timeline) timeline.close()
+        }
+    }
+
     suspend fun logout() = withContext(Dispatchers.IO) {
         withLifecycleLock {
             logoutInProgress = true
+            stopReadReceiptRefresh()
             cancelPendingDataMediaReplay(resetRetryBudget = true)
             pendingMediaReadyRoomIds.clear()
             pushTokenObserver?.cancel()
@@ -1887,7 +2248,9 @@ class MatrixRepository(context: Context) {
                 verificationController?.close()
                 verificationController = null
                 pendingVerificationRequest = null
+                verificationWasInitiatedHere = false
                 _verification.value = null
+                stopReadReceiptRefresh()
                 activeRoomId = null
                 val timeline = activeTimeline
                 activeTimeline = null
@@ -1952,6 +2315,7 @@ class MatrixRepository(context: Context) {
     suspend fun close() = withContext(Dispatchers.IO) {
         withLifecycleLock {
         syncServiceRunning = false
+        stopReadReceiptRefresh()
         cancelPendingDataMediaReplay(resetRetryBudget = true)
         pendingMediaReadyRoomIds.clear()
         pushTokenObserver?.cancel()
@@ -1962,6 +2326,7 @@ class MatrixRepository(context: Context) {
         verificationController?.close()
         verificationController = null
         pendingVerificationRequest = null
+        verificationWasInitiatedHere = false
         _verification.value = null
         syncStateHandle?.cancel()
         syncStateHandle?.close()
@@ -2027,8 +2392,16 @@ class MatrixRepository(context: Context) {
     }
 
     private suspend fun startSync(matrixClient: Client) {
-        var stage = "disable-send-queues"
+        var stage = "install-udt-diagnostic-listener"
         try {
+            if (BuildConfig.DEBUG) {
+                matrixClient.setUtdDelegate(object : UnableToDecryptDelegate {
+                    override fun onUtd(info: UnableToDecryptInfo) {
+                        recordDiagnosticUtdCause(info.eventId, info.cause.name)
+                    }
+                })
+            }
+            stage = "disable-send-queues"
             // The send-queue subscription below respawns persisted tasks immediately. Keep it
             // disabled until durable attachment paths have been restored into private cache.
             matrixClient.enableAllSendQueues(false)
@@ -2144,6 +2517,81 @@ class MatrixRepository(context: Context) {
         }
     }
 
+    private fun startReadReceiptRefresh(roomId: String, timeline: Timeline) {
+        stopReadReceiptRefresh()
+        readReceiptRefreshJob = callbackScope.launch {
+            while (!logoutInProgress && activeRoomId == roomId && activeTimeline === timeline) {
+                delay(1_000)
+                if (logoutInProgress || activeRoomId != roomId || activeTimeline !== timeline) break
+                try {
+                    refreshReadReceiptProjection(roomId, timeline)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // Receipt reads are a local-store projection repair. A transient store
+                    // error must not interrupt sync or the conversation timeline.
+                }
+            }
+        }
+    }
+
+    private fun stopReadReceiptRefresh() {
+        readReceiptRefreshJob?.cancel()
+        readReceiptRefreshJob = null
+    }
+
+    private suspend fun refreshReadReceiptProjection(roomId: String, timeline: Timeline) {
+        val pendingOwnEventIds = synchronized(timelineMessagesLock) {
+            if (activeRoomId != roomId || activeTimeline !== timeline || logoutInProgress) return
+            timelineMessages.asSequence()
+                .filterNotNull()
+                .filter { it.isOwn && !it.hasBeenRead }
+                .mapNotNull(ChatMessage::eventId)
+                .toSet()
+        }
+        if (pendingOwnEventIds.isEmpty()) return
+
+        val peerUserIds = expectedDeliveryMemberIdsByRoom[roomId].orEmpty()
+        if (peerUserIds.isEmpty()) return
+
+        val room = requireRoom(roomId)
+        val receiptEventIds = try {
+            peerUserIds.mapNotNull { peerUserId ->
+                room.loadUserReceipt(ReceiptType.READ, ReceiptThread.Unthreaded, peerUserId)?.eventId
+            }.toSet()
+        } finally {
+            room.close()
+        }
+        if (receiptEventIds.isEmpty()) return
+
+        val changedEventIds = mutableListOf<String>()
+        synchronized(timelineMessagesLock) {
+            if (activeRoomId != roomId || activeTimeline !== timeline || logoutInProgress) return
+            val latestReceiptIndex = timelineMessages.indices
+                .filter { index -> timelineMessages[index]?.eventId?.let(receiptEventIds::contains) == true }
+                .maxOrNull()
+                ?: return
+            for (index in 0..latestReceiptIndex) {
+                val message = timelineMessages[index] ?: continue
+                val eventId = message.eventId ?: continue
+                if (message.isOwn && !message.hasBeenRead) {
+                    timelineMessages[index] = message.copy(hasBeenRead = true)
+                    changedEventIds += eventId
+                }
+            }
+            if (changedEventIds.isNotEmpty()) publishTimelineMessagesLocked()
+        }
+        changedEventIds.forEach(::recordReadReceiptProjectionDiagnostic)
+    }
+
+    private fun recordReadReceiptProjectionDiagnostic(eventId: String) {
+        if (!BuildConfig.DEBUG) return
+        synchronized(readReceiptDiagnosticLock) {
+            if (readReceiptDiagnosticEventId != eventId) return
+            readReceiptDiagnosticSnapshot = readReceiptDiagnosticSnapshot.copy(appModelReadState = true)
+        }
+    }
+
     private fun clearTimelineMessages() {
         synchronized(timelineMessagesLock) {
             timelineMessages.clear()
@@ -2164,25 +2612,58 @@ class MatrixRepository(context: Context) {
         val event = item.asEvent() ?: return null
         return try {
             val msgLike = (event.content as? TimelineItemContent.MsgLike)?.content
-            val messageContent = (msgLike?.kind as? MsgLikeKind.Message)?.content
-            if (messageContent?.msgType is MessageType.Other) {
-                val other = messageContent.msgType as MessageType.Other
-                if (other.msgtype == DELIVERY_ACK_MSGTYPE) {
-                    val acknowledgedId = messageContent.body.takeIf(String::isNotBlank) ?: return null
-                    if (event.isOwn) {
-                        recordOwnDeliveryAck(roomId, acknowledgedId, event.localSendState)
-                        observedAckTargetsByRoom.computeIfAbsent(roomId) { ConcurrentHashMap.newKeySet() }
-                            .add(acknowledgedId)
-                        if ((event.localSendState as? EventSendState.SendingFailed)?.isRecoverable == true) {
-                            rememberRecoverableAckSend(roomId, acknowledgedId, event)
+            val eventId = (event.eventOrTransactionId as? EventOrTransactionId.EventId)?.eventId
+            if (BuildConfig.DEBUG && event.isRemote && eventId != null) {
+                val itemKind = when (val content = event.content) {
+                    is TimelineItemContent.MsgLike -> when (val kind = content.content.kind) {
+                        is MsgLikeKind.Message -> if (kind.content.msgType is MessageType.Other) {
+                            val messageType = kind.content.msgType as MessageType.Other
+                            if (messageType.msgtype == DELIVERY_ACK_MSGTYPE) "ACK" else "OTHER_MESSAGE"
+                        } else {
+                            "MESSAGE"
                         }
-                    } else {
-                        if (event.isRemote) recordRemoteAckMessageObserved(roomId)
-                        recordReceivedDeliveryAck(roomId, acknowledgedId, event.sender)
+                        is MsgLikeKind.UnableToDecrypt -> "UTD"
+                        MsgLikeKind.Redacted -> "REDACTED"
+                        else -> "OTHER_MESSAGE_KIND"
                     }
-                    refreshDeliveryStates()
-                    return null
+                    TimelineItemContent.CallInvite -> "CALL_INVITE"
+                    is TimelineItemContent.RtcNotification -> "RTC_NOTIFICATION"
+                    is TimelineItemContent.RoomMembership -> "ROOM_MEMBERSHIP"
+                    is TimelineItemContent.ProfileChange -> "PROFILE_CHANGE"
+                    is TimelineItemContent.State -> "STATE"
+                    is TimelineItemContent.FailedToParseMessageLike -> "FAILED_MESSAGE"
+                    is TimelineItemContent.FailedToParseState -> "FAILED_STATE"
                 }
+                val direction = if (event.isOwn) "OWN_REMOTE" else "REMOTE"
+                recordDiagnosticTimelineCategory(roomId, eventId, "${direction}_$itemKind")
+            }
+            if (BuildConfig.DEBUG && !event.isOwn && event.isRemote) {
+                val unableToDecrypt = msgLike?.kind as? MsgLikeKind.UnableToDecrypt
+                if (unableToDecrypt != null) {
+                    val cause = when (val encrypted = unableToDecrypt.msg) {
+                        is EncryptedMessage.MegolmV1AesSha2 -> encrypted.cause.name
+                        is EncryptedMessage.OlmV1Curve25519AesSha2 -> "OLM_ENCRYPTED"
+                        EncryptedMessage.Unknown -> "UNKNOWN_ENCRYPTED"
+                    }
+                    if (eventId != null) recordDiagnosticUtdCause(eventId, cause)
+                }
+            }
+            val messageContent = (msgLike?.kind as? MsgLikeKind.Message)?.content
+            val acknowledgedId = messageContent?.msgType?.deliveryAckTarget()
+            if (acknowledgedId != null) {
+                if (event.isOwn) {
+                    recordOwnDeliveryAck(roomId, acknowledgedId, event.localSendState)
+                    observedAckTargetsByRoom.computeIfAbsent(roomId) { ConcurrentHashMap.newKeySet() }
+                        .add(acknowledgedId)
+                    if ((event.localSendState as? EventSendState.SendingFailed)?.isRecoverable == true) {
+                        rememberRecoverableAckSend(roomId, acknowledgedId, event)
+                    }
+                } else if (event.isRemote) {
+                    recordRemoteAckMessageObserved(roomId)
+                    recordReceivedDeliveryAck(roomId, acknowledgedId, event.sender)
+                }
+                refreshDeliveryStates()
+                return null
             }
             val attachment = messageContent?.msgType?.chatAttachment()
             val body = if (attachment != null) {
@@ -2190,7 +2671,6 @@ class MatrixRepository(context: Context) {
             } else {
                 event.content.readableBody() ?: return null
             }
-            val eventId = (event.eventOrTransactionId as? EventOrTransactionId.EventId)?.eventId
             if (!event.isOwn && event.isRemote && eventId != null &&
                 messageContent?.msgType?.isDeliveryAckEligible() == true
             ) {
@@ -2211,6 +2691,8 @@ class MatrixRepository(context: Context) {
                     sentByMe = reaction.senders.any { sender -> sender.senderId == ownUserId },
                 )
             }
+            val hasBeenRead = event.isOwn && event.readReceipts.keys.any { it != ownUserId }
+            recordReadReceiptDiagnostic(eventId, event.isOwn, event.readReceipts.keys.any { it != ownUserId }, hasBeenRead)
             ChatMessage(
                 id = eventId ?: (event.eventOrTransactionId as? EventOrTransactionId.TransactionId)?.transactionId.orEmpty(),
                 eventId = eventId,
@@ -2222,13 +2704,36 @@ class MatrixRepository(context: Context) {
                 deliveryState = state,
                 canRetry = (sendState as? EventSendState.SendingFailed)?.isRecoverable == true,
                 canReply = event.canBeRepliedTo && eventId != null,
+                canEdit = event.isOwn && event.isRemote && event.isEditable &&
+                    messageContent?.msgType is MessageType.Text,
+                canRedact = event.isOwn && event.isRemote && eventId != null && messageContent != null,
                 replyToEventId = replyTo,
                 reactions = reactions,
-                hasBeenRead = event.isOwn && event.readReceipts.keys.any { it != ownUserId },
+                hasBeenRead = hasBeenRead,
                 attachment = attachment,
             )
         } finally {
             event.destroy()
+        }
+    }
+
+    private fun recordReadReceiptDiagnostic(
+        eventId: String?,
+        isOwnEvent: Boolean,
+        hasOtherReader: Boolean,
+        mappedReadState: Boolean,
+    ) {
+        if (!BuildConfig.DEBUG || eventId == null) return
+        synchronized(readReceiptDiagnosticLock) {
+            if (readReceiptDiagnosticEventId != eventId) return
+            readReceiptDiagnosticSnapshot = ReadReceiptDiagnosticSnapshot(
+                eventSeen = true,
+                isOwnEvent = isOwnEvent,
+                hasOtherReader = hasOtherReader,
+                mappedReadState = mappedReadState,
+                appModelReadState = mappedReadState,
+                updateCount = (readReceiptDiagnosticSnapshot.updateCount + 1).coerceAtMost(999),
+            )
         }
     }
 
@@ -2341,9 +2846,8 @@ class MatrixRepository(context: Context) {
         try {
             val message = ((event.content as? TimelineItemContent.MsgLike)?.content?.kind as? MsgLikeKind.Message)
                 ?.content ?: return
-            val controlAck = message.msgType as? MessageType.Other
-            if (controlAck?.msgtype == DELIVERY_ACK_MSGTYPE) {
-                val acknowledgedEventId = message.body.takeIf(String::isNotBlank) ?: return
+            val acknowledgedEventId = message.msgType.deliveryAckTarget()
+            if (acknowledgedEventId != null) {
                 if (event.isOwn) {
                     recordOwnDeliveryAck(roomId, acknowledgedEventId, event.localSendState)
                     observedTargets.add(acknowledgedEventId)
@@ -2369,6 +2873,12 @@ class MatrixRepository(context: Context) {
         }
     }
 
+    private fun MessageType.deliveryAckTarget(): String? = when (this) {
+        is MessageType.Other -> if (msgtype == DELIVERY_ACK_MSGTYPE) body.takeIf(String::isNotBlank) else null
+        is MessageType.Text -> DeliveryAckProtocol.targetEventId(content.body)
+        else -> null
+    }
+
     private fun closeDeliveryAckObservers() {
         deliveryAckObservers.values.toList().forEach { observer ->
             runCatching { observer.handle.cancel() }
@@ -2384,7 +2894,7 @@ class MatrixRepository(context: Context) {
         if (room.encryptionState().name != "ENCRYPTED") throw IllegalStateException("Delivery receipts require encryption")
         val timeline = room.timeline()
         val content = timeline.createMessageContent(
-            MessageType.Other(DELIVERY_ACK_MSGTYPE, eventId),
+            MessageType.Text(TextMessageContent(DeliveryAckProtocol.encode(eventId), null)),
         ) ?: run {
             timeline.close()
             throw IllegalStateException("Couldn't prepare an encrypted delivery receipt")
@@ -3068,6 +3578,7 @@ class MatrixRepository(context: Context) {
             verificationController = controller
             controller.setDelegate(object : SessionVerificationControllerDelegate {
             override fun didReceiveVerificationRequest(details: org.matrix.rustcomponents.sdk.SessionVerificationRequestDetails) {
+                verificationWasInitiatedHere = false
                 val userId = details.senderProfile.userId
                 val deviceName = details.deviceDisplayName ?: details.deviceId
                 pendingVerificationRequest = userId to details.flowId
@@ -3079,19 +3590,20 @@ class MatrixRepository(context: Context) {
             }
 
             override fun didAcceptVerificationRequest() {
-                _verification.update { current -> current?.copy(status = DeviceVerificationStatus.COMPARING) }
+                updateVerificationProgress()
+                // Both the requester and accepter reach Ready. Only the requester starts
+                // SAS; the accepter waits for the SDK to receive and accept the Start event.
+                if (!verificationWasInitiatedHere) return
                 callbackScope.launch {
                     runCatching { controller.startSasVerification() }
                         .onFailure { error ->
-                            _verification.update { current ->
-                                current?.copy(status = DeviceVerificationStatus.FAILED, error = error.message)
-                            }
+                            updateVerificationFailure(error)
                         }
                 }
             }
 
             override fun didStartSasVerification() {
-                _verification.update { current -> current?.copy(status = DeviceVerificationStatus.COMPARING) }
+                updateVerificationProgress()
             }
 
             override fun didReceiveVerificationData(data: SessionVerificationData) {
@@ -3108,32 +3620,64 @@ class MatrixRepository(context: Context) {
                     data.destroy()
                 }
                 _verification.update { current ->
-                    current?.copy(status = DeviceVerificationStatus.COMPARING, sas = sas)
+                    when {
+                        current == null -> null
+                        current.status in VERIFICATION_TERMINAL_STATUSES -> current
+                        current.status == DeviceVerificationStatus.CONFIRMING -> current.copy(sas = sas)
+                        else -> current.copy(status = DeviceVerificationStatus.COMPARING, sas = sas)
+                    }
                 }
             }
 
             override fun didFail() {
-                _verification.update { current ->
-                    current?.copy(status = DeviceVerificationStatus.FAILED, error = "Verification couldn't be completed.")
-                }
+                updateVerificationTerminal(DeviceVerificationStatus.FAILED, "Verification couldn't be completed.")
             }
 
             override fun didCancel() {
                 pendingVerificationRequest = null
-                _verification.update { current -> current?.copy(status = DeviceVerificationStatus.CANCELLED) }
+                verificationWasInitiatedHere = false
+                updateVerificationTerminal(DeviceVerificationStatus.CANCELLED)
             }
 
             override fun didFinish() {
                 pendingVerificationRequest = null
-                _verification.update { current -> current?.copy(status = DeviceVerificationStatus.VERIFIED) }
+                verificationWasInitiatedHere = false
+                updateVerificationTerminal(DeviceVerificationStatus.VERIFIED)
                 activeRoomId?.let { roomId ->
-                    callbackScope.launch { runCatching { refreshPeerTrust(requireRoom(roomId)) } }
+                    callbackScope.launch { runCatching { refreshPeerTrustAfterVerification(roomId) } }
                 }
             }
             })
             return controller
         } finally {
             verificationControllerMutex.unlock()
+        }
+    }
+
+    private fun updateVerificationProgress() {
+        _verification.update { current ->
+            if (current == null || current.status in VERIFICATION_TERMINAL_STATUSES ||
+                current.status == DeviceVerificationStatus.CONFIRMING
+            ) {
+                current
+            } else {
+                current.copy(status = DeviceVerificationStatus.COMPARING)
+            }
+        }
+    }
+
+    private fun updateVerificationFailure(error: Throwable) {
+        val safeError = verificationErrorMessage(error) ?: "Verification couldn't be completed."
+        _verification.update { current ->
+            if (current == null || current.status in VERIFICATION_TERMINAL_STATUSES) current
+            else current.copy(status = DeviceVerificationStatus.FAILED, error = safeError)
+        }
+    }
+
+    private fun updateVerificationTerminal(status: DeviceVerificationStatus, error: String? = null) {
+        _verification.update { current ->
+            if (current == null || current.status in VERIFICATION_TERMINAL_STATUSES) current
+            else current.copy(status = status, error = error)
         }
     }
 
@@ -4300,12 +4844,19 @@ class MatrixRepository(context: Context) {
 
     private companion object {
         const val DELIVERY_ACK_MSGTYPE = "org.friendline.delivery"
+        val VERIFICATION_TERMINAL_STATUSES = setOf(
+            DeviceVerificationStatus.VERIFIED,
+            DeviceVerificationStatus.CANCELLED,
+            DeviceVerificationStatus.FAILED,
+        )
         const val VERIFICATION_CONTROL_ROOM_NAME = "Device verification"
         const val VERIFICATION_CONTROL_ROOM_TOPIC = "org.friendline.verification-control.v1"
         const val VERIFICATION_ROOM_JOIN_TIMEOUT_MS = 120_000L
         const val VERIFICATION_ROOM_JOIN_POLL_MS = 500L
         const val VERIFICATION_ROOM_ROUTE_SYNC_TIMEOUT_MS = 30_000L
         const val VERIFICATION_ROOM_ROUTE_SYNC_POLL_MS = 500L
+        const val VERIFICATION_CONTROL_ROOM_STATE_TIMEOUT_MS = 15_000L
+        const val VERIFICATION_CONTROL_ROOM_STATE_POLL_MS = 250L
         const val ROOM_CREATE_ENCRYPTION_TIMEOUT_MS = 15_000L
         const val ROOM_CREATE_ENCRYPTION_POLL_MS = 250L
         const val ACK_NONE = "none"
@@ -4331,6 +4882,8 @@ class MatrixRepository(context: Context) {
         const val MAX_PROVISIONAL_ACK_SENDERS_PER_TARGET = 32
         const val VERIFICATION_IDENTITY_WAIT_TIMEOUT_MS = 20_000L
         const val VERIFICATION_IDENTITY_POLL_MS = 1_000L
+        const val PEER_TRUST_REFRESH_TIMEOUT_MS = 60_000L
+        const val PEER_TRUST_REFRESH_POLL_MS = 1_000L
         const val VOICE_DURATION_MATCH_TOLERANCE_MS = 1_000L
         val mediaCleanupLock = Any()
         var mediaTempCleanedForProcess = false

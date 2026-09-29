@@ -480,6 +480,28 @@ class MessengerViewModel(context: Context) : ViewModel() {
         }
     }
 
+    fun editMessage(message: ChatMessage, newBody: String) {
+        if (logoutRequested) return
+        val snapshot = _state.value
+        val roomId = snapshot.currentRoomId ?: return
+        if (!snapshot.currentRoomEncrypted || !message.isOwn || !message.canEdit) return
+        viewModelScope.launch {
+            runCatching { repository.editMessage(roomId, message, newBody) }
+                .onFailure { _state.update { it.copy(error = "Couldn't edit this encrypted message. Try again after syncing.") } }
+        }
+    }
+
+    fun redactMessage(message: ChatMessage) {
+        if (logoutRequested) return
+        val snapshot = _state.value
+        val roomId = snapshot.currentRoomId ?: return
+        if (!snapshot.currentRoomEncrypted || !message.isOwn || !message.canRedact) return
+        viewModelScope.launch {
+            runCatching { repository.redactMessage(roomId, message) }
+                .onFailure { _state.update { it.copy(error = "Couldn't remove this encrypted message. Try again after syncing.") } }
+        }
+    }
+
     fun sendText(body: String) {
         if (logoutRequested) return
         val roomId = _state.value.currentRoomId ?: return
