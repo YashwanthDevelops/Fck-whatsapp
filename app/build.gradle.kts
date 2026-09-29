@@ -28,6 +28,9 @@ val effectivePushEnabled = pushEnabled && validPushMatrixDomain && hasGoogleServ
 if (effectivePushEnabled) {
     apply(plugin = "com.google.gms.google-services")
 }
+val splitApksForDistribution = providers.gradleProperty("privateMessengerSplitApks")
+    .map { it.toBooleanStrict() }
+    .getOrElse(false)
 
 val localDebugKeystore = providers.environmentVariable("PRIVATE_MESSENGER_DEBUG_KEYSTORE").orNull
 val localDebugKeystorePassword = providers.environmentVariable("PRIVATE_MESSENGER_DEBUG_KEYSTORE_PASSWORD").orNull ?: "android"
@@ -93,6 +96,15 @@ android {
         }
     }
 
+    splits {
+        abi {
+            isEnable = splitApksForDistribution
+            reset()
+            include("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
+            isUniversalApk = false
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -118,6 +130,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("com.google.firebase:firebase-messaging")
     implementation("org.matrix.rustcomponents:sdk-android:26.09.9")
+    implementation("io.livekit:livekit-android:2.29.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")

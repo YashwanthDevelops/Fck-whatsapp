@@ -302,6 +302,34 @@ function Invoke-DiagnosticInstrumentation {
     if ($peerIdentityStateObservation.Success) {
         Write-Output "OUTBOX_DIAG_PEER_IDENTITY_STATE sender=$($peerIdentityStateObservation.Groups[1].Value) recipient=$($peerIdentityStateObservation.Groups[2].Value)"
     }
+    $messageMutationObservation = [regex]::Match(
+        $safeOutput,
+        "OUTBOX_DIAG_MESSAGE_MUTATION edit=(true|false) redact=(true|false) peerActionsRejected=(true|false)"
+    )
+    if ($messageMutationObservation.Success) {
+        Write-Output "OUTBOX_DIAG_MESSAGE_MUTATION edit=$($messageMutationObservation.Groups[1].Value) redact=$($messageMutationObservation.Groups[2].Value) peerActionsRejected=$($messageMutationObservation.Groups[3].Value)"
+    }
+    $unverifiedDeviceObservation = [regex]::Match(
+        $safeOutput,
+        "OUTBOX_DIAG_UNVERIFIED_DEVICE addedDevice=(true|false) localIdentity=(missing|verified|unverified|unavailable) selfSigningKeyPresent=(true|false) deviceCrossSigned=(true|false) primaryDecrypted=(true|false) newDeviceUndecryptable=(true|false) newDeviceDecrypted=(true|false) roomKeyRecipientList=(available|unavailable)"
+    )
+    if ($unverifiedDeviceObservation.Success) {
+        Write-Output "OUTBOX_DIAG_UNVERIFIED_DEVICE addedDevice=$($unverifiedDeviceObservation.Groups[1].Value) localIdentity=$($unverifiedDeviceObservation.Groups[2].Value) selfSigningKeyPresent=$($unverifiedDeviceObservation.Groups[3].Value) deviceCrossSigned=$($unverifiedDeviceObservation.Groups[4].Value) primaryDecrypted=$($unverifiedDeviceObservation.Groups[5].Value) newDeviceUndecryptable=$($unverifiedDeviceObservation.Groups[6].Value) newDeviceDecrypted=$($unverifiedDeviceObservation.Groups[7].Value) roomKeyRecipientList=$($unverifiedDeviceObservation.Groups[8].Value)"
+    }
+    $addedDeviceTrustStatus = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_added_device_trust=(missing|verified|unverified|unavailable)\|(true|false)\|(true|false)"
+    )
+    if ($addedDeviceTrustStatus.Success) {
+        Write-Output "OUTBOX_DIAG_ADDED_DEVICE_TRUST localIdentity=$($addedDeviceTrustStatus.Groups[1].Value) selfSigningKeyPresent=$($addedDeviceTrustStatus.Groups[2].Value) deviceCrossSigned=$($addedDeviceTrustStatus.Groups[3].Value)"
+    }
+    $addedDeviceResultStatus = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_added_device_result=(missing|verified|unverified|unavailable)\|(true|false)\|(true|false)\|(true|false)\|(true|false)\|(true|false)\|(available|unavailable)"
+    )
+    if ($addedDeviceResultStatus.Success) {
+        Write-Output "OUTBOX_DIAG_ADDED_DEVICE_RESULT localIdentity=$($addedDeviceResultStatus.Groups[1].Value) selfSigningKeyPresent=$($addedDeviceResultStatus.Groups[2].Value) deviceCrossSigned=$($addedDeviceResultStatus.Groups[3].Value) primaryDecrypted=$($addedDeviceResultStatus.Groups[4].Value) newDeviceUndecryptable=$($addedDeviceResultStatus.Groups[5].Value) newDeviceDecrypted=$($addedDeviceResultStatus.Groups[6].Value) roomKeyRecipientList=$($addedDeviceResultStatus.Groups[7].Value)"
+    }
     $groupDeliveryObservations = [regex]::Matches(
         $safeOutput,
         "OUTBOX_DIAG_GROUP_DELIVERY expected=(\d{1,2}) acknowledged=(\d{1,2}) delivered=(true|false)"
@@ -435,7 +463,7 @@ function Invoke-DiagnosticInstrumentation {
         } else {
             "test-method-not-reached"
         }
-        $progressPattern = "OUTBOX_DIAG_PROGRESS stage=$([regex]::Escape($Stage)) step=(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|createGroupConversation|verifyGroupPeer|awaitGroupDeliveryPartial|awaitGroupDeliveryComplete|sendGroupMessage|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|verificationPeerTrust|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|awaitBackgroundDelivery|awaitOfflineDeliveryAck|awaitOfflineBacklog|sendReadReceipt|awaitReadReceipt|awaitTyping|verifyExactlyOnce) state=(start|complete)"
+        $progressPattern = "OUTBOX_DIAG_PROGRESS stage=$([regex]::Escape($Stage)) step=(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|createGroupConversation|verifyGroupPeer|awaitGroupDeliveryPartial|awaitGroupDeliveryComplete|sendGroupMessage|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|unverifiedDeviceKeyExclusion|editAndRedactEncryptedMessage|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|verificationPeerTrust|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|awaitBackgroundDelivery|awaitOfflineDeliveryAck|awaitOfflineBacklog|sendReadReceipt|awaitReadReceipt|awaitTyping|verifyExactlyOnce) state=(start|complete)"
         $progressMatches = [regex]::Matches($safeOutput, $progressPattern)
         $progressEvents = @(
             foreach ($progressMatch in $progressMatches) {
@@ -443,7 +471,7 @@ function Invoke-DiagnosticInstrumentation {
             }
         )
         if ($progressEvents.Count -eq 0) {
-            $statusProgressPattern = "outbox_diag_progress=$([regex]::Escape($Stage))\|(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|createGroupConversation|verifyGroupPeer|awaitGroupDeliveryPartial|awaitGroupDeliveryComplete|sendGroupMessage|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|verificationPeerTrust|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|awaitBackgroundDelivery|awaitOfflineDeliveryAck|awaitOfflineBacklog|sendReadReceipt|awaitReadReceipt|awaitTyping|verifyExactlyOnce)\|(start|complete)"
+            $statusProgressPattern = "outbox_diag_progress=$([regex]::Escape($Stage))\|(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|createGroupConversation|verifyGroupPeer|awaitGroupDeliveryPartial|awaitGroupDeliveryComplete|sendGroupMessage|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|unverifiedDeviceKeyExclusion|editAndRedactEncryptedMessage|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|verificationPeerTrust|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|awaitBackgroundDelivery|awaitOfflineDeliveryAck|awaitOfflineBacklog|sendReadReceipt|awaitReadReceipt|awaitTyping|verifyExactlyOnce)\|(start|complete)"
             $statusProgressMatches = [regex]::Matches($safeOutput, $statusProgressPattern)
             $progressEvents = @(
                 foreach ($progressMatch in $statusProgressMatches) {

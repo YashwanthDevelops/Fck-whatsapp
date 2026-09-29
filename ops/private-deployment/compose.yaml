@@ -1,9 +1,16 @@
 name: friendline-private
 
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   db:
     image: ${POSTGRES_IMAGE:-postgres:16.15-alpine}
     restart: unless-stopped
+    logging: *bounded-logging
     environment:
       POSTGRES_DB: synapse
       POSTGRES_USER: synapse
@@ -26,12 +33,15 @@ services:
   synapse:
     image: ${SYNAPSE_IMAGE:-ghcr.io/element-hq/synapse:v1.161.0}
     restart: unless-stopped
+    logging: *bounded-logging
     environment:
       SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
       SYNAPSE_SERVER_NAME: ${MATRIX_DOMAIN:?Set MATRIX_DOMAIN to the stable domain you own}
       SYNAPSE_REPORT_STATS: "no"
       MATRIX_DOMAIN: ${MATRIX_DOMAIN:?Set MATRIX_DOMAIN to the stable domain you own}
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      CADDY_PROXY_IP: ${CADDY_PROXY_IP:-172.30.255.2}
+      PROXY_NETWORK_SUBNET: ${PROXY_NETWORK_SUBNET:-172.30.255.0/29}
     secrets:
       - postgres_password
     volumes:
@@ -60,6 +70,7 @@ services:
   caddy:
     image: ${CADDY_IMAGE:-caddy:2.11.4-alpine}
     restart: unless-stopped
+    logging: *bounded-logging
     environment:
       MATRIX_DOMAIN: ${MATRIX_DOMAIN:?Set MATRIX_DOMAIN to the stable domain you own}
     ports:
@@ -83,6 +94,7 @@ services:
       proxy:
         aliases:
           - ${MATRIX_DOMAIN:?Set MATRIX_DOMAIN to the stable domain you own}
+        ipv4_address: ${CADDY_PROXY_IP:-172.30.255.2}
       edge: {}
 
   sygnal:
@@ -90,6 +102,7 @@ services:
     profiles:
       - push
     restart: unless-stopped
+    logging: *bounded-logging
     environment:
       SYGNAL_CONF: /sygnal/sygnal.yaml
     volumes:
@@ -116,6 +129,9 @@ networks:
     internal: true
   proxy:
     internal: true
+    ipam:
+      config:
+        - subnet: ${PROXY_NETWORK_SUBNET:-172.30.255.0/29}
   edge:
     driver: bridge
 

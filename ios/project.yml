@@ -7,6 +7,9 @@ packages:
   MatrixRustSDK:
     url: https://github.com/matrix-org/matrix-rust-components-swift
     exactVersion: 26.08.11
+  LiveKit:
+    url: https://github.com/livekit/client-sdk-swift
+    exactVersion: 2.17.0
 targets:
   PrivateMessenger:
     type: application
@@ -17,6 +20,8 @@ targets:
     dependencies:
       - package: MatrixRustSDK
         product: MatrixRustSDK
+      - package: LiveKit
+        product: LiveKit
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.friendline.messenger.ios
@@ -27,6 +32,7 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: Private Messenger
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: Connect to your private development homeserver on the local network.
         INFOPLIST_KEY_NSMicrophoneUsageDescription: Record voice messages for encrypted conversations. Audio is encrypted on this device before it is sent.
+        INFOPLIST_KEY_NSCameraUsageDescription: Make encrypted video calls with people in your private conversations.
         INFOPLIST_KEY_MatrixPushEnabled: "$(MATRIX_PUSH_ENABLED)"
         INFOPLIST_KEY_MatrixPushDomain: "$(MATRIX_PUSH_DOMAIN)"
         INFOPLIST_KEY_MatrixPushAppID: "$(MATRIX_PUSH_APP_ID)"

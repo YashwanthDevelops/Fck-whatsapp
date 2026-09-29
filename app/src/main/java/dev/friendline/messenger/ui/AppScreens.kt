@@ -99,7 +99,12 @@ fun LoginScreen(
             .padding(horizontal = 28.dp, vertical = 32.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Text("Private Messenger", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
+        Text(
+            "Private Messenger",
+            style = MaterialTheme.typography.headlineMedium,
+            color = MaterialTheme.colorScheme.onBackground,
+            fontWeight = FontWeight.SemiBold,
+        )
         Spacer(Modifier.height(8.dp))
         Text(
             "Sign in to your private server. New accounts are created by your server administrator.",

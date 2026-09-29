@@ -22,6 +22,12 @@ RESERVED_EXAMPLE_DOMAINS = (
     "example.net",
     "example.org",
 )
+DEFAULT_PROXY_NETWORK_SUBNET = "172.30.255.0/29"
+DEFAULT_CADDY_PROXY_IP = "172.30.255.2"
+RFC1918_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
 
 
 def is_deployable_domain(domain: str) -> bool:
@@ -41,6 +47,37 @@ def is_deployable_domain(domain: str) -> bool:
         normalized == reserved or normalized.endswith(f".{reserved}")
         for reserved in RESERVED_EXAMPLE_DOMAINS
     )
+
+
+def caddy_proxy_ip_range(caddy_ip: str, proxy_subnet: str) -> str:
+    """Return the narrow Synapse SSRF exception for Caddy's static proxy IP."""
+    try:
+        address = ipaddress.ip_address(caddy_ip)
+        network = ipaddress.ip_network(proxy_subnet, strict=True)
+    except ValueError as error:
+        raise SystemExit(
+            "The private proxy IP and subnet must be valid IP addresses."
+        ) from error
+
+    if address.version != 4 or network.version != 4:
+        raise SystemExit("The private proxy network must use IPv4.")
+    if not any(network.subnet_of(private_network) for private_network in RFC1918_NETWORKS):
+        raise SystemExit(
+            "PROXY_NETWORK_SUBNET must be within an RFC1918 private IPv4 range."
+        )
+    if not 24 <= network.prefixlen <= 29:
+        raise SystemExit(
+            "PROXY_NETWORK_SUBNET must be a usable private subnet from /24 through /29."
+        )
+    if address not in network:
+        raise SystemExit("CADDY_PROXY_IP must be inside PROXY_NETWORK_SUBNET.")
+    if address in {
+        network.network_address,
+        network.network_address + 1,
+        network.broadcast_address,
+    }:
+        raise SystemExit("CADDY_PROXY_IP must be a usable address inside PROXY_NETWORK_SUBNET.")
+    return f"{address}/32"
 
 
 def read_database_password() -> str:
@@ -109,6 +146,12 @@ def configure() -> None:
     config["trusted_key_servers"] = []
     config["suppress_key_server_warning"] = True
     config["max_upload_size"] = "34M"
+    config["ip_range_whitelist"] = [
+        caddy_proxy_ip_range(
+            os.environ.get("CADDY_PROXY_IP", DEFAULT_CADDY_PROXY_IP),
+            os.environ.get("PROXY_NETWORK_SUBNET", DEFAULT_PROXY_NETWORK_SUBNET),
+        )
+    ]
 
     push = config.get("push") or {}
     push["include_content"] = False

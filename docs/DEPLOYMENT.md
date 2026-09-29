@@ -29,7 +29,8 @@ This project has no configured host, domain, DNS, TLS certificate, or server cre
 
 ## Private client distribution
 
-- Android: create a release APK after release signing is configured. Keep the keystore and its password outside Git, record how it is backed up, and retain the same signing identity for updates.
+- Android: create release APKs after release signing is configured. Keep the keystore and its password outside Git, record how it is backed up, and retain the same signing identity for updates. A universal APK includes every native architecture and is large; build one APK per supported ABI with `:app:assembleStandardRelease -PprivateMessengerSplitApks=true`, then give each friend the APK matching their device. The normal debug build remains universal for emulator testing.
+- Android App Bundle: `:app:bundleStandardRelease` creates an AAB containing all native architectures. It must be signed with the stable upload key before a private Play track or app-bundle distribution service can use it.
 - iOS: build and sign on a Mac. Xcode personal-team signing can support limited development installs; broader or longer-lived distribution may require Apple Developer Program membership, certificates, and provisioning. Decide distribution after device builds work.
 
 ## Rollback and recovery

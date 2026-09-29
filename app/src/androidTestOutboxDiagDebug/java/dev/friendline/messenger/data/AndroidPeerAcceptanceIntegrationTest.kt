@@ -12,6 +12,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import org.matrix.rustcomponents.sdk.LogLevel
 import org.matrix.rustcomponents.sdk.TracingConfiguration
@@ -23,6 +24,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import java.security.MessageDigest
 
 /**
@@ -225,6 +228,19 @@ class AndroidPeerAcceptanceIntegrationTest {
             },
             onIdentityState = onIdentityState,
         )
+        onStep("unverifiedDeviceKeyExclusion")
+        reportProgress(instrumentation, "core", "unverifiedDeviceKeyExclusion", "start")
+        assertNewUnverifiedDeviceCannotDecrypt(
+            homeserver = homeserver,
+            recipientId = recipientId,
+            recipientPassword = recipientPassword,
+            marker = marker,
+            roomId = roomId,
+            sender = sender,
+            recipient = recipient,
+            appContext = instrumentation.targetContext,
+        )
+        reportProgress(instrumentation, "core", "unverifiedDeviceKeyExclusion", "complete")
         reportProgress(instrumentation, "core", "verifyDiagnosticRoom", "complete")
 
         onStep("editAndRedactEncryptedMessage")
@@ -730,6 +746,145 @@ class AndroidPeerAcceptanceIntegrationTest {
         }
         println("OUTBOX_DIAG_MESSAGE_MUTATION edit=true redact=true peerActionsRejected=true")
     }
+
+    private suspend fun assertNewUnverifiedDeviceCannotDecrypt(
+        homeserver: String,
+        recipientId: String,
+        recipientPassword: String,
+        marker: String,
+        roomId: String,
+        sender: MatrixRepository,
+        recipient: MatrixRepository,
+        appContext: Context,
+    ) {
+        // This fresh repository logs in to the already-verified account with a new device ID
+        // and an empty crypto store. It does not import the account's private cross-signing keys.
+        val addedDevice = newIsolatedRepository(appContext, "recipient-added-device")
+        try {
+            loginFresh(addedDevice, homeserver, recipientId, recipientPassword)
+            await("new device sees the existing encrypted room") {
+                addedDevice.refreshConversations()
+                isJoinedEncrypted(addedDevice, roomId)
+            }
+            addedDevice.openConversation(roomId)
+            delay(2_000)
+
+            val localIdentityState = allowlistedIdentityState(
+                addedDevice.ownVerificationIdentityStateForDiagnostic(),
+            )
+            val crossSignature = addedDeviceCrossSignatureStatus(appContext, recipientId)
+            InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                putString(
+                    "outbox_diag_added_device_trust",
+                    "$localIdentityState|${crossSignature.selfSigningKeyPresent}|${crossSignature.deviceKeyCrossSigned}",
+                )
+            })
+            check(crossSignature.selfSigningKeyPresent) {
+                "The added device could not establish whether its device key is cross-signed"
+            }
+            check(!crossSignature.deviceKeyCrossSigned) {
+                "The fresh login was cross-signed before the unverified-device check"
+            }
+
+            val baselineUtd = addedDevice.utdCauseCountsForDiagnostic().values.sum()
+            val baselineRoomUtd = addedDevice.timelineCategoriesForDiagnostic(roomId)
+                .getOrDefault("REMOTE_UTD", 0)
+            val body = "new-device-unverified-$marker"
+
+            sender.sendText(roomId, body)
+            val senderEvent = awaitMessage(sender, "sender confirms the unverified-device probe") {
+                it.body == body && it.isOwn && it.isRemote && it.eventId != null
+            }
+            val eventId = checkNotNull(senderEvent.eventId)
+            awaitMessage(recipient, "existing verified device decrypts the probe") {
+                it.eventId == eventId && it.body == body && !it.isOwn
+            }
+
+            val newDeviceUndecryptable = awaitCondition("new device receives the encrypted event without its room key", 30_000) {
+                val utdCount = addedDevice.utdCauseCountsForDiagnostic().values.sum()
+                val roomUtd = addedDevice.timelineCategoriesForDiagnostic(roomId)
+                    .getOrDefault("REMOTE_UTD", 0)
+                utdCount > baselineUtd && roomUtd > baselineRoomUtd
+            }
+            val newDeviceDecrypted = addedDevice.messages.value.any {
+                it.eventId == eventId || it.body == body
+            }
+            val deviceObservation =
+                "$localIdentityState|${crossSignature.selfSigningKeyPresent}|${crossSignature.deviceKeyCrossSigned}" +
+                    "|true|$newDeviceUndecryptable|$newDeviceDecrypted|unavailable"
+            InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                putString("outbox_diag_added_device_result", deviceObservation)
+            })
+            println(
+                "OUTBOX_DIAG_UNVERIFIED_DEVICE addedDevice=true localIdentity=$localIdentityState " +
+                    "selfSigningKeyPresent=true deviceCrossSigned=false primaryDecrypted=true " +
+                    "newDeviceUndecryptable=$newDeviceUndecryptable newDeviceDecrypted=$newDeviceDecrypted " +
+                    "roomKeyRecipientList=unavailable",
+            )
+            check(newDeviceUndecryptable) {
+                "The newly added unverified device did not surface the probe as undecryptable"
+            }
+            check(!newDeviceDecrypted) {
+                "A newly added device without the account's cross-signing secrets decrypted the probe"
+            }
+        } finally {
+            addedDevice.close()
+        }
+    }
+
+    private suspend fun addedDeviceCrossSignatureStatus(
+        appContext: Context,
+        userId: String,
+    ): DeviceCrossSignatureStatus = withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val deviceContext = isolatedContext(appContext, "recipient-added-device")
+        val session = checkNotNull(DeviceVault(deviceContext).loadSession()) {
+            "The additional Matrix device did not persist its diagnostic session"
+        }
+        val connection = URL(
+            "${session.homeserverUrl.trimEnd('/')}/_matrix/client/v3/keys/query",
+        ).openConnection() as HttpURLConnection
+        try {
+            connection.connectTimeout = 5_000
+            connection.readTimeout = 10_000
+            connection.requestMethod = "POST"
+            connection.doOutput = true
+            connection.setRequestProperty("Authorization", "Bearer ${session.accessToken}")
+            connection.setRequestProperty("Content-Type", "application/json")
+            val request = JSONObject().put(
+                "device_keys",
+                JSONObject().put(userId, org.json.JSONArray().put(session.deviceId)),
+            )
+            connection.outputStream.bufferedWriter(Charsets.UTF_8).use { writer ->
+                writer.write(request.toString())
+            }
+            val status = connection.responseCode
+            check(status in 200..299) {
+                "The diagnostic homeserver could not return the added device's public keys (HTTP $status)"
+            }
+            val response = connection.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
+                JSONObject(reader.readText())
+            }
+            val selfSigningKeys = response.optJSONObject("self_signing_keys")
+                ?.optJSONObject(userId)
+                ?.optJSONObject("keys")
+            val selfSigningKeyId = selfSigningKeys?.keys()?.asSequence()?.firstOrNull()
+            val deviceKeys = response.optJSONObject("device_keys")
+                ?.optJSONObject(userId)
+                ?.optJSONObject(session.deviceId)
+            val signatures = deviceKeys?.optJSONObject("signatures")?.optJSONObject(userId)
+            DeviceCrossSignatureStatus(
+                selfSigningKeyPresent = selfSigningKeyId != null,
+                deviceKeyCrossSigned = selfSigningKeyId != null && signatures?.has(selfSigningKeyId) == true,
+            )
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private data class DeviceCrossSignatureStatus(
+        val selfSigningKeyPresent: Boolean,
+        val deviceKeyCrossSigned: Boolean,
+    )
 
     private suspend fun queueAttachmentWhileServerIsOffline(
         homeserver: String,

@@ -2,7 +2,7 @@
 
 This is a separate hosted deployment bundle for the private friend group. It does not share the local development stack's bind mounts, Compose project, or data. It prepares Synapse with PostgreSQL behind Caddy-managed HTTPS. An optional Sygnal profile and app configuration are included for Android/iOS push delivery; it remains inactive until real provider credentials are configured and end-to-end delivery is validated.
 
-The stack keeps public registration and guest access disabled, blocks federation at both the Synapse listener and configuration layers, disables URL previews and anonymous statistics, and sets `push.include_content: false`. PostgreSQL is initialized with UTF-8 encoding and the `C` locale required by Synapse; this only takes effect when its data volume is first created. PostgreSQL, Synapse, and Caddy state use named Docker volumes. The database has no published port. Synapse is reachable only from Caddy on an isolated Docker network, and its outbound network is isolated as well. On that private proxy network, Docker resolves the configured Matrix domain to Caddy so Synapse can reach the same HTTPS push URL without public-network egress. Caddy publishes TCP 80/443 and UDP 443 for certificate validation, HTTPS, and HTTP/3.
+The stack keeps public registration and guest access disabled, blocks federation at both the Synapse listener and configuration layers, disables URL previews and anonymous statistics, and sets `push.include_content: false`. PostgreSQL is initialized with UTF-8 encoding and the `C` locale required by Synapse; this only takes effect when its data volume is first created. PostgreSQL, Synapse, and Caddy state use named Docker volumes. The database has no published port. Synapse is reachable only from Caddy on an isolated Docker network, and its outbound network is isolated as well. On that private proxy network, Docker resolves the configured Matrix domain to Caddy so Synapse can reach the same HTTPS push URL without public-network egress. Since Synapse's outbound IP-range protection also applies to push gateways and blocks private addresses by default, Caddy receives a fixed address and Synapse permits only that exact `/32`. The default proxy subnet is `172.30.255.0/29`; if it overlaps a host, VPN, or Docker network, set both `PROXY_NETWORK_SUBNET` and `CADDY_PROXY_IP` in `.env` to a free RFC1918 subnet between `/24` and `/29` and a usable address inside it before first setup. Caddy publishes TCP 80/443 and UDP 443 for certificate validation, HTTPS, and HTTP/3.
 
 The server domain is an identity decision: Matrix user IDs include it. Choose the stable DNS name you own before first setup. Do not use the `.invalid` placeholder from `.env.example` for a real deployment.
 
@@ -30,6 +30,8 @@ Run these commands on the Linux host from this directory (`ops/private-deploymen
    ```
 
 2. Edit `.env`: set `MATRIX_DOMAIN` to the stable DNS name you own and confirm `POSTGRES_PASSWORD_FILE=./secrets/postgres_password`. Do not use reserved documentation or local-only names such as `.invalid`, `.example`, `.test`, or `.local`; the Synapse helper rejects these before it writes the homeserver identity. This syntax check cannot verify DNS ownership or reachability. The image tags are pinned to release versions. Before production, review security advisories and pin each image to a verified digest in the same change-control process.
+
+   The default proxy subnet is `172.30.255.0/29`, with Caddy at `172.30.255.2`. Check that it does not overlap a host, VPN, or existing Docker network. If it does, add `PROXY_NETWORK_SUBNET=<free-RFC1918-subnet-from-/24-through-/29>` and `CADDY_PROXY_IP=<usable-address-in-that-subnet>` to `.env`; the Synapse helper validates the address/subnet pairing and permits only the exact Caddy address for push-gateway requests.
 
 3. Confirm that Compose resolves the required variables and secret file, without starting containers:
 
@@ -78,6 +80,7 @@ Run these commands on the Linux host from this directory (`ops/private-deploymen
 - Caddy request access logging is not enabled. Synapse still handles account, room, device, and delivery metadata needed to operate Matrix; E2EE protects message content only when the client uses encrypted rooms.
 - `push.include_content: false` omits event content from Matrix push notification pokes. No APNs/FCM provider is configured here, and routing metadata can still be present in push requests.
 - Sygnal is an optional Compose profile. When enabled, it has no published port; Caddy routes only `/_matrix/push/v1/notify` to it over the private network.
+- Container JSON logs rotate at 10 MB per file and keep five files to limit disk growth on the host.
 
 The Docker networks isolate services from the public internet, but they do not encrypt traffic between containers on the same host. Treat the host and its Docker administrator as trusted. The server's configuration and media volumes also contain sensitive operational data even though encrypted room bodies are not readable by Synapse.
 

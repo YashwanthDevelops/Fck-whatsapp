@@ -5,6 +5,11 @@ import android.net.Uri
 import android.graphics.BitmapFactory
 import android.provider.OpenableColumns
 import dev.friendline.messenger.BuildConfig
+import dev.friendline.messenger.calls.CALL_MESSAGE_TYPE
+import dev.friendline.messenger.calls.CallProtocol
+import dev.friendline.messenger.calls.MessengerCallAction
+import dev.friendline.messenger.calls.MessengerCallKind
+import dev.friendline.messenger.calls.MessengerCallSignal
 import dev.friendline.messenger.push.MatrixPushClient
 import dev.friendline.messenger.push.MatrixPushSession
 import dev.friendline.messenger.push.PushPusherIdentity
@@ -103,7 +108,9 @@ import java.nio.file.StandardCopyOption
 import java.time.Duration
 import java.util.UUID
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
@@ -161,6 +168,7 @@ class MatrixRepository(context: Context) {
     private val _composerDraft = MutableStateFlow("")
     private val _connection = MutableStateFlow("Offline")
     private val _typingUsers = MutableStateFlow<List<String>>(emptyList())
+    private val _callSignals = MutableSharedFlow<MessengerCallSignal>(extraBufferCapacity = 32)
     private val _verification = MutableStateFlow<DeviceVerificationUiState?>(null)
     private val _peerTrust = MutableStateFlow(PeerTrustStatus.UNKNOWN)
     private val _searchResults = MutableStateFlow<List<MessageSearchHit>>(emptyList())
@@ -182,6 +190,7 @@ class MatrixRepository(context: Context) {
     val composerDraft = _composerDraft.asStateFlow()
     val connection = _connection.asStateFlow()
     val typingUsers = _typingUsers.asStateFlow()
+    val callSignals = _callSignals.asSharedFlow()
     val verification = _verification.asStateFlow()
     val peerTrust = _peerTrust.asStateFlow()
     val searchResults = _searchResults.asStateFlow()
@@ -1680,6 +1689,35 @@ class MatrixRepository(context: Context) {
         refreshConversations()
     }
 
+    /**
+     * Send encrypted call control over the existing Matrix room. The 256-bit media key is
+     * included only on an invitation and remains inside Matrix's encrypted event payload.
+     */
+    suspend fun sendCallSignal(
+        roomId: String,
+        action: MessengerCallAction,
+        callId: String,
+        kind: MessengerCallKind? = null,
+        mediaKeyBase64: String? = null,
+    ) = withContext(Dispatchers.IO) {
+        check(!logoutInProgress && activeRoomId == roomId) { "Open the conversation before placing a call" }
+        val room = requireRoom(roomId)
+        check(room.encryptionState().name == "ENCRYPTED") {
+            "Calls are disabled because this conversation is not end-to-end encrypted"
+        }
+        check(_peerTrust.value == PeerTrustStatus.VERIFIED) {
+            "Verify this conversation before starting or joining a call"
+        }
+        check(expectedDeliveryMemberIdsByRoom[roomId]?.size == 1) {
+            "Calls are currently available only in verified one-to-one conversations"
+        }
+        val content = CallProtocol.envelope(action, callId, kind, mediaKeyBase64)
+        withSendQueueGate {
+            check(activeRoomId == roomId && !logoutInProgress) { "The conversation changed before the call signal was sent" }
+            room.sendRaw("m.room.message", content)
+        }
+    }
+
     suspend fun sendAttachment(
         roomId: String,
         contentUri: String,
@@ -2649,6 +2687,26 @@ class MatrixRepository(context: Context) {
                 }
             }
             val messageContent = (msgLike?.kind as? MsgLikeKind.Message)?.content
+            val customMessage = messageContent?.msgType as? MessageType.Other
+            if (customMessage?.msgtype == CALL_MESSAGE_TYPE) {
+                val senderId = event.sender
+                val incomingEventId = eventId
+                if (!event.isOwn && event.isRemote && incomingEventId != null &&
+                    activeRoomId == roomId && _peerTrust.value == PeerTrustStatus.VERIFIED &&
+                    expectedDeliveryMemberIdsByRoom[roomId]?.contains(senderId) == true
+                ) {
+                    val rawEvent = runCatching { event.lazyProvider.debugInfo().originalJson }.getOrNull()
+                    if (rawEvent != null) {
+                        CallProtocol.parse(
+                            roomId = roomId,
+                            senderId = senderId,
+                            eventId = incomingEventId,
+                            originalEventJson = rawEvent,
+                        )?.let(_callSignals::tryEmit)
+                    }
+                }
+                return null
+            }
             val acknowledgedId = messageContent?.msgType?.deliveryAckTarget()
             if (acknowledgedId != null) {
                 if (event.isOwn) {
