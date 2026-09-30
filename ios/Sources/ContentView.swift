@@ -1,10 +1,12 @@
 import SwiftUI
 import UIKit
 import AVFoundation
+import CoreImage
 import CoreTransferable
 import PhotosUI
 import QuickLook
 import UniformTypeIdentifiers
+import VisionKit
 
 private struct ImportedMediaFile: Transferable {
     let url: URL
@@ -492,6 +494,8 @@ private struct NewConversationScreen: View {
     @State private var matrixIds = ""
     @State private var name = ""
     @State private var isGroup = false
+    @State private var showingFriendQr = false
+    @State private var showingFriendQrScanner = false
 
     var body: some View {
         NavigationStack {
@@ -517,6 +521,27 @@ private struct NewConversationScreen: View {
                          ? "Invite at least two people. The room is private and invite-only. Messages are end-to-end encrypted; the homeserver can see room membership and any room name."
                          : "This private conversation is created with encryption enabled. The homeserver can see room membership and any room name.")
                 }
+                Section("FRIEND DISCOVERY") {
+                    HStack(spacing: 12) {
+                        Button {
+                            requestFriendQrScanner()
+                        } label: {
+                            Label("Scan friend QR", systemImage: "qrcode.viewfinder")
+                        }
+                        .disabled(isGroup || messenger.isBusy)
+                        Spacer(minLength: 0)
+                        if messenger.friendAddressQrPayload != nil {
+                            Button {
+                                showingFriendQr = true
+                            } label: {
+                                Label("Show my QR", systemImage: "qrcode")
+                            }
+                        }
+                    }
+                    Text("The QR contains only a Matrix ID and homeserver. You can always enter a Matrix ID above. Verify devices separately after adding a friend.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
                 Section {
                     Button {
                         Task {
@@ -536,8 +561,169 @@ private struct NewConversationScreen: View {
             .navigationTitle("New conversation")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .navigationBarLeading) { Button("Cancel") { dismiss() } } }
+            .sheet(isPresented: $showingFriendQr) {
+                NavigationStack {
+                    if let payload = messenger.friendAddressQrPayload, let matrixId = messenger.userId {
+                        FriendAddressQrView(payload: payload, matrixId: matrixId)
+                    } else {
+                        VStack(spacing: 10) {
+                            Image(systemName: "qrcode").font(.largeTitle).foregroundStyle(.secondary)
+                            Text("QR unavailable").font(.headline)
+                            Text("Your current Matrix address couldn't be prepared.")
+                                .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                        }
+                        .padding(28)
+                    }
+                }
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+            }
+            .sheet(isPresented: $showingFriendQrScanner) {
+                NavigationStack {
+                    FriendAddressQrScannerView(
+                        onScan: { rawValue in
+                            if let matrixId = messenger.resolveFriendAddressQr(rawValue) {
+                                matrixIds = matrixId
+                                isGroup = false
+                                showingFriendQrScanner = false
+                            }
+                        },
+                        onFailure: {
+                            messenger.errorMessage = "QR scanning couldn't start. Enter the Matrix ID manually."
+                            showingFriendQrScanner = false
+                        }
+                    )
+                    .navigationTitle("Scan friend QR")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Cancel") { showingFriendQrScanner = false }
+                        }
+                    }
+                }
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+            }
         }
     }
+
+    private func requestFriendQrScanner() {
+        guard DataScannerViewController.isSupported else {
+            messenger.errorMessage = "Live QR scanning isn't supported on this device. Enter the Matrix ID manually."
+            return
+        }
+        Task { @MainActor in
+            let permissionGranted = await AVCaptureDevice.requestAccess(for: .video)
+            guard permissionGranted, DataScannerViewController.isAvailable else {
+                messenger.errorMessage = "Camera access is unavailable. Allow camera access or enter the Matrix ID manually."
+                return
+            }
+            showingFriendQrScanner = true
+        }
+    }
+}
+
+private struct FriendAddressQrView: View {
+    @Environment(\.dismiss) private var dismiss
+    let payload: String
+    let matrixId: String
+
+    var body: some View {
+        VStack(spacing: 15) {
+            if let image = friendAddressQrImage(payload) {
+                Image(uiImage: image)
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: 290, maxHeight: 290)
+                    .padding(16)
+                    .background(.white, in: RoundedRectangle(cornerRadius: 18))
+                    .accessibilityLabel("Friendline address QR code")
+            }
+            Text(matrixId)
+                .font(.body.monospaced())
+                .textSelection(.enabled)
+            Text("This QR contains your Matrix ID and homeserver only. It does not verify device identity.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .navigationTitle("My Friendline QR")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Done") { dismiss() }
+            }
+        }
+    }
+}
+
+@MainActor
+private struct FriendAddressQrScannerView: UIViewControllerRepresentable {
+    let onScan: (String) -> Void
+    let onFailure: () -> Void
+
+    func makeUIViewController(context: Context) -> DataScannerViewController {
+        let scanner = DataScannerViewController(
+            recognizedDataTypes: [.barcode(symbologies: [.qr])],
+            qualityLevel: .balanced,
+            recognizesMultipleItems: false,
+            isHighFrameRateTrackingEnabled: false,
+            isPinchToZoomEnabled: true,
+            isGuidanceEnabled: true,
+            isHighlightingEnabled: true
+        )
+        scanner.delegate = context.coordinator
+        do {
+            try scanner.startScanning()
+        } catch {
+            onFailure()
+        }
+        return scanner
+    }
+
+    func updateUIViewController(_ controller: DataScannerViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onScan: onScan, onFailure: onFailure)
+    }
+
+    static func dismantleUIViewController(_ controller: DataScannerViewController, coordinator: Coordinator) {
+        controller.stopScanning()
+    }
+
+    final class Coordinator: NSObject, DataScannerViewControllerDelegate {
+        private let onScan: (String) -> Void
+        private let onFailure: () -> Void
+        private var didScan = false
+
+        init(onScan: @escaping (String) -> Void, onFailure: @escaping () -> Void) {
+            self.onScan = onScan
+            self.onFailure = onFailure
+        }
+
+        func dataScanner(_ dataScanner: DataScannerViewController, didAdd addedItems: [RecognizedItem], allItems: [RecognizedItem]) {
+            guard !didScan else { return }
+            for item in addedItems {
+                guard case let .barcode(barcode) = item, let value = barcode.payloadStringValue else { continue }
+                didScan = true
+                dataScanner.stopScanning()
+                onScan(value)
+                return
+            }
+        }
+    }
+}
+
+private func friendAddressQrImage(_ payload: String) -> UIImage? {
+    let generator = CIFilter.qrCodeGenerator()
+    generator.message = Data(payload.utf8)
+    generator.correctionLevel = "M"
+    guard let output = generator.outputImage?.transformed(by: CGAffineTransform(scaleX: 12, y: 12)),
+          let image = CIContext().createCGImage(output, from: output.extent) else { return nil }
+    return UIImage(cgImage: image)
 }
 
 private struct ChatScreen: View {

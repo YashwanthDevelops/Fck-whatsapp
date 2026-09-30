@@ -7,6 +7,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
 import dev.friendline.messenger.push.MatrixPushClient
 
@@ -14,6 +15,7 @@ import dev.friendline.messenger.push.MatrixPushClient
 fun MessengerApp(viewModel: MessengerViewModel) {
     val state by viewModel.state.collectAsState()
     val context = LocalContext.current
+    val myFriendAddressQr = remember(state.userId, state.homeserver) { viewModel.friendAddressQrPayload() }
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = MatrixPushClient.notificationPermissionContract(),
     ) { granted -> viewModel.onPushPermissionResult(granted) }
@@ -73,8 +75,11 @@ fun MessengerApp(viewModel: MessengerViewModel) {
         state.userId != null && state.showNewConversation -> NewConversationScreen(
             isBusy = state.isBusy,
             error = state.error,
+            friendMatrixId = state.userId,
+            friendAddressQrPayload = myFriendAddressQr,
             onBack = { viewModel.showNewConversation(false) },
             onCreate = viewModel::createConversation,
+            onResolveFriendAddressQr = viewModel::resolveFriendAddressQr,
             onClearError = viewModel::clearError,
         )
         state.userId != null -> ConversationListScreen(

@@ -1,5 +1,10 @@
 package dev.friendline.messenger.ui
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import android.graphics.Bitmap
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -44,6 +49,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -60,6 +66,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.Role
@@ -73,6 +81,13 @@ import dev.friendline.messenger.push.PushRegistrationStatus
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import dev.friendline.messenger.data.ConversationSummary
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
+import com.google.zxing.qrcode.QRCodeWriter
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
@@ -556,13 +571,22 @@ private fun EmptyConversations(isConnected: Boolean, onNew: () -> Unit) {
 fun NewConversationScreen(
     isBusy: Boolean,
     error: String?,
+    friendMatrixId: String?,
+    friendAddressQrPayload: String?,
     onBack: () -> Unit,
     onCreate: (String, String, Boolean) -> Unit,
+    onResolveFriendAddressQr: (String) -> String?,
     onClearError: () -> Unit,
 ) {
     var recipient by rememberSaveable { mutableStateOf("") }
     var groupName by rememberSaveable { mutableStateOf("") }
     var isGroup by rememberSaveable { mutableStateOf(false) }
+    var showingOwnQr by rememberSaveable { mutableStateOf(false) }
+    var scanError by rememberSaveable { mutableStateOf<String?>(null) }
+    val context = LocalContext.current
+    val ownQrBitmap = remember(friendAddressQrPayload) {
+        friendAddressQrPayload?.let(::buildFriendAddressQrBitmap)
+    }
     Scaffold(
         contentWindowInsets = WindowInsets.navigationBars,
         topBar = {
@@ -635,6 +659,63 @@ fun NewConversationScreen(
                     singleLine = true,
                 )
             }
+            Spacer(Modifier.height(16.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                OutlinedButton(
+                    onClick = {
+                        scanError = null
+                        val activity = context.findHostActivity()
+                        if (activity == null) {
+                            scanError = "QR scanning isn't available here. Enter the Matrix ID manually."
+                            return@OutlinedButton
+                        }
+                        runCatching {
+                            val options = GmsBarcodeScannerOptions.Builder()
+                                .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+                                .enableAutoZoom()
+                                .build()
+                            GmsBarcodeScanning.getClient(activity, options).startScan()
+                                .addOnSuccessListener { barcode ->
+                                    val rawValue = barcode.rawValue
+                                    val matrixId = rawValue?.let(onResolveFriendAddressQr)
+                                    if (matrixId != null) {
+                                        recipient = matrixId
+                                        isGroup = false
+                                        onClearError()
+                                    } else if (rawValue == null) {
+                                        scanError = "This QR code doesn't contain a Friendline contact. Enter the Matrix ID manually."
+                                    }
+                                }
+                                .addOnFailureListener {
+                                    scanError = "QR scanning is unavailable. Enter the Matrix ID manually."
+                                }
+                        }.onFailure {
+                            scanError = "QR scanning is unavailable. Enter the Matrix ID manually."
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("Scan friend QR")
+                }
+                OutlinedButton(
+                    onClick = { showingOwnQr = true },
+                    enabled = ownQrBitmap != null,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("My QR code")
+                }
+            }
+            if (scanError != null) {
+                Text(scanError.orEmpty(), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            }
+            Text(
+                "QR sharing contains only your Matrix ID and homeserver. Verify devices separately before trusting them.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             if (error != null) {
                 Spacer(Modifier.height(12.dp))
                 ErrorText(error, onClearError)
@@ -656,6 +737,60 @@ fun NewConversationScreen(
             )
         }
     }
+    if (showingOwnQr && ownQrBitmap != null) {
+        AlertDialog(
+            onDismissRequest = { showingOwnQr = false },
+            title = { Text("My Friendline QR") },
+            text = {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Image(
+                        bitmap = ownQrBitmap.asImageBitmap(),
+                        contentDescription = "Friendline address QR code for ${friendMatrixId.orEmpty()}",
+                        modifier = Modifier.size(240.dp),
+                    )
+                    Text(friendMatrixId.orEmpty(), style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "This is an address card, not proof of identity. Verify devices separately after adding the contact.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            },
+            confirmButton = { TextButton(onClick = { showingOwnQr = false }) { Text("Done") } },
+        )
+    }
+}
+
+private fun buildFriendAddressQrBitmap(value: String): Bitmap? = runCatching {
+    val matrix = QRCodeWriter().encode(
+        value,
+        BarcodeFormat.QR_CODE,
+        512,
+        512,
+        mapOf(
+            EncodeHintType.MARGIN to 2,
+            EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M,
+        ),
+    )
+    Bitmap.createBitmap(matrix.width, matrix.height, Bitmap.Config.ARGB_8888).apply {
+        for (y in 0 until matrix.height) {
+            for (x in 0 until matrix.width) {
+                setPixel(x, y, if (matrix[x, y]) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
+            }
+        }
+    }
+}.getOrNull()
+
+private fun Context.findHostActivity(): Activity? {
+    var candidate: Context? = this
+    while (candidate != null) {
+        when (val current = candidate) {
+            is Activity -> return current
+            is ContextWrapper -> candidate = current.baseContext.takeUnless { it === current }
+            else -> return null
+        }
+    }
+    return null
 }
 
 @Composable

@@ -19,6 +19,7 @@ import dev.friendline.messenger.data.ConversationSummary
 import dev.friendline.messenger.data.DeviceVerificationUiState
 import dev.friendline.messenger.data.MessageSearchHit
 import dev.friendline.messenger.data.MatrixRepository
+import dev.friendline.messenger.data.FriendAddressQrPayload
 import dev.friendline.messenger.data.PendingVoiceNoteStillQueuedException
 import dev.friendline.messenger.data.PeerTrustStatus
 import dev.friendline.messenger.push.PushRegistrationStatus
@@ -457,6 +458,31 @@ class MessengerViewModel(context: Context) : ViewModel() {
     fun openReferencedMessage(eventId: String) {
         val roomId = _state.value.currentRoomId ?: return
         openConversation(roomId, focusEventId = eventId)
+    }
+
+    fun friendAddressQrPayload(): String? {
+        val state = _state.value
+        val matrixId = state.userId ?: return null
+        return runCatching {
+            FriendAddressQrPayload.encode(matrixId, state.homeserver, allowPrivateHttp = BuildConfig.DEBUG)
+        }.getOrNull()
+    }
+
+    fun resolveFriendAddressQr(rawValue: String): String? {
+        val state = _state.value
+        return runCatching {
+            FriendAddressQrPayload.resolveForHomeserver(
+                rawValue,
+                state.homeserver,
+                allowPrivateHttp = BuildConfig.DEBUG,
+            )
+        }.onSuccess {
+            _state.update { it.copy(error = null) }
+        }.onFailure {
+            _state.update {
+                it.copy(error = "This QR is invalid or uses a different homeserver. Enter the Matrix ID manually.")
+            }
+        }.getOrNull()
     }
 
     fun completeMessageNavigation(eventId: String) {

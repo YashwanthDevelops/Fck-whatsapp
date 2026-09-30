@@ -8,6 +8,8 @@
 	<string>Connect to your private development homeserver on the local network.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Record voice messages for encrypted conversations. Audio is encrypted on this device before it is sent.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Scan Friendline QR codes to add invited contacts.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
