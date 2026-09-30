@@ -351,6 +351,10 @@ class MessengerViewModel(context: Context) : ViewModel() {
             stopAudioPlayback()
         }
         val conversation = repository.conversations.value.firstOrNull { it.roomId == roomId }
+        if (conversation?.membership == "INVITED") {
+            _state.update { it.copy(error = "Accept or decline this invitation before opening the conversation.") }
+            return
+        }
         viewModelScope.launch {
             _state.update {
                 it.copy(
@@ -370,7 +374,6 @@ class MessengerViewModel(context: Context) : ViewModel() {
                 )
             }
             runCatching {
-                if (conversation?.membership == "INVITED") repository.joinConversation(roomId)
                 repository.openConversation(roomId, focusEventId)
             }
                 .onSuccess {
@@ -393,6 +396,50 @@ class MessengerViewModel(context: Context) : ViewModel() {
                         )
                     }
                 }
+        }
+    }
+
+    fun acceptRoomInvitation(roomId: String) {
+        runConversationMembershipAction(
+            errorMessage = "Couldn't accept this encrypted invitation. Try again when connected.",
+            action = { repository.acceptConversationInvitation(roomId) },
+            afterSuccess = { openConversation(roomId) },
+        )
+    }
+
+    fun declineRoomInvitation(roomId: String) {
+        runConversationMembershipAction(
+            errorMessage = "Couldn't decline this invitation. Try again when connected.",
+            action = { repository.declineConversationInvitation(roomId) },
+        )
+    }
+
+    fun leaveConversation(roomId: String) {
+        runConversationMembershipAction(
+            errorMessage = "Couldn't leave this conversation. Try again when connected.",
+            action = { repository.leaveConversation(roomId) },
+        )
+    }
+
+    private fun runConversationMembershipAction(
+        errorMessage: String,
+        action: suspend () -> Unit,
+        afterSuccess: () -> Unit = {},
+    ) {
+        if (logoutRequested || _state.value.isBusy) return
+        viewModelScope.launch {
+            _state.update { it.copy(isBusy = true, error = null) }
+            try {
+                action()
+                _state.update { it.copy(isBusy = false) }
+                beginRoomRefresh()
+                afterSuccess()
+            } catch (cancelled: CancellationException) {
+                _state.update { it.copy(isBusy = false) }
+                throw cancelled
+            } catch (_: Exception) {
+                _state.update { it.copy(isBusy = false, error = errorMessage) }
+            }
         }
     }
 

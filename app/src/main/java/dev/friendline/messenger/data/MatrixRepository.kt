@@ -439,6 +439,11 @@ class MatrixRepository(context: Context) {
                 val info = room.roomInfo()
                 val latest = room.latestEvent()
                 try {
+                    if (info.membership != org.matrix.rustcomponents.sdk.Membership.JOINED &&
+                        info.membership != org.matrix.rustcomponents.sdk.Membership.INVITED
+                    ) {
+                        return@runCatching null
+                    }
                     if (info.topic == VERIFICATION_CONTROL_ROOM_TOPIC) {
                         val peerUserId = info.inviter?.userId
                             ?: directPeerForRoom(directRooms, room.id())
@@ -909,15 +914,60 @@ class MatrixRepository(context: Context) {
         PushRegistrationStatus.DISABLED
     }
 
-    suspend fun joinConversation(roomId: String) = withContext(Dispatchers.IO) {
+    suspend fun acceptConversationInvitation(roomId: String) = withContext(Dispatchers.IO) {
+        val room = requireClient().rooms().firstOrNull { it.id() == roomId }
+            ?: throw IllegalArgumentException("This invitation is no longer available")
+        val invitation = room.roomInfo()
+        try {
+            check(invitation.membership == org.matrix.rustcomponents.sdk.Membership.INVITED) {
+                "This invitation is no longer available"
+            }
+            check(room.encryptionState().name == "ENCRYPTED") {
+                "This invitation is not end-to-end encrypted and cannot be joined"
+            }
+            room.join()
+        } finally {
+            invitation.destroy()
+        }
+
+        val joined = room.roomInfo()
+        try {
+            check(joined.membership == org.matrix.rustcomponents.sdk.Membership.JOINED) {
+                "The encrypted invitation did not finish joining"
+            }
+            check(room.encryptionState().name == "ENCRYPTED") {
+                "The joined conversation is not end-to-end encrypted"
+            }
+        } finally {
+            joined.destroy()
+        }
+        refreshConversations()
+    }
+
+    suspend fun declineConversationInvitation(roomId: String) = withContext(Dispatchers.IO) {
         val room = requireClient().rooms().firstOrNull { it.id() == roomId }
             ?: throw IllegalArgumentException("This invitation is no longer available")
         val info = room.roomInfo()
         try {
-            check(room.encryptionState().name == "ENCRYPTED") {
-                "This invitation is not end-to-end encrypted and cannot be joined"
+            check(info.membership == org.matrix.rustcomponents.sdk.Membership.INVITED) {
+                "This invitation is no longer available"
             }
-            if (info.membership == org.matrix.rustcomponents.sdk.Membership.INVITED) room.join()
+            room.leave()
+        } finally {
+            info.destroy()
+        }
+        refreshConversations()
+    }
+
+    suspend fun leaveConversation(roomId: String) = withContext(Dispatchers.IO) {
+        val room = requireClient().rooms().firstOrNull { it.id() == roomId }
+            ?: throw IllegalArgumentException("This conversation is no longer available")
+        val info = room.roomInfo()
+        try {
+            check(info.membership == org.matrix.rustcomponents.sdk.Membership.JOINED) {
+                "You are no longer a member of this conversation"
+            }
+            room.leave()
         } finally {
             info.destroy()
         }

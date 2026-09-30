@@ -37,12 +37,15 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Logout
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -191,6 +194,9 @@ fun ConversationListScreen(
     pushNotificationsConfigured: Boolean,
     error: String?,
     onOpen: (String) -> Unit,
+    onAcceptInvitation: (String) -> Unit,
+    onDeclineInvitation: (String) -> Unit,
+    onLeaveConversation: (String) -> Unit,
     onNew: () -> Unit,
     onLogout: () -> Unit,
     onReadReceiptsChange: (Boolean) -> Unit,
@@ -203,6 +209,7 @@ fun ConversationListScreen(
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var showPrivacySettings by rememberSaveable { mutableStateOf(false) }
+    var conversationPendingLeave by remember { mutableStateOf<ConversationSummary?>(null) }
     val focusManager = LocalFocusManager.current
     val visible = remember(conversations, query) {
         conversations.filterNot { row -> row.isVerificationControl && row.membership != "INVITED" }
@@ -293,8 +300,19 @@ fun ConversationListScreen(
                                 onJoin = onJoinVerification?.let { join -> { join(conversation.roomId) } },
                                 isBusy = isBusy,
                             )
+                        } else if (conversation.membership == "INVITED") {
+                            ConversationInvitationRow(
+                                conversation = conversation,
+                                isBusy = isBusy,
+                                onAccept = { onAcceptInvitation(conversation.roomId) },
+                                onDecline = { onDeclineInvitation(conversation.roomId) },
+                            )
                         } else {
-                            ConversationRow(conversation, onClick = { onOpen(conversation.roomId) })
+                            ConversationRow(
+                                conversation,
+                                onClick = { onOpen(conversation.roomId) },
+                                onLeave = if (isBusy) null else { { conversationPendingLeave = conversation } },
+                            )
                         }
                         if (index != visible.lastIndex) HorizontalDivider(color = MaterialTheme.colorScheme.outline)
                     }
@@ -369,6 +387,66 @@ fun ConversationListScreen(
                 TextButton(onClick = { showPrivacySettings = false }) { Text("Done") }
             },
         )
+    }
+    conversationPendingLeave?.let { conversation ->
+        AlertDialog(
+            onDismissRequest = { if (!isBusy) conversationPendingLeave = null },
+            title = { Text(if (conversation.isGroup) "Leave this group?" else "Leave this conversation?") },
+            text = { Text("You will stop receiving new messages here. You can be invited again later.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        conversationPendingLeave = null
+                        onLeaveConversation(conversation.roomId)
+                    },
+                    enabled = !isBusy,
+                ) { Text("Leave") }
+            },
+            dismissButton = {
+                TextButton(onClick = { conversationPendingLeave = null }, enabled = !isBusy) { Text("Cancel") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun ConversationInvitationRow(
+    conversation: ConversationSummary,
+    isBusy: Boolean,
+    onAccept: () -> Unit,
+    onDecline: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
+            ConversationRow(conversation, onClick = null)
+            if (!conversation.isEncrypted) {
+                Text(
+                    "This invitation is not end-to-end encrypted and cannot be accepted.",
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onDecline, enabled = !isBusy) { Text("Decline") }
+                Spacer(Modifier.width(8.dp))
+                Button(onClick = onAccept, enabled = !isBusy && conversation.isEncrypted) {
+                    if (isBusy) {
+                        CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    Text("Accept")
+                }
+            }
+        }
     }
 }
 
@@ -457,7 +535,12 @@ private fun ConnectionLine(status: String) {
 }
 
 @Composable
-private fun ConversationRow(conversation: ConversationSummary, onClick: () -> Unit) {
+private fun ConversationRow(
+    conversation: ConversationSummary,
+    onClick: (() -> Unit)?,
+    onLeave: (() -> Unit)? = null,
+) {
+    var actionsExpanded by remember(conversation.roomId) { mutableStateOf(false) }
     val time = if (conversation.lastActivityMillis > 0L) {
         DateFormat.getTimeInstance(DateFormat.SHORT, Locale.getDefault()).format(Date(conversation.lastActivityMillis))
     } else ""
@@ -467,14 +550,14 @@ private fun ConversationRow(conversation: ConversationSummary, onClick: () -> Un
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
-            .clickable(onClick = onClick)
+            .then(if (onClick == null) Modifier else Modifier.clickable(onClick = onClick))
             .padding(vertical = 17.dp, horizontal = 4.dp)
             .semantics(mergeDescendants = true) {
                 contentDescription = buildString {
                     append(conversation.title)
                     append(". ")
                     if (conversation.isGroup) append("Group chat. ")
-                    if (conversation.membership == "INVITED") append("Invitation, tap to accept. ")
+                    if (conversation.membership == "INVITED") append("Invitation. Use Accept or Decline. ")
                     append(if (conversation.isEncrypted) "Encrypted" else "Not encrypted")
                     if (conversation.unreadCount > 0) append(". ${conversation.unreadCount} unread")
                     append(". $time. ${conversation.preview}")
@@ -529,6 +612,25 @@ private fun ConversationRow(conversation: ConversationSummary, onClick: () -> Un
                 }
             }
             if (!conversation.isEncrypted) Text("Not encrypted", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+        }
+        if (onLeave != null) {
+            Box {
+                IconButton(
+                    onClick = { actionsExpanded = true },
+                    modifier = Modifier.semantics { contentDescription = "Conversation actions" },
+                ) {
+                    Icon(Icons.Filled.MoreVert, contentDescription = null)
+                }
+                DropdownMenu(expanded = actionsExpanded, onDismissRequest = { actionsExpanded = false }) {
+                    DropdownMenuItem(
+                        text = { Text(if (conversation.isGroup) "Leave group" else "Leave conversation") },
+                        onClick = {
+                            actionsExpanded = false
+                            onLeave()
+                        },
+                    )
+                }
+            }
         }
     }
 }
