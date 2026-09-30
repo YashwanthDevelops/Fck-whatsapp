@@ -144,8 +144,8 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) and [SECURITY.md](SECURITY.md) for the fu
 
 - Local server: Docker Desktop with Linux containers and Docker Compose; Synapse plus PostgreSQL in a private Docker network. Keep DB port unpublished and use dev-only local HTTP only on loopback or a trusted LAN.
 - Android: Windows or macOS with Android Studio, a supported JDK, Android SDK, emulator/device, and Gradle wrapper.
-- iOS: macOS with Xcode/Swift and iOS Simulator; a physical iPhone is required for lifecycle, push, and final E2EE validation. Windows can edit sources but cannot build/sign/run iOS.
-- Use two test Matrix accounts and the same Synapse instance. Android emulator reaches a Windows-host server through `http://10.0.2.2:8008`. For iOS Simulator on a Mac, use the Mac's loopback only if Synapse runs on that Mac; otherwise use the Windows host's private-LAN IP and local firewall/ATS configuration.
+- iOS: WSL/Linux with Swift 6.4, xtool, the Darwin Swift SDK acquired from Apple's authenticated Xcode archive, and a paired physical iPhone. xtool is the primary build/sign/install route; the Xcode IDE and Mac are not required. Apple account access is needed for the SDK archive and development signing; push provisioning additionally needs paid Apple Developer access.
+- Use two disposable Matrix accounts and the same Synapse instance. The Android emulator reaches a Windows-host server through `http://10.0.2.2:8008`; a physical iPhone connected through WSL USB forwarding uses the host's reachable private-LAN endpoint and the app's configured local-network policy.
 - Do not use production accounts, passwords, signing keys, or device keys in test scripts or chat.
 
 See [DEVELOPMENT.md](DEVELOPMENT.md), [DEPLOYMENT.md](DEPLOYMENT.md), and [PROJECT_ACCESS_REQUIREMENTS.md](PROJECT_ACCESS_REQUIREMENTS.md) for setup and access details.
@@ -192,7 +192,7 @@ Sizing assumes one experienced mobile engineer, a private group under roughly te
 | **3 — Encrypted media** | Encrypted photos/video/files/voice notes, thumbnails, size limits, interrupted transfers and retries; true resumable upload needs an explicit design because the Matrix media upload API does not specify byte-range resume. [Matrix media upload API](https://spec.matrix.org/v1.18/client-server-api/#post_matrixmedia-v3upload) | High | 4–8 engineer-weeks |
 | **4 — Calls** | Matrix/WebRTC calling, TURN, call signaling, audio/video permissions/routing, network changes, call-specific security review | Very high | 6–10+ engineer-weeks |
 
-**Critical path:** iOS requires a Mac with Xcode from Phase 0 onward. Interoperability and offline restart tests cannot be replaced by an Android-only build. Phase 0 is roughly 1–2 engineer-weeks once both toolchains/devices are available; cross-platform build coordination may stretch that to 2–3 calendar weeks. Estimates assume one experienced full-time engineer; nights/weekends can take roughly 2–3 times longer. Push adds APNs/FCM setup and may be deferred behind a feature flag if credentials are not ready, but its payload privacy must pass before enablement.
+**Critical path:** iOS progress uses xtool in WSL; the Xcode IDE and Mac are not prerequisites. The Darwin SDK archive, Apple account access, and paired iPhone are still required for the app build/sign/install gate. Interoperability and offline restart tests cannot be replaced by an Android-only build. Phase 0 is roughly 1–2 engineer-weeks once the SDK and both devices are available; cross-platform build coordination may stretch that to 2–3 calendar weeks. Estimates assume one experienced full-time engineer; nights/weekends can take roughly 2–3 times longer. Push adds APNs/FCM setup and may be deferred behind a feature flag if credentials are not ready, but its payload privacy must pass before enablement.
 
 ## 12. Known decisions and open checks
 
