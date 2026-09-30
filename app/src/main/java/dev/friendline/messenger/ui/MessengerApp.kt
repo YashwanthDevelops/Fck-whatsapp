@@ -11,6 +11,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
 import dev.friendline.messenger.push.MatrixPushClient
 
+// Calling is deferred; keep its prototype UI and incoming-call prompts out of the messenger build.
+private const val CALLS_ENABLED = false
+
 @Composable
 fun MessengerApp(viewModel: MessengerViewModel) {
     val state by viewModel.state.collectAsState()
@@ -29,19 +32,19 @@ fun MessengerApp(viewModel: MessengerViewModel) {
             draft = state.composerDraft,
             isEncrypted = state.currentRoomEncrypted,
             isGroup = state.currentRoomIsGroup,
-            canCall = state.currentRoomEncrypted && !state.currentRoomIsGroup,
-            callBusy = state.callBusy,
-            callConnected = state.callConnected,
-            callPeerAccepted = state.callPeerAccepted,
-            callKind = state.activeCallKind,
-            microphoneEnabled = state.callMicrophoneEnabled,
-            cameraEnabled = state.callCameraEnabled,
-            remoteVideoTrack = state.remoteVideoTrack,
+            canCall = CALLS_ENABLED && state.currentRoomEncrypted && !state.currentRoomIsGroup,
+            callBusy = CALLS_ENABLED && state.callBusy,
+            callConnected = CALLS_ENABLED && state.callConnected,
+            callPeerAccepted = CALLS_ENABLED && state.callPeerAccepted,
+            callKind = state.activeCallKind.takeIf { CALLS_ENABLED },
+            microphoneEnabled = CALLS_ENABLED && state.callMicrophoneEnabled,
+            cameraEnabled = CALLS_ENABLED && state.callCameraEnabled,
             onAttachVideoRenderer = viewModel::attachVideoRenderer,
             onDetachVideoRenderer = viewModel::detachVideoRenderer,
-            incomingCallKind = state.incomingCall?.takeIf { it.roomId == state.currentRoomId }?.kind,
-            incomingCallId = state.incomingCall?.takeIf { it.roomId == state.currentRoomId }?.callId,
-            incomingCallFrom = state.incomingCall?.takeIf { it.roomId == state.currentRoomId }?.senderId,
+            remoteVideoTrack = state.remoteVideoTrack.takeIf { CALLS_ENABLED },
+            incomingCallKind = state.incomingCall?.takeIf { CALLS_ENABLED && it.roomId == state.currentRoomId }?.kind,
+            incomingCallId = state.incomingCall?.takeIf { CALLS_ENABLED && it.roomId == state.currentRoomId }?.callId,
+            incomingCallFrom = state.incomingCall?.takeIf { CALLS_ENABLED && it.roomId == state.currentRoomId }?.senderId,
             onStartCall = viewModel::startSecureCall,
             onAcceptCall = { expectedRoomId, expectedCallId ->
                 viewModel.acceptIncomingSecureCall(expectedRoomId, expectedCallId)
