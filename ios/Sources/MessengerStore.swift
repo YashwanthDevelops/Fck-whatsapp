@@ -803,6 +803,7 @@ final class MessengerStore: ObservableObject {
     @Published private(set) var currentRoomTitle = ""
     @Published private(set) var currentRoomEncrypted = false
     @Published private(set) var currentRoomIsGroup = false
+    @Published private(set) var navigationTargetEventId: String?
     @Published private(set) var currentPeerUserId: String?
     @Published private(set) var currentPeerTrust: PeerTrustState = .unknown
     @Published private(set) var draft = ""
@@ -1320,7 +1321,7 @@ final class MessengerStore: ObservableObject {
         }
     }
 
-    func openConversation(_ roomId: String) async {
+    func openConversation(_ roomId: String, focusing eventId: String? = nil) async {
         guard beginClientOperation() else { return }
         defer { endClientOperation() }
         guard let client,
@@ -1373,6 +1374,7 @@ final class MessengerStore: ObservableObject {
         timelineBuffer.apply(.clear)
         messages = []
         currentRoomId = roomId
+        navigationTargetEventId = eventId
         isRoomTimelineReady = false
         restorePendingAttachmentForCurrentRoom()
         currentRoomEncrypted = room.encryptionState() == .encrypted
@@ -1397,8 +1399,18 @@ final class MessengerStore: ObservableObject {
                 await refreshCurrentPeerTrust(fallbackToServer: true)
                 guard roomOpenGeneration == generation, !isSigningOut else { return }
             }
+            let timelineFocus: TimelineFocus
+            if let eventId {
+                timelineFocus = .event(
+                    eventId: eventId,
+                    numContextEvents: 40,
+                    threadMode: .automatic(hideThreadedEvents: false)
+                )
+            } else {
+                timelineFocus = .live(hideThreadedEvents: false)
+            }
             let timelineConfiguration = TimelineConfiguration(
-                focus: .live(hideThreadedEvents: false),
+                focus: timelineFocus,
                 filter: .all,
                 internalIdPrefix: "conversation-\(UUID().uuidString)",
                 dateDividerMode: .daily,
@@ -1435,6 +1447,7 @@ final class MessengerStore: ObservableObject {
         } catch {
             guard roomOpenGeneration == generation else { return }
             currentRoomId = nil
+            navigationTargetEventId = nil
             currentRoomIsGroup = false
             pendingAttachmentURL = nil
             pendingAttachmentForCurrentRoom = false
@@ -1464,6 +1477,7 @@ final class MessengerStore: ObservableObject {
         activeTimeline?.close()
         activeTimeline = nil
         currentRoomId = nil
+        navigationTargetEventId = nil
         isRoomTimelineReady = false
         pendingAttachmentURL = nil
         pendingAttachmentForCurrentRoom = false
@@ -2406,7 +2420,18 @@ final class MessengerStore: ObservableObject {
 
     func openSearchHit(_ hit: MessageSearchHit) async {
         messageSearchQuery = ""
-        await openConversation(hit.roomId)
+        await openConversation(hit.roomId, focusing: hit.eventId)
+    }
+
+    func openReferencedMessage(_ eventId: String) async {
+        guard let roomId = currentRoomId else { return }
+        await openConversation(roomId, focusing: eventId)
+    }
+
+    func completeMessageNavigation(_ eventId: String) {
+        if navigationTargetEventId == eventId {
+            navigationTargetEventId = nil
+        }
     }
 
     private func searchMessages(_ query: String) async {

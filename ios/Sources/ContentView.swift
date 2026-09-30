@@ -675,6 +675,9 @@ private struct ChatScreen: View {
                                             isGroup: messenger.currentRoomIsGroup,
                                             onRetry: messenger.retryFailedMessages,
                                             onReply: { messenger.setReplyTarget($0) },
+                                            onNavigateToEvent: { eventId in
+                                                Task { await messenger.openReferencedMessage(eventId) }
+                                            },
                                             onReact: { message, emoji in Task { await messenger.toggleReaction(message, key: emoji) } },
                                             onEdit: { editingMessage = $0 },
                                             onRedact: { messagePendingRedaction = $0 },
@@ -708,8 +711,25 @@ private struct ChatScreen: View {
                                 })
                                 messenger.markVisibleIncomingMessagesRead(visibleIds)
                             }
+                            .onAppear {
+                                if let targetId = messenger.navigationTargetEventId,
+                                   let target = visibleMessages.first(where: { $0.eventId == targetId }) {
+                                    withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(target.id, anchor: .center) }
+                                    messenger.completeMessageNavigation(targetId)
+                                } else if messenger.navigationTargetEventId == nil,
+                                          let last = visibleMessages.last {
+                                    proxy.scrollTo(last.id, anchor: .bottom)
+                                }
+                            }
                             .onChange(of: visibleMessages.count) { _ in
-                                if let last = visibleMessages.last { withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(last.id, anchor: .bottom) } }
+                                if let targetId = messenger.navigationTargetEventId {
+                                    if let target = visibleMessages.first(where: { $0.eventId == targetId }) {
+                                        withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(target.id, anchor: .center) }
+                                        messenger.completeMessageNavigation(targetId)
+                                    }
+                                } else if let last = visibleMessages.last {
+                                    withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(last.id, anchor: .bottom) }
+                                }
                             }
                             .overlay {
                                 if visibleMessages.isEmpty {
@@ -1141,6 +1161,7 @@ private struct MessageRow: View {
     let isGroup: Bool
     let onRetry: () -> Void
     let onReply: (ChatMessage) -> Void
+    let onNavigateToEvent: (String) -> Void
     let onReact: (ChatMessage, String) -> Void
     let onEdit: (ChatMessage) -> Void
     let onRedact: (ChatMessage) -> Void
@@ -1153,7 +1174,13 @@ private struct MessageRow: View {
             if message.isOwn { Spacer(minLength: 48) }
             VStack(alignment: .leading, spacing: 5) {
                 if !message.isOwn { Text(message.sender).font(.caption.weight(.semibold)).foregroundStyle(Color.accentColor) }
-                if message.replyToEventId != nil { Text("↪ Reply").font(.caption2.weight(.semibold)).foregroundStyle(Color.accentColor) }
+                if let replyToEventId = message.replyToEventId {
+                    Button { onNavigateToEvent(replyToEventId) } label: {
+                        Text("↪ Reply").font(.caption2.weight(.semibold)).foregroundStyle(Color.accentColor)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Open replied-to message")
+                }
                 if let attachment = message.attachment {
                     Button { onOpenAttachment(message) } label: {
                         HStack(spacing: 11) {
