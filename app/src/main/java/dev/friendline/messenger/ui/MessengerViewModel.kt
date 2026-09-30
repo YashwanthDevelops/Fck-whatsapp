@@ -861,23 +861,47 @@ class MessengerViewModel(context: Context) : ViewModel() {
         if (body.isBlank()) return
         draftJob?.cancel()
         typingStopJob?.cancel()
+        val submittedReply = _state.value.replyTarget
         _state.update { it.copy(composerDraft = "", error = null) }
-        val replyTo = _state.value.replyTarget?.eventId
-        _state.update { it.copy(replyTarget = null) }
+        val replyTo = submittedReply?.eventId
         viewModelScope.launch {
-            runCatching { repository.sendText(roomId, body, replyTo) }
-                .onFailure { error ->
-                    _state.update {
-                        if (it.currentRoomId == roomId) {
-                            it.copy(
-                                composerDraft = it.composerDraft.ifBlank { body },
-                                error = error.message ?: "Couldn't send this message.",
-                            )
-                        } else {
-                            it
-                        }
+            try {
+                val draftClearFailed = repository.sendText(roomId, body, replyTo)
+                _state.update {
+                    if (it.currentRoomId == roomId) {
+                        it.copy(
+                            replyTarget = if (it.replyTarget?.id == submittedReply?.id) null else it.replyTarget,
+                            error = if (draftClearFailed) {
+                                "Message sent, but the saved draft could not be cleared. Check the conversation before sending it again."
+                            } else {
+                                it.error
+                            },
+                        )
+                    } else {
+                        it
                     }
                 }
+            } catch (cancelled: CancellationException) {
+                _state.update {
+                    if (it.currentRoomId == roomId) {
+                        it.copy(composerDraft = it.composerDraft.ifBlank { body })
+                    } else {
+                        it
+                    }
+                }
+                throw cancelled
+            } catch (error: Throwable) {
+                _state.update {
+                    if (it.currentRoomId == roomId) {
+                        it.copy(
+                            composerDraft = it.composerDraft.ifBlank { body },
+                            error = error.message ?: "Couldn't send this message.",
+                        )
+                    } else {
+                        it
+                    }
+                }
+            }
         }
     }
 

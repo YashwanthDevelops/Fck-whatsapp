@@ -1821,45 +1821,69 @@ class MatrixRepository(context: Context) {
         _peerTrust.value = PeerTrustStatus.UNKNOWN
     }
 
-    suspend fun sendText(roomId: String, body: String, replyToEventId: String? = null) = withContext(Dispatchers.IO) {
-        val room = requireRoom(roomId)
-        check(room.encryptionState().name == "ENCRYPTED") {
-            "Messages are disabled because this conversation is not encrypted"
-        }
-        val timeline = activeTimeline?.takeIf { activeRoomId == roomId } ?: room.timeline().also {
-            activeRoomId = roomId
-            activeTimeline = it
-        }
-        val content: RoomMessageEventContentWithoutRelation = timeline.createMessageContent(
-            MessageType.Text(TextMessageContent(body.trim(), null)),
-        ) ?: throw IllegalStateException("This message could not be prepared")
+    suspend fun sendText(roomId: String, body: String, replyToEventId: String? = null): Boolean {
+        var sendQueued = false
+        var draftClearFailed = false
         try {
-            val handle = withSendQueueGate {
-                val sendHandle = withDeliverySnapshotReservation(
-                    roomId = roomId,
-                    room = room,
-                    pendingLocalTextEcho = PendingLocalTextEcho(
-                        sender = ownUserId.orEmpty(),
-                        body = body.trim(),
-                        timestampMillis = System.currentTimeMillis(),
-                        replyToEventId = replyToEventId,
-                    ),
-                ) {
-                    if (replyToEventId == null) {
-                        timeline.send(content)
-                    } else {
-                        timeline.sendReply(content, replyToEventId)
-                    }
+            withContext(Dispatchers.IO) {
+                val room = requireRoom(roomId)
+                check(room.encryptionState().name == "ENCRYPTED") {
+                    "Messages are disabled because this conversation is not encrypted"
                 }
-                sendHandle.destroy()
-                runCatching { room.typingNotice(false) }
-                runCatching { room.clearComposerDraft(null) }
-                _composerDraft.value = ""
+                val timeline = activeTimeline?.takeIf { activeRoomId == roomId } ?: room.timeline().also {
+                    activeRoomId = roomId
+                    activeTimeline = it
+                }
+                val content: RoomMessageEventContentWithoutRelation = timeline.createMessageContent(
+                    MessageType.Text(TextMessageContent(body.trim(), null)),
+                ) ?: throw IllegalStateException("This message could not be prepared")
+                try {
+                    val sendHandle = withSendQueueGate {
+                        withDeliverySnapshotReservation(
+                            roomId = roomId,
+                            room = room,
+                            pendingLocalTextEcho = PendingLocalTextEcho(
+                                sender = ownUserId.orEmpty(),
+                                body = body.trim(),
+                                timestampMillis = System.currentTimeMillis(),
+                                replyToEventId = replyToEventId,
+                            ),
+                        ) {
+                            if (replyToEventId == null) {
+                                timeline.send(content)
+                            } else {
+                                timeline.sendReply(content, replyToEventId)
+                            }
+                        }
+                    }
+                    sendQueued = true
+                    runCatching { sendHandle.destroy() }
+                    withContext(NonCancellable) {
+                        try {
+                            room.clearComposerDraft(null)
+                        } catch (_: Exception) {
+                            draftClearFailed = true
+                        }
+                        _composerDraft.value = ""
+                    }
+                    runCatching { room.typingNotice(false) }
+                } finally {
+                    runCatching { content.destroy() }
+                }
+                try {
+                    refreshConversations()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // The periodic conversation refresh can recover this projection. A refresh
+                    // failure after queueing must never make the composer restore a sent message.
+                }
             }
-        } finally {
-            content.destroy()
+        } catch (cancelled: CancellationException) {
+            if (!sendQueued) throw cancelled
+            _composerDraft.value = ""
         }
-        refreshConversations()
+        return draftClearFailed
     }
 
     /**
