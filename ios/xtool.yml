@@ -1,6 +1,6 @@
 version: 1
 bundleID: dev.friendline.messenger.ios
-infoPath: Info.plist
-entitlementsPath: PrivateMessenger-dev.entitlements
+infoPath: .build/xtool-profile/Info.plist
+entitlementsPath: .build/xtool-profile/Entitlements.plist
 resources:
   - Sources/en.lproj/Localizable.strings

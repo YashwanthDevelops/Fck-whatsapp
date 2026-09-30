@@ -14,7 +14,7 @@
 
 Use the Gradle wrapper checked into the repository root; Android sources are currently under `app/`. Do not rely on a globally installed Gradle. Android SDK packages and JDK 17 are available locally. On this Windows host, create `C:\t` and set `JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=C:/t -Djdk.net.unixdomain.tmpdir=C:/t` before running Gradle to avoid the JDK loopback-selector failure. Set `ANDROID_HOME` and `ANDROID_SDK_ROOT` to `.tools/android-sdk` when no `local.properties` is present.
 
-For iOS, use the SwiftPM app package and `xtool` described in [ios/README.md](../ios/README.md). `xtool dev build` compiles the app; `xtool dev` also signs and installs it on a paired iPhone. The Xcode archive is needed to create Apple's iOS SDK, while the Xcode IDE and a Mac are not required by this build route. xtool builds do not replace the unit, integration, and physical-device tests below.
+For iOS, use the SwiftPM app package and `xtool` described in [ios/README.md](../ios/README.md). From `ios/`, run `python3 configure_xtool_profile.py` before each build so xtool has the generated Info.plist and entitlements; then `xtool dev build` compiles the app and `xtool dev` also signs and installs it on a paired iPhone. The Xcode archive is needed to create Apple's iOS SDK, while the Xcode IDE and a Mac are not required by this build route. xtool builds do not replace the unit, integration, and physical-device tests below.
 
 ## Version selection
 

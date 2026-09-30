@@ -21,10 +21,13 @@ From `ios/` in WSL:
 
 ```sh
 swift package resolve
+python3 configure_xtool_profile.py
 xtool dev build
 xtool dev
 ```
 
 `xtool dev build` checks the real app and pinned Matrix XCFramework. `xtool dev` additionally signs and installs to a paired iPhone. Device pairing, Developer Mode, and certificate trust are completed on the phone when prompted.
+
+The profile generator writes its non-secret Info.plist and entitlements under the ignored `.build/xtool-profile/` directory. Run it before each xtool build; its default resets push to off. After APNs provisioning is configured, a push-enabled development profile can be generated with `python3 configure_xtool_profile.py --configuration debug --push-domain matrix.example.org`. For a release profile, pair `python3 configure_xtool_profile.py --configuration release --push-domain matrix.example.org` with `xtool dev build --configuration release` or `xtool dev run --configuration release`. Run the generator again without `--push-domain` to return to a push-disabled build.
 
 Development configuration leaves push disabled and keeps `NSFileProtectionComplete`. Push-enabled signing needs a separately provisioned Apple capability and matching push configuration. A free provisioning profile is suitable for short development runs, not dependable distribution.
