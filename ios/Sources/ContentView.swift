@@ -576,7 +576,10 @@ private struct ChatScreen: View {
                             .foregroundStyle(Color.accentColor)
                     }
                     Spacer()
-                    Label(messenger.currentRoomEncrypted ? "ENCRYPTED" : "PAUSED", systemImage: "lock.fill")
+                    Label(
+                        messenger.currentRoomEncrypted ? "ENCRYPTED" : "NOT ENCRYPTED",
+                        systemImage: messenger.currentRoomEncrypted ? "lock.fill" : "exclamationmark.lock.fill"
+                    )
                         .foregroundStyle(messenger.currentRoomEncrypted ? Color.accentColor : Color.orange)
                         .tracking(0.8)
                     if messenger.currentPeerUserId != nil {
@@ -1194,6 +1197,13 @@ private struct MessageRow: View {
                     }
                 }
                 .font(.system(size: 9, weight: .medium, design: .rounded)).tracking(0.5).foregroundStyle(.secondary)
+                if let deliveryDetails = message.deliveryMemberDetails {
+                    Text(deliveryDetails)
+                        .font(.system(size: 10, weight: .medium, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .accessibilityLabel("Group recipient delivery status. \(deliveryDetails)")
+                }
                 if message.isOwn && message.canRetry {
                     Button("Retry encrypted send", action: onRetry)
                         .font(.caption.weight(.semibold))

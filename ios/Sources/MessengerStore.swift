@@ -3,6 +3,7 @@ import AVFoundation
 import AudioToolbox
 import CryptoKit
 import Foundation
+import MessengerCore
 import MatrixRustSDK
 import Security
 import UniformTypeIdentifiers
@@ -30,6 +31,7 @@ struct ChatMessage: Identifiable, Equatable {
     let timestamp: UInt64
     let isOwn: Bool
     let sendState: String
+    let deliveryMemberDetails: String?
     let canRetry: Bool
     let canReply: Bool
     let canEdit: Bool
@@ -795,6 +797,7 @@ final class MessengerStore: ObservableObject {
     @Published private(set) var connection = "Offline"
     @Published private(set) var conversations: [Conversation] = []
     @Published private(set) var messages: [ChatMessage] = []
+    private var timelineBuffer = TimelineSlotBuffer<ChatMessage>()
     @Published private(set) var typingUsers: [String] = []
     @Published private(set) var currentRoomId: String?
     @Published private(set) var currentRoomTitle = ""
@@ -1034,6 +1037,9 @@ final class MessengerStore: ObservableObject {
             errorMessage = "Enter a valid HTTPS homeserver, Matrix ID, and password. HTTP is available only for private development servers in debug builds."
             return
         }
+        var attemptedPassword = password
+        password = ""
+        defer { attemptedPassword = "" }
 
         var unresolvedPusher: MatrixPusherIdentity?
         do {
@@ -1065,7 +1071,7 @@ final class MessengerStore: ObservableObject {
             freshClient = matrix
             try await matrix.login(
                 username: username.trimmingCharacters(in: .whitespacesAndNewlines),
-                password: password,
+                password: attemptedPassword,
                 initialDeviceName: "Private Messenger",
                 deviceId: nil
             )
@@ -1091,7 +1097,6 @@ final class MessengerStore: ObservableObject {
             client = matrix
             userId = session.userId
             homeserver = validatedHomeserverUrl
-            password = ""
             await configureVerification(matrix)
             if (try vault.loadPendingPushRemoval()) != nil || !pushNotificationsEnabled {
                 let result = await unregisterPushRegistration(using: matrix, resumeRegistration: pushNotificationsEnabled)
@@ -1365,6 +1370,7 @@ final class MessengerStore: ObservableObject {
         typingObserver?.cancel()
         activeTimeline?.close()
         activeTimeline = nil
+        timelineBuffer.apply(.clear)
         messages = []
         currentRoomId = roomId
         isRoomTimelineReady = false
@@ -1468,6 +1474,7 @@ final class MessengerStore: ObservableObject {
         currentPeerUserId = nil
         currentPeerTrust = .unknown
         isBusy = false
+        timelineBuffer.apply(.clear)
         messages = []
         draft = ""
         replyTarget = nil
@@ -3347,6 +3354,7 @@ final class MessengerStore: ObservableObject {
         isRoomTimelineReady = false
         userId = nil
         conversations = []
+        timelineBuffer.apply(.clear)
         messages = []
         typingUsers = []
         replyTarget = nil
@@ -3446,12 +3454,13 @@ final class MessengerStore: ObservableObject {
             .homeserverUrl(url: validatedHomeserverUrl)
             .autoEnableCrossSigning(autoEnableCrossSigning: true)
             .slidingSyncVersionBuilder(versionBuilder: .native)
-            .roomKeyRecipientStrategy(strategy: .onlyTrustedDevices)
+            .roomKeyRecipientStrategy(strategy: .identityBasedStrategy)
+            .decryptionSettings(decryptionSettings: DecryptionSettings(senderDeviceTrustRequirement: .crossSigned))
             .withSearchIndexStore(path: search.path, password: storeKey.base64EncodedString())
             .sqliteStore(config: store)
             .build()
         try Self.applyPrivateFileProtection(to: root)
-        matrix.enableAutomaticBackpagination()
+        matrix.enableAutomaticBackPagination(enableAutomaticBackPagination: true)
         return matrix
     }
 
@@ -3774,27 +3783,25 @@ final class MessengerStore: ObservableObject {
         for update in diff {
             switch update {
             case let .append(values):
-                for value in values { if let message = makeMessage(value, roomId: roomId) { messages.append(message) } }
-            case .clear: messages = []
+                timelineBuffer.apply(.append(values.map { makeMessage($0, roomId: roomId) }))
+            case .clear: timelineBuffer.apply(.clear)
             case let .pushFront(value):
-                if let message = makeMessage(value, roomId: roomId) { messages.insert(message, at: 0) }
+                timelineBuffer.apply(.pushFront(makeMessage(value, roomId: roomId)))
             case let .pushBack(value):
-                if let message = makeMessage(value, roomId: roomId) { messages.append(message) }
-            case .popFront: if !messages.isEmpty { messages.removeFirst() }
-            case .popBack: if !messages.isEmpty { messages.removeLast() }
+                timelineBuffer.apply(.pushBack(makeMessage(value, roomId: roomId)))
+            case .popFront: timelineBuffer.apply(.popFront)
+            case .popBack: timelineBuffer.apply(.popBack)
             case let .insert(index, value):
-                if let message = makeMessage(value, roomId: roomId) { messages.insert(message, at: min(Int(index), messages.count)) }
+                timelineBuffer.apply(.insert(index: Int(index), value: makeMessage(value, roomId: roomId)))
             case let .set(index, value):
-                if Int(index) < messages.count, let message = makeMessage(value, roomId: roomId) { messages[Int(index)] = message }
-            case let .remove(index): if Int(index) < messages.count { messages.remove(at: Int(index)) }
-            case let .truncate(length): messages = Array(messages.prefix(Int(length)))
+                timelineBuffer.apply(.set(index: Int(index), value: makeMessage(value, roomId: roomId)))
+            case let .remove(index): timelineBuffer.apply(.remove(index: Int(index)))
+            case let .truncate(length): timelineBuffer.apply(.truncate(length: Int(length)))
             case let .reset(values):
-                var restored = [ChatMessage]()
-                for value in values { if let message = makeMessage(value, roomId: roomId) { restored.append(message) } }
-                messages = Array(restored.suffix(300))
+                timelineBuffer.apply(.reset(values.map { makeMessage($0, roomId: roomId) }))
             }
         }
-        if messages.count > 300 { messages = Array(messages.suffix(300)) }
+        messages = timelineBuffer.visible(limit: 300)
         var positions = [String: Int]()
         var uniqueMessages = [ChatMessage]()
         for message in messages {
@@ -3933,6 +3940,8 @@ final class MessengerStore: ObservableObject {
         return ChatMessage(id: identifier, eventId: eventId, isRemote: event.isRemote,
                            canMarkAsRead: canMarkAsRead, sender: event.sender, body: body,
                            timestamp: event.timestamp, isOwn: event.isOwn, sendState: visibleSendState,
+                           deliveryMemberDetails: event.isOwn
+                               ? eventId.flatMap { deliveryMemberDetails(roomId: roomId, eventId: $0) } : nil,
                            canRetry: canRetry, canReply: event.canBeRepliedTo && eventId != nil,
                            canEdit: event.isOwn && event.isRemote && event.isEditable && isPlainTextMessage,
                            canRedact: canRedact,
@@ -4057,11 +4066,13 @@ final class MessengerStore: ObservableObject {
         messages = messages.map { message in
             guard message.isOwn, let eventId = message.eventId, let roomId = currentRoomId else { return message }
             let sendState = deliveryState(roomId: roomId, eventId: eventId, fallback: message.sendState)
-            guard sendState != message.sendState else { return message }
+            let memberDetails = deliveryMemberDetails(roomId: roomId, eventId: eventId)
+            guard sendState != message.sendState || memberDetails != message.deliveryMemberDetails else { return message }
             return ChatMessage(id: message.id, eventId: message.eventId, isRemote: message.isRemote,
                                canMarkAsRead: message.canMarkAsRead,
                                sender: message.sender, body: message.body, timestamp: message.timestamp,
-                               isOwn: message.isOwn, sendState: sendState, canRetry: message.canRetry,
+                               isOwn: message.isOwn, sendState: sendState,
+                               deliveryMemberDetails: memberDetails, canRetry: message.canRetry,
                                canReply: message.canReply, canEdit: message.canEdit, canRedact: message.canRedact,
                                replyToEventId: message.replyToEventId,
                                reactions: message.reactions, hasBeenRead: message.hasBeenRead,
@@ -4079,6 +4090,17 @@ final class MessengerStore: ObservableObject {
             fallback: fallback,
             legacyDelivered: expectedSnapshot != nil && deliveryAckLedger.received.contains(eventId),
         )
+    }
+
+    private func deliveryMemberDetails(roomId: String, eventId: String) -> String? {
+        guard let expected = deliveryAckLedger.expectedMembersByRoom[roomId]?[eventId], expected.count > 1 else {
+            return nil
+        }
+        let acknowledged = deliveryAckLedger.acknowledgedMembersByRoom[roomId]?[eventId] ?? []
+        return expected.sorted().map { userId in
+            let status = acknowledged.contains(userId) ? "Delivered" : "Waiting"
+            return "\(status) · \(userId)"
+        }.joined(separator: "\n")
     }
 
     private func sendDeliveryAcknowledgement(roomId: String?, eventId: String) async throws {

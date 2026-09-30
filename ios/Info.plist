@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>Private Messenger</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Connect to your private development homeserver on the local network.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Record voice messages for encrypted conversations. Audio is encrypted on this device before it is sent.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>MatrixPushEnabled</key>
+	<false/>
+	<key>MatrixPushDomain</key>
+	<string></string>
+	<key>MatrixPushAppID</key>
+	<string>dev.friendline.messenger.ios.dev</string>
+</dict>
+</plist>

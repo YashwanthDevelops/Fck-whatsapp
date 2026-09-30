@@ -6,7 +6,7 @@ options:
 packages:
   MatrixRustSDK:
     url: https://github.com/matrix-org/matrix-rust-components-swift
-    exactVersion: 26.08.11
+    exactVersion: 26.09.07
   LiveKit:
     url: https://github.com/livekit/client-sdk-swift
     exactVersion: 2.17.0
