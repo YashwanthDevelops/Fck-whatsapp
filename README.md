@@ -2,46 +2,51 @@
 
 # Friendline
 
-**Private conversations for a small circle of friends.**
+**Private, end-to-end encrypted messaging for a small circle.**
 
-End-to-end encrypted messaging built on Matrix, with native Android and iOS clients.
+Native Android and iOS clients · Matrix identity and sync · Self-hosted Synapse
 
-![Android](https://img.shields.io/badge/Android-Kotlin%20%7C%20Compose-3DDC84?logo=android&logoColor=white)
-![iOS](https://img.shields.io/badge/iOS-SwiftUI-147EFB?logo=apple&logoColor=white)
-![Protocol](https://img.shields.io/badge/protocol-Matrix-0DBD8B?logo=matrix&logoColor=white)
-![Status](https://img.shields.io/badge/status-prototype-orange)
+[![Android](https://img.shields.io/badge/Android-Kotlin%20%7C%20Compose-3DDC84?logo=android&logoColor=white)](app/)
+[![iOS](https://img.shields.io/badge/iOS-SwiftUI-147EFB?logo=apple&logoColor=white)](ios/)
+[![Matrix](https://img.shields.io/badge/Protocol-Matrix-0DBD8B?logo=matrix&logoColor=white)](docs/ARCHITECTURE.md)
+[![Status](https://img.shields.io/badge/Status-In%20development-orange)](docs/TESTING.md)
 
 </div>
 
 > [!WARNING]
-> **Work in progress.** This prototype is not ready for everyday use or public distribution. Android↔iOS encryption, physical-device security, production hosting, and several release checks remain unverified. See the [testing record](docs/TESTING.md).
+> Friendline is an active prototype, not ready for everyday use. Recent Android changes still need a fresh peer-acceptance run. iOS builds, Android↔iOS interoperability, real push delivery, live calls, and hosted deployment are not yet verified. See [testing status](docs/TESTING.md).
 
-## Project snapshot
+## At a glance
 
-| Measure | Recorded result |
-| --- | --- |
-| Android unit tests | 12 passed in the recorded run |
-| Peer acceptance clients | 3 Android SDK clients on one API 37 emulator |
-| Group delivery | `1 of 2` recipients while one was offline; `2 of 2` after reconnect |
-| Android↔iOS encrypted exchange | Not yet verified |
-| Physical-phone acceptance | Not yet passed |
+| Android unit tests | Signed Android outputs | Earlier Android peer run | Cross-platform acceptance |
+| :---: | :---: | :---: | :---: |
+| **44 passed** | **4 APKs + 1 AAB** | **3 clients · API 37** | **Pending** |
 
-The peer test covered encrypted conversations, offline delivery and recovery, delivery acknowledgements, read receipts, typing, replies, reactions, local search, and attachment recovery. Emulator results do not establish physical-device or cross-platform behavior.
+Build and test results are recorded in the [testing log](docs/TESTING.md). The three-client run predates the latest changes; it is not current-source acceptance.
 
-## Architecture
+## What’s here
 
-| Client | Stack |
+- Encrypted Matrix direct and group conversations, with device verification.
+- Offline message queue and reconnect recovery, plus delivery receipts distinct from read receipts.
+- Replies, reactions, edits, redactions, local search, encrypted attachments, and QR friend exchange.
+- Native Android client in Kotlin/Jetpack Compose and iOS client in SwiftUI.
+- Private Synapse/PostgreSQL deployment configuration, with optional push and call-service components.
+
+Calls and push are still integration work; neither has passed live end-to-end acceptance. Android and iOS are not yet verified against each other.
+
+## Stack
+
+| Layer | Technology |
 | --- | --- |
 | Android | Kotlin · Jetpack Compose · Matrix Rust SDK |
 | iOS | Swift · SwiftUI · Matrix Rust SDK |
-| Homeserver | Matrix Synapse · PostgreSQL |
+| Messaging | Matrix · encrypted rooms · Synapse · PostgreSQL |
+| Optional calls | LiveKit · self-hosted call authorization |
 
-Rooms require end-to-end encryption; the app must not fall back to plaintext. The homeserver routes encrypted events. The current server setup is for local development—friend-accessible production hosting is not configured.
+## Get started
 
-## Development
+Read the [development guide](docs/DEVELOPMENT.md) for local setup and homeserver instructions. Android builds use a locally generated, patched Matrix SDK AAR that is intentionally excluded from Git; see the [SDK build notes](ops/sdk-build/README.md) before building from a fresh clone.
 
-Start with the [development guide](docs/DEVELOPMENT.md) for toolchains, local Synapse setup, and running the clients.
+## Project notes
 
-## Documentation
-
-[Architecture](docs/ARCHITECTURE.md) · [Security](docs/SECURITY.md) · [Threat model](docs/THREAT_MODEL.md) · [Testing status](docs/TESTING.md) · [Deployment](docs/DEPLOYMENT.md)
+[Architecture](docs/ARCHITECTURE.md) · [Security](docs/SECURITY.md) · [Threat model](docs/THREAT_MODEL.md) · [Testing](docs/TESTING.md) · [Deployment](docs/DEPLOYMENT.md) · [Calls](docs/CALLS.md)

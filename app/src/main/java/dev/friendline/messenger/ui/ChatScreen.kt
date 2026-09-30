@@ -71,6 +71,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.contentDescription
@@ -86,6 +87,10 @@ import dev.friendline.messenger.data.ChatMessage
 import dev.friendline.messenger.data.AttachmentKind
 import dev.friendline.messenger.data.MessageSearchHit
 import dev.friendline.messenger.data.PeerTrustStatus
+import dev.friendline.messenger.calls.MessengerCallKind
+import io.livekit.android.renderer.TextureViewRenderer
+import io.livekit.android.room.track.VideoTrack
+import livekit.org.webrtc.RendererCommon
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
@@ -100,6 +105,25 @@ fun ChatScreen(
     draft: String,
     isEncrypted: Boolean,
     isGroup: Boolean,
+    canCall: Boolean,
+    callBusy: Boolean,
+    callConnected: Boolean,
+    callPeerAccepted: Boolean,
+    callKind: MessengerCallKind?,
+    microphoneEnabled: Boolean,
+    cameraEnabled: Boolean,
+    remoteVideoTrack: VideoTrack?,
+    onAttachVideoRenderer: (VideoTrack, TextureViewRenderer) -> Unit,
+    onDetachVideoRenderer: (TextureViewRenderer) -> Unit,
+    incomingCallKind: MessengerCallKind?,
+    incomingCallId: String?,
+    incomingCallFrom: String?,
+    onStartCall: (MessengerCallKind) -> Unit,
+    onAcceptCall: (String, String) -> Unit,
+    onDeclineCall: () -> Unit,
+    onEndCall: () -> Unit,
+    onToggleCallMicrophone: () -> Unit,
+    onToggleCallCamera: () -> Unit,
     connection: String,
     peerTrust: PeerTrustStatus,
     messages: List<ChatMessage>,
@@ -140,6 +164,7 @@ fun ChatScreen(
     onMessageSearchQueryChange: (String) -> Unit,
     onPaginateMessageSearch: () -> Unit,
     onOpenSearchHit: (MessageSearchHit) -> Unit,
+    onMessageNavigationCompleted: (String) -> Unit,
     onDraftChange: (String) -> Unit,
     onClearError: () -> Unit,
 ) {
@@ -158,15 +183,49 @@ fun ChatScreen(
     val microphonePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) onStartVoiceRecording() else onMicrophonePermissionDenied()
     }
+    var pendingCallPermission by remember { mutableStateOf<MessengerCallKind?>(null) }
+    var pendingCallInvite by remember { mutableStateOf<Pair<String, String>?>(null) }
+    val callPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        val kind = pendingCallPermission
+        val invite = pendingCallInvite
+        pendingCallPermission = null
+        pendingCallInvite = null
+        if (kind != null && ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED &&
+            (kind != MessengerCallKind.VIDEO || ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
+        ) {
+            if (invite != null) onAcceptCall(invite.first, invite.second) else onStartCall(kind)
+        }
+    }
+    fun requestCallPermissions(kind: MessengerCallKind, invite: Pair<String, String>? = null) {
+        val needed = buildList {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) add(Manifest.permission.RECORD_AUDIO)
+            if (kind == MessengerCallKind.VIDEO && ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) add(Manifest.permission.CAMERA)
+        }
+        if (needed.isEmpty()) {
+            if (invite != null) onAcceptCall(invite.first, invite.second) else onStartCall(kind)
+        } else {
+            pendingCallPermission = kind
+            pendingCallInvite = invite
+            callPermissionLauncher.launch(needed.toTypedArray())
+        }
+    }
     val visualMediaPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         uri?.let { onSendAttachment(it.toString()) }
     }
     val documentPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { onSendAttachment(it.toString()) }
     }
-    onMessageNavigationCompleted: (String) -> Unit,
     LaunchedEffect(roomId, messages.size, searchVisible, navigationTargetEventId) {
         if (!searchVisible && messages.isNotEmpty()) {
+            if (navigationTargetEventId != null) {
+                val targetIndex = messages.indexOfFirst { it.eventId == navigationTargetEventId }
+                if (targetIndex >= 0) {
+                    listState.scrollToItem(targetIndex)
+                    scrollToLatestOnLoad = false
+                    onMessageNavigationCompleted(navigationTargetEventId)
+                }
+                return@LaunchedEffect
+            }
             val layout = listState.layoutInfo
             val lastVisibleIndex = layout.visibleItemsInfo.lastOrNull()?.index
             val wasNearBottom = layout.totalItemsCount == 0 || lastVisibleIndex == null || lastVisibleIndex >= messages.lastIndex - 1
@@ -217,15 +276,6 @@ fun ChatScreen(
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.primary,
                                     fontWeight = FontWeight.Bold,
-            if (navigationTargetEventId != null) {
-                val targetIndex = messages.indexOfFirst { it.eventId == navigationTargetEventId }
-                if (targetIndex >= 0) {
-                    listState.scrollToItem(targetIndex)
-                    scrollToLatestOnLoad = false
-                    onMessageNavigationCompleted(navigationTargetEventId)
-                }
-                return@LaunchedEffect
-            }
                                 )
                             }
                         }
@@ -274,6 +324,10 @@ fun ChatScreen(
                     }
                 },
                 actions = {
+                    if (canCall && callKind == null && !callBusy && incomingCallKind == null) {
+                        TextButton(onClick = { requestCallPermissions(MessengerCallKind.VOICE) }) { Text("Call") }
+                        TextButton(onClick = { requestCallPermissions(MessengerCallKind.VIDEO) }) { Text("Video") }
+                    }
                     TextButton(onClick = onVerifyPeer) { Text("Verify") }
                     IconButton(
                         onClick = {
@@ -451,6 +505,49 @@ fun ChatScreen(
         },
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
+            if (callBusy) {
+                Row(
+                    Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.secondaryContainer).padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        when {
+                            !callConnected -> "Connecting securely…"
+                            !callPeerAccepted -> "Calling… waiting for your contact"
+                            callKind == MessengerCallKind.VIDEO -> "Encrypted video call connected"
+                            else -> "Encrypted voice call connected"
+                        },
+                        Modifier.weight(1f),
+                    )
+                    if (callConnected && callPeerAccepted) {
+                        TextButton(onClick = onToggleCallMicrophone) { Text(if (microphoneEnabled) "Mute" else "Unmute") }
+                        if (callKind == MessengerCallKind.VIDEO) {
+                            TextButton(onClick = onToggleCallCamera) { Text(if (cameraEnabled) "Camera off" else "Camera on") }
+                        }
+                        TextButton(onClick = onEndCall) { Text("End") }
+                    }
+                    if (callConnected && !callPeerAccepted) TextButton(onClick = onEndCall) { Text("Cancel") }
+                }
+                if (callConnected && callPeerAccepted && callKind == MessengerCallKind.VIDEO) {
+                    val track = remoteVideoTrack
+                    if (track == null) {
+                        Text(
+                            "Waiting for the other participant's video…",
+                            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        RemoteCallVideoView(
+                            track = track,
+                            attachRenderer = onAttachVideoRenderer,
+                            detachRenderer = onDetachVideoRenderer,
+                            modifier = Modifier.fillMaxWidth().weight(1f).padding(12.dp),
+                        )
+                    }
+                }
+            }
             if (!isEncrypted) {
                 Text(
                     "This room has no encryption. Messages are disabled here to protect your privacy.",
@@ -579,6 +676,23 @@ fun ChatScreen(
             }
         }
     }
+    if (incomingCallKind != null && callKind == null && !callBusy) {
+        AlertDialog(
+            onDismissRequest = onDeclineCall,
+            title = { Text(if (incomingCallKind == MessengerCallKind.VIDEO) "Incoming video call" else "Incoming voice call") },
+            text = { Text("${incomingCallFrom ?: "A verified contact"} is calling. Accepting checks the encrypted invitation and joins the private call.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    val callId = incomingCallId
+                    val incomingRoomId = roomId
+                    if (callId != null && incomingRoomId != null) {
+                        requestCallPermissions(incomingCallKind, incomingRoomId to callId)
+                    }
+                }) { Text("Accept") }
+            },
+            dismissButton = { TextButton(onClick = onDeclineCall) { Text("Decline") } },
+        )
+    }
 
     attachmentToOpenExternally?.let { message ->
         AlertDialog(
@@ -678,6 +792,35 @@ private fun ChatErrorBanner(message: String, onDismiss: () -> Unit) {
             ) {
                 Icon(Icons.Filled.Close, contentDescription = null)
             }
+        }
+    }
+}
+
+@Composable
+private fun RemoteCallVideoView(
+    track: VideoTrack,
+    attachRenderer: (VideoTrack, TextureViewRenderer) -> Unit,
+    detachRenderer: (TextureViewRenderer) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val renderer = remember(track) { mutableStateOf<TextureViewRenderer?>(null) }
+    AndroidView(
+        factory = { context ->
+            TextureViewRenderer(context).also { view ->
+                view.setMirror(false)
+                view.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+                attachRenderer(track, view)
+                renderer.value = view
+            }
+        },
+        modifier = modifier,
+    )
+    androidx.compose.runtime.DisposableEffect(track) {
+        onDispose {
+            renderer.value?.let { view ->
+                detachRenderer(view)
+            }
+            renderer.value = null
         }
     }
 }
@@ -808,6 +951,23 @@ private fun MessageLine(
             Text(time, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (message.isOwn) {
                 Text(deliveryLabel, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        if (message.deliveryMemberDetails.isNotEmpty()) {
+            Column(
+                modifier = Modifier.padding(start = 4.dp, top = 2.dp),
+                verticalArrangement = Arrangement.spacedBy(1.dp),
+            ) {
+                message.deliveryMemberDetails.forEach { recipient ->
+                    Text(
+                        text = "${if (recipient.delivered) "✓ Delivered" else "◷ Waiting"} · ${recipient.userId}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.semantics {
+                            contentDescription = "${if (recipient.delivered) "Delivered to" else "Waiting for"} ${recipient.userId}"
+                        },
+                    )
+                }
             }
         }
         if (message.isOwn && message.canRetry) {

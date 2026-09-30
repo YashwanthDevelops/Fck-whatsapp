@@ -1,7 +1,10 @@
 package dev.friendline.messenger.data
 
+import android.Manifest
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.pm.PackageManager
+import android.media.MediaRecorder
 import android.os.Bundle
 import androidx.core.content.FileProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -228,23 +231,14 @@ class AndroidPeerAcceptanceIntegrationTest {
             },
             onIdentityState = onIdentityState,
         )
-        onStep("unverifiedDeviceKeyExclusion")
-        reportProgress(instrumentation, "core", "unverifiedDeviceKeyExclusion", "start")
-        assertNewUnverifiedDeviceCannotDecrypt(
-            homeserver = homeserver,
-            recipientId = recipientId,
-            recipientPassword = recipientPassword,
-            marker = marker,
-            roomId = roomId,
-            sender = sender,
-            recipient = recipient,
-            appContext = instrumentation.targetContext,
-        )
-        reportProgress(instrumentation, "core", "unverifiedDeviceKeyExclusion", "complete")
+        // Verification uses SDK timelines/control rooms. Reopen the conversation afterward
+        // so the first message uses a live timeline projection rather than a stale handle.
+        sender.openConversation(roomId)
+        recipient.openConversation(roomId)
         reportProgress(instrumentation, "core", "verifyDiagnosticRoom", "complete")
 
         onStep("editAndRedactEncryptedMessage")
-        verifyMessageEditingAndRedaction(roomId, marker, sender, recipient)
+        verifyMessageEditingAndRedaction(roomId, marker, sender, recipient, onStep)
 
         val backgroundRoomId = sender.createEncryptedConversation(
             invitedUserIds = listOf(recipientId),
@@ -538,15 +532,42 @@ class AndroidPeerAcceptanceIntegrationTest {
         recipient.sendTypingNotice(roomId, false)
 
         val replyTargetBody = "reply-target-$marker"
-        onStep("sendText")
+        onStep("sendReplyTarget")
         sender.sendText(roomId, replyTargetBody)
+        onStep("awaitReplyTarget")
         val replyTarget = awaitMessage(recipient, "reply target") {
             it.body == replyTargetBody && !it.isOwn && it.eventId != null
         }
+        onStep("sendReply")
         recipient.sendText(roomId, "reply-$marker", checkNotNull(replyTarget.eventId))
-        onStep("verifyExactlyOnce")
-        awaitMessage(sender, "reply relation") {
-            it.body == "reply-$marker" && it.replyToEventId == replyTarget.eventId
+        onStep("awaitReplyEcho")
+        val replyEcho = awaitMessage(sender, "reply echo") {
+            it.body == "reply-$marker" && !it.isOwn
+        }
+        onStep("awaitReplyRelation")
+        val replyRelationMatched = awaitCondition("reply target relation", 15_000) {
+            sender.messages.value.any {
+                it.body == "reply-$marker" && !it.isOwn && it.replyToEventId == replyTarget.eventId
+            }
+        }
+        val currentReplyRelation = sender.messages.value.firstOrNull { it.body == "reply-$marker" && !it.isOwn }
+        val replyRelationSummary = listOf(
+            replyRelationMatched,
+            replyEcho.replyToEventId != null,
+            replyTarget.eventId.length > 0,
+            currentReplyRelation?.replyToEventId != null,
+        ).joinToString("|") { it.toString() }
+        InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+            putString("outbox_diag_reply_relation", replyRelationSummary)
+        })
+        println(
+            "OUTBOX_DIAG_REPLY_RELATION matched=$replyRelationMatched " +
+                "projectedRelation=${replyEcho.replyToEventId != null} " +
+                "targetEvent=true " +
+                "currentRelation=${currentReplyRelation?.replyToEventId != null}",
+        )
+        check(replyRelationMatched) {
+            "The encrypted reply did not preserve its target event relation"
         }
 
         val reactionTarget = awaitMessage(recipient, "reaction target") {
@@ -558,13 +579,91 @@ class AndroidPeerAcceptanceIntegrationTest {
         }
 
         val searchMarker = "search-$marker"
-        onStep("sendText")
+        onStep("sendSearchMarker")
         sender.sendText(roomId, searchMarker)
+        onStep("awaitSearchMarker")
         awaitMessage(recipient, "searchable message") { it.body == searchMarker && !it.isOwn }
-        recipient.searchMessages(searchMarker)
-        check(awaitCondition("local encrypted search", 30_000) {
+        onStep("executeLocalSearch")
+        // SearchService queries indexed terms; punctuation-delimited run IDs are not a
+        // stable query syntax across SDK index implementations. Search a word from the
+        // body and verify the exact unique body appears in the local result set.
+        recipient.searchMessages("search")
+        onStep("awaitLocalSearch")
+        val localSearchFound = awaitCondition("local encrypted search", 30_000) {
             recipient.searchResults.value.any { it.roomId == roomId && it.body.contains(searchMarker) }
-        }) { "The recipient's local search index did not find a recent encrypted message" }
+        }
+        if (!localSearchFound) {
+            val searchState = listOf(
+                recipient.searchResults.value.size.coerceAtMost(999).toString(),
+                recipient.searchLoading.value.toString(),
+                recipient.searchHasMore.value.toString(),
+                recipient.searchResults.value.any { it.roomId == roomId }.toString(),
+            ).joinToString("|")
+            InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                putString("outbox_diag_search_state", searchState)
+            })
+            println(
+                "OUTBOX_DIAG_SEARCH_STATE resultCount=${recipient.searchResults.value.size} " +
+                    "loading=${recipient.searchLoading.value} hasMore=${recipient.searchHasMore.value} " +
+                    "roomResult=${recipient.searchResults.value.any { it.roomId == roomId }}",
+            )
+            println(
+                "OUTBOX_DIAG_SEARCH result=missing query=outbox " +
+                    "resultCount=${recipient.searchResults.value.size.coerceAtMost(999)} " +
+                    "loading=${recipient.searchLoading.value} hasMore=${recipient.searchHasMore.value}",
+            )
+        } else {
+            println("OUTBOX_DIAG_SEARCH result=found query=outbox")
+        }
+        check(localSearchFound) { "The recipient's local search index did not find a recent encrypted message" }
+
+        onStep("localStoreMarkerScan")
+        val localStoreScan = scanIsolatedMessageStores(instrumentation.targetContext, marker)
+        val localStoreMarkerClear = localStoreScan.markerMatchFiles == 0
+        Log.i(
+            "OUTBOX_DIAG_LOCAL_SCAN",
+            "storeFiles=${localStoreScan.storeFiles} sqliteFiles=${localStoreScan.sqliteFiles} " +
+                "walFiles=${localStoreScan.walFiles} cacheFiles=${localStoreScan.cacheFiles} " +
+                "searchIndexFiles=${localStoreScan.searchIndexFiles} markerMatchFiles=${localStoreScan.markerMatchFiles}",
+        )
+        instrumentation.sendStatus(0, Bundle().apply {
+            putString(
+                "outbox_diag_local_store_scan",
+                listOf(
+                    localStoreScan.storeFiles,
+                    localStoreScan.sqliteFiles,
+                    localStoreScan.walFiles,
+                    localStoreScan.cacheFiles,
+                    localStoreScan.searchIndexFiles,
+                    localStoreScan.markerMatchFiles,
+                ).joinToString("|"),
+            )
+        })
+
+        onStep("voiceNoteRoundTrip")
+        verifyVoiceNoteRoundTrip(
+            context = instrumentation.targetContext,
+            roomId = roomId,
+            marker = marker,
+            sender = sender,
+            recipient = recipient,
+            onStep = onStep,
+        )
+
+        onStep("unverifiedDeviceKeyExclusion")
+        reportProgress(instrumentation, "core", "unverifiedDeviceKeyExclusion", "start")
+        assertNewUnverifiedDeviceCannotDecrypt(
+            homeserver = homeserver,
+            recipientId = recipientId,
+            recipientPassword = recipientPassword,
+            marker = marker,
+            roomId = roomId,
+            sender = sender,
+            recipient = recipient,
+            appContext = instrumentation.targetContext,
+            onStep = onStep,
+        )
+        reportProgress(instrumentation, "core", "unverifiedDeviceKeyExclusion", "complete")
 
         onStep("createGroupConversation")
         reportProgress(instrumentation, "core", "createGroupConversation", "start")
@@ -699,7 +798,232 @@ class AndroidPeerAcceptanceIntegrationTest {
         reportSafeResult(instrumentation, "core", "completed", "verified")
         println(
             "OUTBOX_DIAG_RESULT stage=core roomEncrypted=true recipientOfflineBacklog=true " +
-                "delivered=true read=true typing=true replies=true reactions=true search=true groupDeliveredPerMember=true",
+                "delivered=true read=true typing=true replies=true reactions=true search=true voice=true " +
+                "groupDeliveredPerMember=true localStoreMarkerClear=$localStoreMarkerClear " +
+                "storeFiles=${localStoreScan.storeFiles} sqliteFiles=${localStoreScan.sqliteFiles} " +
+                "walFiles=${localStoreScan.walFiles} cacheFiles=${localStoreScan.cacheFiles} " +
+                "searchIndexFiles=${localStoreScan.searchIndexFiles} markerMatchFiles=${localStoreScan.markerMatchFiles}",
+        )
+        check(localStoreMarkerClear) {
+            "The unique message marker appeared in an isolated sender/recipient store, cache, or search-index file " +
+                "(files=${localStoreScan.markerMatchFiles})"
+        }
+    }
+
+    private suspend fun verifyVoiceNoteRoundTrip(
+        context: Context,
+        roomId: String,
+        marker: String,
+        sender: MatrixRepository,
+        recipient: MatrixRepository,
+        onStep: (String) -> Unit,
+    ) {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        onStep("voiceNotePermission")
+        val hasRecordAudioPermission =
+            context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        if (!hasRecordAudioPermission) {
+            instrumentation.uiAutomation.grantRuntimePermission(
+                context.packageName,
+                Manifest.permission.RECORD_AUDIO,
+            )
+        }
+        check(context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            "The isolated app could not obtain microphone permission for the voice-note capture check"
+        }
+
+        val voiceFile = attachmentFixture(context, "voice-note-$marker.m4a")
+        val durationMillis = 1_800L
+        val recorder = MediaRecorder(context)
+        try {
+            onStep("voiceRecorderPrepare")
+            recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            recorder.setAudioEncodingBitRate(96_000)
+            recorder.setAudioSamplingRate(44_100)
+            recorder.setOutputFile(voiceFile.absolutePath)
+            recorder.prepare()
+            onStep("voiceRecorderStart")
+            recorder.start()
+            delay(durationMillis)
+            onStep("voiceRecorderStop")
+            recorder.stop()
+        } catch (failure: Throwable) {
+            voiceFile.delete()
+            throw AssertionError("The isolated emulator could not record a short AAC voice-note fixture", failure)
+        } finally {
+            runCatching { recorder.release() }
+        }
+
+        try {
+            assertTrue("The captured voice-note fixture was empty", voiceFile.isFile && voiceFile.length() > 0L)
+            val fixtureBytes = voiceFile.readBytes()
+            val fixtureHash = sha256(fixtureBytes)
+            val voiceUri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.files",
+                voiceFile,
+            )
+            onStep("voiceUpload")
+            sender.sendAttachment(roomId, voiceUri.toString(), audioDurationMillis = durationMillis)
+
+            val sentVoiceMessage = awaitMessage(sender, "sender's uploaded voice note") {
+                it.isOwn && it.eventId != null && it.attachment?.fileName == voiceFile.name
+            }
+            val attachment = checkNotNull(sentVoiceMessage.attachment)
+            assertEquals(AttachmentKind.AUDIO, attachment.kind)
+            assertTrue("The sent voice note did not retain an audio MIME type", attachment.mimeType.startsWith("audio/"))
+
+            val receivedVoiceMessage = awaitMessage(recipient, "peer's encrypted voice note") {
+                !it.isOwn && it.eventId == sentVoiceMessage.eventId &&
+                    it.attachment?.let { received ->
+                        received.fileName == voiceFile.name && received.kind == AttachmentKind.AUDIO
+                    } == true
+            }
+            onStep("voicePeerDecrypt")
+            assertTrue(
+                "The received voice note did not expose encrypted Matrix media key metadata",
+                listOf("\"key\"", "\"iv\"", "\"hashes\"").all {
+                    receivedVoiceMessage.attachment?.sourceJson?.contains(it, ignoreCase = true) == true
+                },
+            )
+
+            val decryptedFile = recipient.loadAttachmentForViewing(receivedVoiceMessage)
+            try {
+                assertEquals(fixtureBytes.size, decryptedFile.length().toInt())
+                assertEquals(fixtureHash, sha256(decryptedFile.readBytes()))
+            } finally {
+                recipient.deleteTemporaryMediaFile(decryptedFile)
+                fixtureBytes.fill(0)
+            }
+            onStep("voiceDeliveredAck")
+            val eventId = checkNotNull(sentVoiceMessage.eventId)
+            fun reportVoiceAckState(delivered: Boolean) {
+                val senderAck = runCatching { sender.deliveryAckDiagnosticSnapshot(roomId, eventId) }.getOrNull()
+                val recipientAck = runCatching { recipient.deliveryAckDiagnosticSnapshot(roomId, eventId) }.getOrNull()
+                val summary =
+                    "$delivered|true|${senderAck?.observerInstalled ?: "unavailable"}|" +
+                        "${senderAck?.recordPresent ?: "unavailable"}|${senderAck?.state ?: "unavailable"}|" +
+                        "${senderAck?.snapshotKnown ?: "unavailable"}|${senderAck?.expectedRecipientCount ?: -1}|" +
+                        "${senderAck?.acknowledgedRecipientCount ?: -1}|" +
+                        "${senderAck?.provisionalAcknowledgementCount ?: -1}|" +
+                        "${senderAck?.remoteAckMessageCount ?: -1}|" +
+                        "${recipientAck?.observerInstalled ?: "unavailable"}|" +
+                        "${recipientAck?.recordPresent ?: "unavailable"}|${recipientAck?.state ?: "unavailable"}|" +
+                        "${recipientAck?.remoteAckMessageCount ?: -1}|" +
+                        "${senderAck?.sendQueueUpdatesObserverInstalled ?: "unavailable"}|" +
+                        "${senderAck?.activeSnapshotReservation ?: "unavailable"}|" +
+                        "${recipientAck?.sendQueueUpdatesObserverInstalled ?: "unavailable"}|" +
+                        "${recipientAck?.activeSnapshotReservation ?: "unavailable"}"
+                InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                    putString("outbox_diag_voice_ack", summary)
+                })
+                println(
+                    "OUTBOX_DIAG_VOICE_ACK delivered=$delivered eventIdPresent=true " +
+                        "senderObserver=${senderAck?.observerInstalled ?: "unavailable"} " +
+                        "senderRecord=${senderAck?.recordPresent ?: "unavailable"} " +
+                        "senderState=${senderAck?.state ?: "unavailable"} " +
+                        "senderSnapshot=${senderAck?.snapshotKnown ?: "unavailable"} " +
+                        "senderExpected=${senderAck?.expectedRecipientCount ?: -1} " +
+                        "senderAcked=${senderAck?.acknowledgedRecipientCount ?: -1} " +
+                        "senderProvisional=${senderAck?.provisionalAcknowledgementCount ?: -1} " +
+                        "senderRemoteAckEvents=${senderAck?.remoteAckMessageCount ?: -1} " +
+                        "recipientObserver=${recipientAck?.observerInstalled ?: "unavailable"} " +
+                        "recipientRecord=${recipientAck?.recordPresent ?: "unavailable"} " +
+                        "recipientState=${recipientAck?.state ?: "unavailable"} " +
+                        "recipientRemoteAckEvents=${recipientAck?.remoteAckMessageCount ?: -1} " +
+                        "senderQueueUpdates=${senderAck?.sendQueueUpdatesObserverInstalled ?: "unavailable"} " +
+                        "senderSnapshotReservation=${senderAck?.activeSnapshotReservation ?: "unavailable"} " +
+                        "recipientQueueUpdates=${recipientAck?.sendQueueUpdatesObserverInstalled ?: "unavailable"} " +
+                        "recipientSnapshotReservation=${recipientAck?.activeSnapshotReservation ?: "unavailable"}",
+                )
+            }
+            reportVoiceAckState(delivered = false)
+            val voiceProjectionCategories = sender.timelineCategoriesForDiagnostic(roomId)
+                .filterKeys { it.startsWith("OWN_LOCAL_") }
+                .toSortedMap()
+                .entries
+                .joinToString(",") { (category, count) -> "$category=${count.coerceAtMost(999)}" }
+                .ifBlank { "none" }
+            println(
+                "OUTBOX_DIAG_VOICE_PROJECTION pipeline=${sender.sendPipelineDiagnosticSnapshot(roomId)} " +
+                    "categories=$voiceProjectionCategories",
+            )
+            InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                putString(
+                    "outbox_diag_voice_projection",
+                    "${sender.sendPipelineDiagnosticSnapshot(roomId)}|$voiceProjectionCategories",
+                )
+            })
+            val delivered = awaitCondition("voice-note delivered acknowledgement", 45_000) {
+                sender.messages.value.any {
+                    it.isOwn && it.eventId == eventId && it.deliveryState == "Delivered"
+                }
+            }
+            reportVoiceAckState(delivered)
+            check(delivered) { "Voice-note delivery acknowledgement did not converge" }
+            println(
+                "OUTBOX_DIAG_VOICE_NOTE captured=true uploaded=true audioEvent=true encryptedSource=true " +
+                    "peerDecrypted=true byteHashMatched=true deliveredAck=true",
+            )
+        } finally {
+            voiceFile.delete()
+        }
+    }
+
+    private fun scanIsolatedMessageStores(context: Context, marker: String): IsolatedStoreMarkerScan {
+        val accountNames = listOf("sender", "recipient")
+        val durableRoots = accountNames.map { account ->
+            File(context.noBackupFilesDir, "peer-acceptance/$account")
+        }
+        val cacheRoots = accountNames.map { account ->
+            File(context.cacheDir, "peer-acceptance/$account")
+        }
+        val allRoots = durableRoots + cacheRoots
+        val files = allRoots.asSequence()
+            .filter(File::exists)
+            .flatMap { root -> root.walkTopDown().filter(File::isFile) }
+            .distinctBy { file -> runCatching { file.canonicalPath }.getOrDefault(file.absolutePath) }
+            .toList()
+        val sqliteFiles = files.count { file ->
+            file.name.lowercase().let { name ->
+                name.endsWith(".db") || name.endsWith(".sqlite") || name.endsWith(".sqlite3")
+            }
+        }
+        val walFiles = files.count { file ->
+            file.name.lowercase().let { name -> name.endsWith("-wal") || name.endsWith("-shm") }
+        }
+        val cacheFiles = files.count { file ->
+            cacheRoots.any { root ->
+                runCatching { file.canonicalPath.startsWith(root.canonicalPath + File.separator) }
+                    .getOrDefault(false)
+            }
+        }
+        val searchIndexFiles = files.count { file ->
+            generateSequence(file.parentFile) { directory -> directory.parentFile }
+                .any { directory -> directory.name == "search-index" }
+        }
+        val markerMatchFiles = files.count { file ->
+            file.name.contains(marker, ignoreCase = true) ||
+                String(
+                    runCatching { file.readBytes() }.getOrElse { failure ->
+                        // SQLite may remove/recreate a WAL or cache file while the
+                        // acceptance scan walks live stores. A file that vanished
+                        // between enumeration and reading has no remaining bytes to
+                        // leak; preserve real read errors for files that still exist.
+                        if (!file.exists()) byteArrayOf() else throw failure
+                    },
+                    Charsets.ISO_8859_1,
+                ).contains(marker, ignoreCase = true)
+        }
+        return IsolatedStoreMarkerScan(
+            storeFiles = files.size,
+            sqliteFiles = sqliteFiles,
+            walFiles = walFiles,
+            cacheFiles = cacheFiles,
+            searchIndexFiles = searchIndexFiles,
+            markerMatchFiles = markerMatchFiles,
         )
     }
 
@@ -708,16 +1032,43 @@ class AndroidPeerAcceptanceIntegrationTest {
         marker: String,
         sender: MatrixRepository,
         recipient: MatrixRepository,
+        onStep: (String) -> Unit,
     ) {
         val originalBody = "peer-edit-original-$marker"
         val editedBody = "peer-edit-updated-$marker"
+        onStep("editProbeSend")
+        reportProgress(InstrumentationRegistry.getInstrumentation(), "core", "editProbeSend", "start")
         sender.sendText(roomId, originalBody)
-        val ownMessage = awaitMessage(sender, "own text message is editable") {
-            it.body == originalBody && it.isOwn && it.isRemote && it.eventId != null
+        onStep("editProbeAwaitSenderEcho")
+        reportProgress(InstrumentationRegistry.getInstrumentation(), "core", "editProbeAwaitSenderEcho", "start")
+        val ownMessage = try {
+            awaitMessage(sender, "own text message is editable") {
+                it.body == originalBody && it.isOwn && it.isRemote && it.eventId != null
+            }
+        } catch (failure: Throwable) {
+            val matching = sender.messages.value.filter { it.body == originalBody && it.isOwn }
+            val categories = sender.timelineCategoriesForDiagnostic(roomId)
+                .toSortedMap()
+                .entries
+                .joinToString(",") { (category, count) -> "$category=${count.coerceAtMost(999)}" }
+                .ifBlank { "none" }
+            println(
+                "OUTBOX_DIAG_EDIT_ECHO pipeline=${sender.sendPipelineDiagnosticSnapshot(roomId)} " +
+                    "matches=${matching.size.coerceAtMost(99)} " +
+                    "remote=${matching.count { it.isRemote }.coerceAtMost(99)} " +
+                    "eventId=${matching.count { it.eventId != null }.coerceAtMost(99)} " +
+                    "states=${matching.map { it.deliveryState }.distinct().joinToString(",").ifBlank { "none" }} " +
+                    "categories=$categories",
+            )
+            throw failure
         }
+        reportProgress(InstrumentationRegistry.getInstrumentation(), "core", "editProbeAwaitSenderEcho", "complete")
+        onStep("editProbeAwaitPeerEcho")
+        reportProgress(InstrumentationRegistry.getInstrumentation(), "core", "editProbeAwaitPeerEcho", "start")
         val peerMessage = awaitMessage(recipient, "peer text message is not editable") {
             it.body == originalBody && !it.isOwn && it.isRemote && it.eventId == ownMessage.eventId
         }
+        reportProgress(InstrumentationRegistry.getInstrumentation(), "core", "editProbeAwaitPeerEcho", "complete")
         assertTrue("Only an acknowledged own remote text message should expose Edit", ownMessage.canEdit)
         assertTrue("Only an acknowledged own remote message should expose Remove", ownMessage.canRedact)
         assertFalse("A peer message must not expose Edit", peerMessage.canEdit)
@@ -729,18 +1080,82 @@ class AndroidPeerAcceptanceIntegrationTest {
             recipient.redactMessage(roomId, peerMessage)
         }.isFailure)
 
-        sender.editMessage(roomId, ownMessage, editedBody)
-        val editedOwnMessage = awaitMessage(sender, "encrypted edit updates sender timeline") {
-            it.eventId == ownMessage.eventId && it.body == editedBody && it.isOwn
+        onStep("editProbeEdit")
+        reportProgress(InstrumentationRegistry.getInstrumentation(), "core", "editProbeEdit", "start")
+        try {
+            sender.editMessage(roomId, ownMessage, editedBody)
+        } catch (failure: Throwable) {
+            val reason = when (failure.message) {
+                "An edited message cannot be empty" -> "empty_body_guard"
+                "The edited message is unchanged" -> "unchanged_body_guard"
+                "Only your sent text messages can be edited" -> "ownership_or_editability_guard"
+                "Editing is disabled because this conversation is not encrypted" -> "encryption_guard"
+                "This edit could not be prepared" -> "content_creation_unavailable"
+                else -> "sdk_or_internal_failure"
+            }
+            println(
+                "OUTBOX_DIAG_EDIT_SUBMIT result=failed reason=$reason " +
+                    "failureClass=${failure.javaClass.simpleName}",
+            )
+            throw failure
         }
-        awaitMessage(recipient, "encrypted edit decrypts for recipient") {
-            it.eventId == ownMessage.eventId && it.body == editedBody && !it.isOwn
+        println("OUTBOX_DIAG_EDIT_SUBMIT result=accepted")
+        reportProgress(InstrumentationRegistry.getInstrumentation(), "core", "editProbeEdit", "complete")
+        onStep("awaitEditedSenderProjection")
+        val senderEditObserved = awaitCondition("encrypted edit updates sender timeline") {
+            sender.messages.value.any {
+                it.eventId == ownMessage.eventId && it.body == editedBody && it.isOwn
+            }
         }
+        val senderProjection = sender.messages.value.firstOrNull { it.eventId == ownMessage.eventId }
+        val senderEditRevisions = runCatching {
+            sender.editRevisionDiagnosticForTest(roomId, checkNotNull(ownMessage.eventId), editedBody)
+        }.getOrDefault("unavailable")
+        InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+            putString(
+                "outbox_diag_edit_projection_sender",
+                listOf(
+                    senderEditObserved,
+                    senderProjection != null,
+                    senderProjection?.isRemote == true,
+                    senderProjection?.body == originalBody,
+                    senderProjection?.body == editedBody,
+                    senderProjection?.canEdit == true,
+                    senderProjection?.isEdited == true,
+                    senderEditRevisions,
+                ).joinToString("|") { it.toString() },
+            )
+        })
+        check(senderEditObserved) { "The sender timeline did not apply the encrypted edit" }
+        val editedOwnMessage = checkNotNull(senderProjection)
+        onStep("awaitEditedPeerProjection")
+        val recipientEditObserved = awaitCondition("encrypted edit decrypts for recipient") {
+            recipient.messages.value.any {
+                it.eventId == ownMessage.eventId && it.body == editedBody && !it.isOwn
+            }
+        }
+        val recipientProjection = recipient.messages.value.firstOrNull { it.eventId == ownMessage.eventId }
+        InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+            putString(
+                "outbox_diag_edit_projection_recipient",
+                listOf(
+                    recipientEditObserved,
+                    recipientProjection != null,
+                    recipientProjection?.isRemote == true,
+                    recipientProjection?.body == originalBody,
+                    recipientProjection?.body == editedBody,
+                    recipientProjection?.isEdited == true,
+                ).joinToString("|") { it.toString() },
+            )
+        })
+        check(recipientEditObserved) { "The recipient timeline did not apply the encrypted edit" }
 
+        onStep("awaitRedactionSenderProjection")
         sender.redactMessage(roomId, editedOwnMessage)
         awaitMessage(sender, "redaction updates sender timeline") {
             it.eventId == ownMessage.eventId && it.body == "Message removed" && it.isOwn
         }
+        onStep("awaitRedactionPeerProjection")
         awaitMessage(recipient, "redaction syncs to recipient timeline") {
             it.eventId == ownMessage.eventId && it.body == "Message removed" && !it.isOwn
         }
@@ -756,23 +1171,36 @@ class AndroidPeerAcceptanceIntegrationTest {
         sender: MatrixRepository,
         recipient: MatrixRepository,
         appContext: Context,
+        onStep: (String) -> Unit,
     ) {
+        fun progress(step: String, state: String) {
+            onStep(step)
+            reportProgress(InstrumentationRegistry.getInstrumentation(), "core", step, state)
+        }
         // This fresh repository logs in to the already-verified account with a new device ID
         // and an empty crypto store. It does not import the account's private cross-signing keys.
         val addedDevice = newIsolatedRepository(appContext, "recipient-added-device")
         try {
+            progress("unverifiedAddedDeviceLogin", "start")
             loginFresh(addedDevice, homeserver, recipientId, recipientPassword)
+            progress("unverifiedAddedDeviceLogin", "complete")
+            progress("unverifiedAddedDeviceRoomSync", "start")
             await("new device sees the existing encrypted room") {
                 addedDevice.refreshConversations()
                 isJoinedEncrypted(addedDevice, roomId)
             }
+            progress("unverifiedAddedDeviceRoomSync", "complete")
+            progress("unverifiedAddedDeviceOpenRoom", "start")
             addedDevice.openConversation(roomId)
             delay(2_000)
+            progress("unverifiedAddedDeviceOpenRoom", "complete")
 
+            progress("unverifiedAddedDeviceTrust", "start")
             val localIdentityState = allowlistedIdentityState(
                 addedDevice.ownVerificationIdentityStateForDiagnostic(),
             )
             val crossSignature = addedDeviceCrossSignatureStatus(appContext, recipientId)
+            progress("unverifiedAddedDeviceTrust", "complete")
             InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
                 putString(
                     "outbox_diag_added_device_trust",
@@ -786,34 +1214,93 @@ class AndroidPeerAcceptanceIntegrationTest {
                 "The fresh login was cross-signed before the unverified-device check"
             }
 
-            val baselineUtd = addedDevice.utdCauseCountsForDiagnostic().values.sum()
-            val baselineRoomUtd = addedDevice.timelineCategoriesForDiagnostic(roomId)
-                .getOrDefault("REMOTE_UTD", 0)
             val body = "new-device-unverified-$marker"
 
-            sender.sendText(roomId, body)
+            progress("unverifiedProbeSend", "start")
+            sender.openConversation(roomId)
+            try {
+                sender.sendText(roomId, body)
+            } catch (failure: IllegalStateException) {
+                // Some SDK versions fail closed when an unverified device is present in a room.
+                // Accept only an explicitly trust-related rejection and prove no event was sent.
+                val reason = failure.message.orEmpty().lowercase()
+                check(reason.contains("unverified") || reason.contains("verification") || reason.contains("trust")) {
+                    "The sender rejected the unverified-device probe for an unrelated reason"
+                }
+                check(sender.messages.value.none { it.body == body && it.isOwn && it.isRemote }) {
+                    "A remotely accepted probe was reported as trust-blocked"
+                }
+                InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                    putString("outbox_diag_unverified_probe", "blocked-before-send")
+                })
+                println("OUTBOX_DIAG_UNVERIFIED_PROBE blockedBeforeSend=true")
+                return
+            }
             val senderEvent = awaitMessage(sender, "sender confirms the unverified-device probe") {
                 it.body == body && it.isOwn && it.isRemote && it.eventId != null
             }
             val eventId = checkNotNull(senderEvent.eventId)
+            progress("unverifiedProbeSend", "complete")
+            progress("unverifiedProbePeerDecrypt", "start")
             awaitMessage(recipient, "existing verified device decrypts the probe") {
                 it.eventId == eventId && it.body == body && !it.isOwn
             }
+            progress("unverifiedProbePeerDecrypt", "complete")
 
-            val newDeviceUndecryptable = awaitCondition("new device receives the encrypted event without its room key", 30_000) {
-                val utdCount = addedDevice.utdCauseCountsForDiagnostic().values.sum()
-                val roomUtd = addedDevice.timelineCategoriesForDiagnostic(roomId)
-                    .getOrDefault("REMOTE_UTD", 0)
-                utdCount > baselineUtd && roomUtd > baselineRoomUtd
+            progress("unverifiedProbeUtdProjection", "start")
+            val newDeviceUtdProjection = awaitMessage(
+                addedDevice,
+                "new device projects the same encrypted event as undecryptable",
+            ) {
+                it.eventId == eventId && !it.isOwn && it.body == "Unable to decrypt this message"
             }
-            val newDeviceDecrypted = addedDevice.messages.value.any {
-                it.eventId == eventId || it.body == body
+            progress("unverifiedProbeUtdProjection", "complete")
+            val projectionStates = linkedSetOf("utd")
+            val observationWindowMillis = 30_000L
+            val newDeviceDecrypted = withTimeoutOrNull(observationWindowMillis) {
+                while (true) {
+                    val eventProjection = addedDevice.messages.value.firstOrNull {
+                        it.eventId == eventId && !it.isOwn
+                    }
+                    val projectionState = when {
+                        eventProjection == null -> "missing"
+                        eventProjection.body == body -> "plaintext"
+                        eventProjection.body == "Unable to decrypt this message" -> "utd"
+                        else -> "other"
+                    }
+                    projectionStates.add(projectionState)
+                    if (projectionState == "plaintext") return@withTimeoutOrNull true
+                    delay(200)
+                }
+                @Suppress("UNREACHABLE_CODE")
+                false
+            } ?: false
+            val finalIdentityState = allowlistedIdentityState(
+                addedDevice.ownVerificationIdentityStateForDiagnostic(),
+            )
+            val finalCrossSignature = addedDeviceCrossSignatureStatus(appContext, recipientId)
+            val newDeviceUndecryptable = newDeviceUtdProjection.eventId == eventId &&
+                newDeviceUtdProjection.body == "Unable to decrypt this message"
+            val finalProjectionState = projectionStates.last()
+            val projectionTransition = when {
+                newDeviceDecrypted -> "utd-to-plaintext"
+                "other" in projectionStates -> "utd-to-other"
+                "missing" in projectionStates -> "utd-to-missing"
+                else -> "utd-only"
             }
             val deviceObservation =
                 "$localIdentityState|${crossSignature.selfSigningKeyPresent}|${crossSignature.deviceKeyCrossSigned}" +
                     "|true|$newDeviceUndecryptable|$newDeviceDecrypted|unavailable"
             InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
                 putString("outbox_diag_added_device_result", deviceObservation)
+                putString(
+                    "outbox_diag_added_device_final_trust",
+                    "$finalIdentityState|${finalCrossSignature.selfSigningKeyPresent}|${finalCrossSignature.deviceKeyCrossSigned}",
+                )
+                putString(
+                    "outbox_diag_added_device_projection",
+                    "utd|$finalProjectionState|$projectionTransition|${observationWindowMillis / 1_000}",
+                )
             })
             println(
                 "OUTBOX_DIAG_UNVERIFIED_DEVICE addedDevice=true localIdentity=$localIdentityState " +
@@ -821,8 +1308,20 @@ class AndroidPeerAcceptanceIntegrationTest {
                     "newDeviceUndecryptable=$newDeviceUndecryptable newDeviceDecrypted=$newDeviceDecrypted " +
                     "roomKeyRecipientList=unavailable",
             )
+            println(
+                "OUTBOX_DIAG_ADDED_DEVICE_PROJECTION before=utd after=$finalProjectionState " +
+                    "transition=$projectionTransition windowSeconds=${observationWindowMillis / 1_000}",
+            )
+            println(
+                "OUTBOX_DIAG_ADDED_DEVICE_FINAL_TRUST localIdentity=$finalIdentityState " +
+                    "selfSigningKeyPresent=${finalCrossSignature.selfSigningKeyPresent} " +
+                    "deviceCrossSigned=${finalCrossSignature.deviceKeyCrossSigned}",
+            )
             check(newDeviceUndecryptable) {
                 "The newly added unverified device did not surface the probe as undecryptable"
+            }
+            check(finalIdentityState == "unverified" && !finalCrossSignature.deviceKeyCrossSigned) {
+                "The additional device did not remain unverified throughout the diagnostic window"
             }
             check(!newDeviceDecrypted) {
                 "A newly added device without the account's cross-signing secrets decrypted the probe"
@@ -880,6 +1379,15 @@ class AndroidPeerAcceptanceIntegrationTest {
             connection.disconnect()
         }
     }
+
+    private data class IsolatedStoreMarkerScan(
+        val storeFiles: Int,
+        val sqliteFiles: Int,
+        val walFiles: Int,
+        val cacheFiles: Int,
+        val searchIndexFiles: Int,
+        val markerMatchFiles: Int,
+    )
 
     private data class DeviceCrossSignatureStatus(
         val selfSigningKeyPresent: Boolean,
@@ -1111,14 +1619,32 @@ class AndroidPeerAcceptanceIntegrationTest {
         }) { "The two fresh accounts did not produce safety codes" }
         assertEquals(sender.verification.value?.sas, recipient.verification.value?.sas)
         onVerificationStep("verificationApprove")
-        sender.approveVerification()
-        recipient.approveVerification()
+        coroutineScope {
+            val senderApproval = async {
+                println("OUTBOX_DIAG_VERIFY_APPROVAL peer=sender phase=start")
+                sender.approveVerification()
+                println("OUTBOX_DIAG_VERIFY_APPROVAL peer=sender phase=complete")
+            }
+            val recipientApproval = async {
+                println("OUTBOX_DIAG_VERIFY_APPROVAL peer=recipient phase=start")
+                recipient.approveVerification()
+                println("OUTBOX_DIAG_VERIFY_APPROVAL peer=recipient phase=complete")
+            }
+            senderApproval.await()
+            recipientApproval.await()
+        }
+        val verificationEventsAfterApproval = runCatching {
+            sender.verificationProtocolEventCountsForDiagnostic(
+                checkNotNull(verificationControlRoomId),
+                peerUserId,
+            )
+        }.getOrDefault("http=0")
+        println("OUTBOX_DIAG_VERIFY_EVENTS phase=after-approval $verificationEventsAfterApproval")
         onVerificationStep("verificationComplete")
         val verificationCompleted = awaitCondition("verified peers", 45_000) {
             sender.verification.value?.status == DeviceVerificationStatus.VERIFIED &&
                 recipient.verification.value?.status == DeviceVerificationStatus.VERIFIED
-        } || (sender.verification.value?.status == DeviceVerificationStatus.VERIFIED &&
-            recipient.verification.value?.status == DeviceVerificationStatus.VERIFIED)
+        }
         if (!verificationCompleted) {
             fun safeStatus(repository: MatrixRepository): String = when (repository.verification.value?.status) {
                 DeviceVerificationStatus.REQUESTING -> "requesting"
@@ -1145,8 +1671,17 @@ class AndroidPeerAcceptanceIntegrationTest {
             }.getOrDefault("http=0")
             InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
                 putString("outbox_diag_verification_events", protocolEvents)
+                putString(
+                    "outbox_diag_verification_callbacks",
+                    "${sender.verificationCallbackSummaryForDiagnostic()}|" +
+                        recipient.verificationCallbackSummaryForDiagnostic(),
+                )
             })
             println("OUTBOX_DIAG_VERIFY_EVENTS $protocolEvents")
+            println(
+                "OUTBOX_DIAG_VERIFY_CALLBACKS sender=${sender.verificationCallbackSummaryForDiagnostic()} " +
+                    "recipient=${recipient.verificationCallbackSummaryForDiagnostic()}",
+            )
         }
         check(verificationCompleted) { "Both fresh accounts did not complete device verification" }
         onVerificationStep("verificationPeerTrust")
@@ -1187,8 +1722,17 @@ class AndroidPeerAcceptanceIntegrationTest {
             }.getOrDefault("http=0")
             InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
                 putString("outbox_diag_verification_events", protocolEvents)
+                putString(
+                    "outbox_diag_verification_callbacks",
+                    "${sender.verificationCallbackSummaryForDiagnostic()}|" +
+                        recipient.verificationCallbackSummaryForDiagnostic(),
+                )
             })
             println("OUTBOX_DIAG_VERIFY_EVENTS $protocolEvents")
+            println(
+                "OUTBOX_DIAG_VERIFY_CALLBACKS sender=${sender.verificationCallbackSummaryForDiagnostic()} " +
+                    "recipient=${recipient.verificationCallbackSummaryForDiagnostic()}",
+            )
         }
         check(peerIdentitiesConverged) {
             "The peers completed SAS, but their cross-signing trust did not converge in both directions"

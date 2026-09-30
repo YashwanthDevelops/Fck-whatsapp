@@ -1,0 +1,99 @@
+diff --git a/bindings/matrix-sdk-ffi/src/encryption.rs b/bindings/matrix-sdk-ffi/src/encryption.rs
+index 946afe58ccff0f9efeba03587bafb0560c156b1d..06e37b56ec9dbdfa0c28113683bd58dcb04b23c3 100644
+--- a/bindings/matrix-sdk-ffi/src/encryption.rs
++++ b/bindings/matrix-sdk-ffi/src/encryption.rs
+@@ -44,6 +44,21 @@ pub struct Encryption {
+     pub(crate) _client: Arc<Client>,
+ }
+ 
++/// Return only devices that are cross-signing trusted after requiring a
++/// present, verified identity with no outstanding verification violation.
++fn filter_cross_signed_device_ids(
++    devices: impl IntoIterator<Item = (String, bool)>,
++) -> Vec<String> {
++    devices
++        .into_iter()
++        .filter_map(|(device_id, is_cross_signed)| is_cross_signed.then_some(device_id))
++        .collect()
++}
++
++fn identity_is_safe_for_device_query(is_verified: bool, has_verification_violation: bool) -> bool {
++    is_verified && !has_verification_violation
++}
++
+ /// The encryption data of an event that was sent encrypted (and which we
+ /// managed to decrypt).
+ #[derive(Clone, uniffi::Record)]
+@@ -901,6 +916,41 @@ impl Encryption {
+         }
+     }
+ 
++    /// Query the homeserver for a fresh peer identity and return the device IDs
++    /// whose device keys are trusted by cross-signing.
++    ///
++    /// Fails closed if the identity is absent, unverified, or has a
++    /// verification violation. Callers must still send encrypted to-device
++    /// events only to these explicit device IDs; this method does not authorize
++    /// wildcard device selectors.
++    pub async fn verified_cross_signed_device_ids_for_user(
++        &self,
++        user_id: String,
++    ) -> Result<Vec<String>, ClientError> {
++        let user_id = user_id.as_str().try_into()?;
++        let identity = self.inner.request_user_identity(user_id).await?.ok_or_else(|| {
++            ClientError::Generic {
++                msg: "Peer has no cross-signing identity".to_owned(),
++                details: None,
++            }
++        })?;
++
++        if !identity_is_safe_for_device_query(
++            identity.is_verified(),
++            identity.has_verification_violation(),
++        ) {
++            return Err(ClientError::Generic {
++                msg: "Peer identity is not verified or has a verification violation".to_owned(),
++                details: None,
++            });
++        }
++
++        let devices = self.inner.get_user_devices(user_id).await?;
++        Ok(filter_cross_signed_device_ids(devices.devices().map(|device| {
++            (device.device_id().to_string(), device.is_verified_with_cross_signing())
++        })))
++    }
++
+     /// This method will import all the private cross-signing keys and the
+     /// private part of a backup key and its accompanying version into the
+     /// store.
+@@ -1038,6 +1088,30 @@ impl Encryption {
+     }
+ }
+ 
++#[cfg(test)]
++mod verified_cross_signed_device_ids_tests {
++    use super::{filter_cross_signed_device_ids, identity_is_safe_for_device_query};
++
++    #[test]
++    fn peer_identity_must_be_verified_and_have_no_violation() {
++        assert!(identity_is_safe_for_device_query(true, false));
++        assert!(!identity_is_safe_for_device_query(false, false));
++        assert!(!identity_is_safe_for_device_query(true, true));
++        assert!(!identity_is_safe_for_device_query(false, true));
++    }
++
++    #[test]
++    fn only_cross_signed_devices_are_returned() {
++        let ids = filter_cross_signed_device_ids([
++            ("verified-a".to_owned(), true),
++            ("unverified".to_owned(), false),
++            ("verified-b".to_owned(), true),
++        ]);
++
++        assert_eq!(ids, vec!["verified-a".to_owned(), "verified-b".to_owned()]);
++    }
++}
++
+ /// The E2EE identity of a user.
+ #[derive(uniffi::Object)]
+ pub struct UserIdentity {

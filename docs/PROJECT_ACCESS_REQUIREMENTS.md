@@ -1,6 +1,6 @@
 # Project access requirements
 
-No credentials, Apple membership, deployment host, or signing material were found in the workspace. Never paste passwords, private keys, certificates, or API secrets into chat.
+No Apple signing identity, provider secret, production host, or domain is configured. A local Android release-signing identity now exists in the ignored, account-restricted `ops/private-deployment/credentials/android-release/` directory. Never paste passwords, private keys, certificates, or API secrets into chat.
 
 ## Required now
 
@@ -17,17 +17,18 @@ No credentials, Apple membership, deployment host, or signing material were foun
 |---|---|---|---|---|
 | Mac with Xcode and Swift | Build the iOS app, use Simulator, sign development builds, and test lifecycle | A Mac owned/controlled by the project | Yes on that Mac for iOS builds | No Windows equivalent; source editing alone is not validation |
 | iPhone (and Android/iOS pair) | Validate real cross-platform E2EE, notifications, gestures, and background behavior | Physical devices controlled by the project | Only for authorized hands-on test sessions | Simulator/emulator is partial; hardware behavior must be checked before relying on the app daily |
-| Private server/VPS and stable domain with HTTPS | Host the friend-group homeserver outside local development | Provider account, DNS, and OS secret store | Deployment operator needs access; an agent does not need account password | Local Synapse works for development; LAN testing works on a trusted network |
-| Apple signing identity / Apple ID | Install a development build on an iPhone; later private distribution | Xcode Keychain and Apple's developer portal | Agent only via a controlled Mac workflow; never send certificate/private key through chat | iOS Simulator needs no paid Developer Program membership; device installs require Apple signing |
-| Android signing key | Produce a stable privately shared APK | Offline encrypted password manager / secure backup | Not for debug builds; release signer only through local secure process | Debug APK for initial testing; it is not a stable release identity |
+| Stable Matrix domain and private server/VPS | Host the friend-group homeserver outside local development; the domain is part of Matrix user IDs and should be chosen permanently | Domain registrar, provider account, DNS, and host secret store | Deployment operator needs access; never share account passwords in chat | Local Synapse validates code but cannot be used by friends over the internet |
+| Mac with Xcode 16.3+ and Swift | Resolve/build the current Swift dependency, run iOS Simulator, sign and test iOS lifecycle and calls | A Mac owned/controlled by the project | Required locally for the iOS build; no Windows equivalent | Source editing alone cannot validate iOS binaries |
+| iPhone and an Android/iOS pair | Verify actual Android↔iOS E2EE, calls, notifications, and background behavior | Physical devices controlled by the project | Required for final device acceptance | Simulator/emulator coverage is partial |
+| Apple ID / signing identity, Firebase and APNs credentials | Install privately distributed iOS builds and validate background notifications | Xcode Keychain, Apple Developer portal, Firebase project and protected secret storage | Only through the user's controlled Apple/Firebase sessions; never send secrets through chat | No real push or iOS device install without provider credentials |
+| Android signing-key backup | Preserve the stable signing identity for future updates | Back up `ops/private-deployment/credentials/android-release/friendline-private-release.p12` and its `signing-password.txt` into an encrypted password manager/offline backup | User should secure and retain the local generated identity before sharing builds | Replacing the key after friends install prevents seamless APK updates |
+| Call service deployment and TURN credentials | Run the self-hosted SFU and support reliable calls over mobile networks | Private Linux host, DNS/TLS, protected server secrets | Deployment operator needs access; no media key is shared with the service | LiveKit media hosts exist on both platforms, but Android outbound key delivery is disabled because the Matrix binding cannot select individually verified peer devices; iOS also lacks encrypted custom to-device APIs. UI integration, trusted routing, both builds, and device interoperability remain incomplete |
 
 ## Optional
 
 | Requirement | Why / when | Where stored | Does the coding agent need it? | Local replacement |
 |---|---|---|---|---|
-| Apple Developer Program membership | TestFlight or broader private iOS distribution, if later desired | Apple account | No by default | Xcode development signing supports limited personal-device testing, subject to Apple limits |
-| Firebase/FCM project and Apple APNs credentials | Generic message wakeups after messaging behavior is stable | Android/iOS secret managers; APNs key in protected CI/Keychain | Only when configuring push; never in source or chat | Foreground/next-launch sync remains available; background wakeups are best effort |
-| TURN service credentials | Reliable WebRTC calls in Phase 4 | Server secret store / environment file | Only when implementing calls | Local host candidates can test some same-network calls; not a reliable internet replacement |
+| Apple Developer Program membership | TestFlight or broader private iOS distribution, if desired beyond personal-device development signing | Apple account | Through the user's Apple account | Limited development signing is possible with an Apple ID, subject to Apple limits |
 | Git hosting account | Remote backup, issue tracking, CI, and collaboration | Provider's interactive authentication | No credentials should be sent to the agent | Local Git repo |
 
 ## Not required
@@ -36,6 +37,6 @@ No credentials, Apple membership, deployment host, or signing material were foun
 - Phone numbers, address-book access, contact-discovery service, analytics provider, Kubernetes, Kafka, Redis, or public user-directory service.
 - Shared passwords or private encryption keys in chat.
 
-## Machine validation (2026-09-28)
+## Machine validation (2026-09-30)
 
-Present: Windows, Git, Docker Desktop Linux engine/Compose, Java 26, a downloaded JDK 17, Android SDK packages under ignored `.tools/`, Gradle wrapper, and `adb`. An API 37 Android emulator and isolated Linux-container Gradle builds are available; debug, minified release, and outbox integration builds have succeeded. Android Studio, macOS/Xcode, and a configured iPhone are not present. Physical Android↔iPhone testing and iOS build/signing still require access to a Mac and devices.
+Present: Windows, Git, Docker Compose, JDK 17, Android SDK under ignored `.tools/`, Gradle wrapper, and `adb`. The Android API 37 emulator has passed prior isolated Android peer/outbox acceptance. Four signed per-ABI Android release APKs and a signed AAB were verified; the emulator installed and launched its x86_64 release APK. Current Docker Desktop Linux Engine requests fail with HTTP 500, so the local Matrix service cannot currently be started or revalidated. Android Studio, macOS/Xcode, and a configured iPhone are not present. The private Matrix host and stable domain are not provisioned. iOS compilation, Apple signing, Android↔iOS device acceptance, public backend deployment, provider push, and calls remain outstanding. Call integration is being designed for iOS 16 with a custom LiveKit media host; its E2EE key exchange and trusted-device routing are not yet implemented or validated.

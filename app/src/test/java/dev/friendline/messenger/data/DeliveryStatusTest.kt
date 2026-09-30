@@ -1,9 +1,39 @@
 package dev.friendline.messenger.data
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class DeliveryStatusTest {
+    @Test
+    fun acceptedServerResponsePromotesOnlyMatchingOwnLocalEcho() {
+        val localEcho = ChatMessage(
+            id = "txn-1",
+            eventId = null,
+            isRemote = false,
+            sender = "@me:example.test",
+            body = "hello",
+            timestampMillis = 10L,
+            isOwn = true,
+            deliveryState = "Sending",
+        )
+
+        val promoted = promoteAcceptedLocalMessage(
+            message = localEcho,
+            transactionId = "txn-1",
+            eventId = "\$event:example.test",
+            deliveryState = "Sent",
+        )
+
+        assertEquals("\$event:example.test", promoted?.id)
+        assertEquals("\$event:example.test", promoted?.eventId)
+        assertEquals(true, promoted?.isRemote)
+        assertEquals("Sent", promoted?.deliveryState)
+        assertEquals("hello", promoted?.body)
+        assertNull(promoteAcceptedLocalMessage(localEcho, "other-txn", "\$other:example.test", "Sent"))
+        assertNull(promoteAcceptedLocalMessage(localEcho.copy(isOwn = false), "txn-1", "\$event:example.test", "Sent"))
+    }
+
     @Test
     fun oneToOneKeepsDeliveredSemantics() {
         assertEquals("Sent", deliveryStatusLabel(setOf("peer"), emptySet()))
@@ -34,6 +64,20 @@ class DeliveryStatusTest {
         assertEquals(afterMemberAcknowledges, addDeliveryAcknowledgement(expected, afterMemberAcknowledges, "member-a"))
         assertEquals(null, addDeliveryAcknowledgement(expected, afterMemberAcknowledges, "outside-member"))
         assertEquals("Delivered to 1 of 2", deliveryStatusLabel(expected, afterMemberAcknowledges))
+    }
+
+    @Test
+    fun groupRecipientDetailsAreStableAndIgnoreUnexpectedAcknowledgements() {
+        assertEquals(
+            listOf(
+                DeliveryMemberStatus("member-a", delivered = true),
+                DeliveryMemberStatus("member-b", delivered = false),
+            ),
+            deliveryMemberStatuses(
+                expectedMemberIds = setOf("member-b", "member-a"),
+                acknowledgedMemberIds = setOf("member-a", "not-in-snapshot"),
+            ),
+        )
     }
 
     @Test

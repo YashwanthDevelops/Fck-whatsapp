@@ -7,9 +7,16 @@
 		@admin_api path /_synapse/admin /_synapse/admin/*
 		respond @admin_api 404
 
+		@call_auth path /_friendline/calls/v1/calls /_friendline/calls/v1/calls/*
+		reverse_proxy @call_auth call-auth:8080
+
 		@push_gateway path /_matrix/push/v1/notify
 		reverse_proxy @push_gateway sygnal:5000
 
 		reverse_proxy synapse:8008
 	}
+}
+
+{$CALLS_DOMAIN} {
+	reverse_proxy livekit:7880
 }

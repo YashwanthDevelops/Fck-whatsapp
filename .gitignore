@@ -30,5 +30,6 @@ __pycache__/
 local.properties
 # Per-project Firebase client configuration for local Android builds.
 **/google-services.json
+/app/libs/sdk-android-private-*.aar
 .DS_Store
 Thumbs.db

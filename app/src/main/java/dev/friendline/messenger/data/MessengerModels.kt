@@ -27,11 +27,18 @@ data class ChatMessage(
     val canRetry: Boolean = false,
     val canReply: Boolean = false,
     val canEdit: Boolean = false,
+    val isEdited: Boolean = false,
     val canRedact: Boolean = false,
     val replyToEventId: String? = null,
     val reactions: List<ReactionSummary> = emptyList(),
     val hasBeenRead: Boolean = false,
     val attachment: ChatAttachment? = null,
+    val deliveryMemberDetails: List<DeliveryMemberStatus> = emptyList(),
+)
+
+data class DeliveryMemberStatus(
+    val userId: String,
+    val delivered: Boolean,
 )
 
 data class ChatAttachment(

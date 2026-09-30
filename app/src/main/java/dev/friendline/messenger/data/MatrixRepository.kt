@@ -6,10 +6,17 @@ import android.graphics.BitmapFactory
 import android.provider.OpenableColumns
 import dev.friendline.messenger.BuildConfig
 import dev.friendline.messenger.calls.CALL_MESSAGE_TYPE
+import dev.friendline.messenger.calls.CALL_CONTENT_KEY
+import dev.friendline.messenger.calls.CALL_INVITE_TTL_MILLIS
+import dev.friendline.messenger.calls.CALL_KEY_BYTES
 import dev.friendline.messenger.calls.CallProtocol
-import dev.friendline.messenger.calls.MessengerCallAction
+import dev.friendline.messenger.calls.CallAuthClient
+import dev.friendline.messenger.calls.IncomingCallMediaMaterial
+import dev.friendline.messenger.calls.verifiedCallKeyRecipients
 import dev.friendline.messenger.calls.MessengerCallKind
 import dev.friendline.messenger.calls.MessengerCallSignal
+import dev.friendline.messenger.calls.CALL_KEY_EVENT_TYPE
+import dev.friendline.messenger.calls.OutgoingCallKeyMaterial
 import dev.friendline.messenger.push.MatrixPushClient
 import dev.friendline.messenger.push.MatrixPushSession
 import dev.friendline.messenger.push.PushPusherIdentity
@@ -55,6 +62,7 @@ import org.matrix.rustcomponents.sdk.LatestEventValue
 import org.matrix.rustcomponents.sdk.MediaFileHandle
 import org.matrix.rustcomponents.sdk.MediaSource
 import org.matrix.rustcomponents.sdk.MessageType
+import org.matrix.rustcomponents.sdk.MembershipState
 import org.matrix.rustcomponents.sdk.MsgLikeKind
 import org.matrix.rustcomponents.sdk.ReceiptType
 import org.matrix.rustcomponents.sdk.ReceiptThread
@@ -62,7 +70,6 @@ import org.matrix.rustcomponents.sdk.Room
 import org.matrix.rustcomponents.sdk.RoomHistoryVisibility
 import org.matrix.rustcomponents.sdk.RoomMessageEventContentWithoutRelation
 import org.matrix.rustcomponents.sdk.SearchService
-import org.matrix.rustcomponents.sdk.MembershipState
 import org.matrix.rustcomponents.sdk.SearchServicePaginationStateListener
 import org.matrix.rustcomponents.sdk.SearchServiceResult
 import org.matrix.rustcomponents.sdk.SearchServiceResultsListener
@@ -72,6 +79,7 @@ import org.matrix.rustcomponents.sdk.SendAttachmentJoinHandle
 import org.matrix.rustcomponents.sdk.SendHandle
 import org.matrix.rustcomponents.sdk.RoomSendQueueUpdate
 import org.matrix.rustcomponents.sdk.SendQueueRoomUpdateListener
+import org.matrix.rustcomponents.sdk.SendQueueListener
 import org.matrix.rustcomponents.sdk.SessionVerificationController
 import org.matrix.rustcomponents.sdk.SessionVerificationControllerDelegate
 import org.matrix.rustcomponents.sdk.SessionVerificationData
@@ -80,6 +88,9 @@ import org.matrix.rustcomponents.sdk.SyncService
 import org.matrix.rustcomponents.sdk.SyncServiceStateObserver
 import org.matrix.rustcomponents.sdk.SendQueueRoomErrorListener
 import org.matrix.rustcomponents.sdk.TaskHandle
+import org.matrix.rustcomponents.sdk.ToDeviceMessage
+import org.matrix.rustcomponents.sdk.ToDeviceMessageListener
+import org.matrix.rustcomponents.sdk.ShieldState
 import org.matrix.rustcomponents.sdk.TextMessageContent
 import org.matrix.rustcomponents.sdk.Timeline
 import org.matrix.rustcomponents.sdk.TimelineDiff
@@ -87,8 +98,8 @@ import org.matrix.rustcomponents.sdk.TimelineItem
 import org.matrix.rustcomponents.sdk.TimelineItemContent
 import org.matrix.rustcomponents.sdk.TimelineListener
 import org.matrix.rustcomponents.sdk.TimelineConfiguration
-import org.matrix.rustcomponents.sdk.TimelineFilter
 import org.matrix.rustcomponents.sdk.TimelineFocus
+import org.matrix.rustcomponents.sdk.TimelineFilter
 import org.matrix.rustcomponents.sdk.RoomMessageEventMessageType
 import org.matrix.rustcomponents.sdk.DateDividerMode
 import org.matrix.rustcomponents.sdk.TypingNotificationsListener
@@ -97,6 +108,8 @@ import org.matrix.rustcomponents.sdk.UploadSource
 import org.matrix.rustcomponents.sdk.VideoInfo
 import org.matrix.rustcomponents.sdk.SlidingSyncVersionBuilder
 import uniffi.matrix_sdk_crypto.CollectStrategy
+import uniffi.matrix_sdk_crypto.DecryptionSettings
+import uniffi.matrix_sdk_crypto.TrustRequirement
 import java.io.File
 import java.io.FileOutputStream
 import java.io.FileInputStream
@@ -108,6 +121,7 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.time.Duration
 import java.util.UUID
+import java.security.SecureRandom
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -170,6 +184,9 @@ class MatrixRepository(context: Context) {
     private val _connection = MutableStateFlow("Offline")
     private val _typingUsers = MutableStateFlow<List<String>>(emptyList())
     private val _callSignals = MutableSharedFlow<MessengerCallSignal>(extraBufferCapacity = 32)
+    private val callInviteReplayLock = Any()
+    private val seenCallInvites = LinkedHashMap<String, Long>()
+    private val verificationCallbackCounts = ConcurrentHashMap<String, AtomicInteger>()
     private val _verification = MutableStateFlow<DeviceVerificationUiState?>(null)
     private val _peerTrust = MutableStateFlow(PeerTrustStatus.UNKNOWN)
     private val _searchResults = MutableStateFlow<List<MessageSearchHit>>(emptyList())
@@ -228,9 +245,15 @@ class MatrixRepository(context: Context) {
     private val diagnosticUtdCauseCounts = ConcurrentHashMap<String, AtomicInteger>()
     private val diagnosticUtdEventIds = ConcurrentHashMap.newKeySet<String>()
     private val diagnosticTimelineEventIdsByRoom = ConcurrentHashMap<String, MutableSet<String>>()
+    private val editRevisionRefreshScheduled = ConcurrentHashMap.newKeySet<String>()
+    private val optimisticEditBodiesByEvent = ConcurrentHashMap<String, String>()
+    private val optimisticEditTargetsUpdatedByEvent = ConcurrentHashMap<String, Boolean>()
+    private val optimisticEditOverlayProjectionCounts = ConcurrentHashMap<String, AtomicInteger>()
+    private val optimisticRedactedEventIds = ConcurrentHashMap.newKeySet<String>()
     private val diagnosticTimelineCategoriesByRoom = ConcurrentHashMap<String, ConcurrentHashMap<String, AtomicInteger>>()
     private val deliverySnapshotReservationLock = Any()
     private var activeDeliverySnapshotReservation: DeliverySnapshotReservation? = null
+    private val mediaDeliverySnapshotReservations = ConcurrentHashMap<String, DeliverySnapshotReservation>()
     private val readReceiptLocks = ConcurrentHashMap<String, Mutex>()
     private val verificationPeerPrewarmScheduled = ConcurrentHashMap.newKeySet<String>()
     @Volatile private var verificationDiagnosticStage = "idle"
@@ -251,6 +274,10 @@ class MatrixRepository(context: Context) {
     private var pendingMediaReplayRetryCount = 0
     private var pendingMediaReplayExecuting = false
     private val activeAttachmentSends = ConcurrentHashMap<String, TrackedAttachmentSend>()
+    /** Transaction to server event IDs returned by Matrix send responses, awaiting timeline echo. */
+    private val acceptedSendEventIdsByTransaction = ConcurrentHashMap<String, String>()
+    private val diagnosticSendQueueUpdateCounts = ConcurrentHashMap<String, ConcurrentHashMap<String, AtomicInteger>>()
+    private val diagnosticSendQueueUpdateFailures = ConcurrentHashMap<String, AtomicInteger>()
 
     private var client: Client? = null
     private var searchService: SearchService? = null
@@ -263,9 +290,13 @@ class MatrixRepository(context: Context) {
     @Volatile private var verificationWasInitiatedHere = false
     private var syncService: SyncService? = null
     private var syncStateHandle: TaskHandle? = null
+    private var callKeySubscription: TaskHandle? = null
+    private var callKeyListener: ToDeviceMessageListener? = null
     private var sendQueueStatusHandle: TaskHandle? = null
     private var sendQueueUpdatesHandle: TaskHandle? = null
     private var sendQueueUpdatesListener: SendQueueRoomUpdateListener? = null
+    private var activeRoomSendQueueUpdatesHandle: TaskHandle? = null
+    private var activeRoomSendQueueUpdatesListener: SendQueueListener? = null
     private var typingListenerHandle: TaskHandle? = null
     @Volatile private var activeTimeline: Timeline? = null
     @Volatile private var readReceiptRefreshJob: Job? = null
@@ -1092,8 +1123,12 @@ class MatrixRepository(context: Context) {
             if (events != null) {
                 for (index in 0 until events.length()) {
                     val event = events.optJSONObject(index) ?: continue
-                    val type = event.optString("type")
-                    val name = when (type) {
+                    // The in-room verification API wraps the protocol kind in
+                    // m.room.message.content.msgtype. Top-level `type` is always
+                    // m.room.message for this dedicated control room.
+                    if (event.optString("type") != "m.room.message") continue
+                    val protocolType = event.optJSONObject("content")?.optString("msgtype")
+                    val name = when (protocolType) {
                         "m.key.verification.request" -> "request"
                         "m.key.verification.ready" -> "ready"
                         "m.key.verification.start" -> "start"
@@ -1126,6 +1161,20 @@ class MatrixRepository(context: Context) {
         }
     }
 
+    /** Fixed callback names/counts only; never includes SAS values, flow IDs, keys or event bodies. */
+    internal fun verificationCallbackSummaryForDiagnostic(): String {
+        check(BuildConfig.DEBUG) { "Verification diagnostics are unavailable in release builds" }
+        val names = listOf("request", "accepted", "sas-started", "sas-received", "failed", "cancelled", "finished")
+        return names.joinToString(",") { name ->
+            "$name=${verificationCallbackCounts[name]?.get()?.coerceIn(0, 999) ?: 0}"
+        }
+    }
+
+    private fun recordVerificationCallback(name: String) {
+        if (!BuildConfig.DEBUG) return
+        verificationCallbackCounts.computeIfAbsent(name) { AtomicInteger() }.incrementAndGet()
+    }
+
     private fun recordDiagnosticUtdCause(eventId: String, cause: String) {
         if (!BuildConfig.DEBUG || !diagnosticUtdEventIds.add(eventId)) return
         diagnosticUtdCauseCounts.computeIfAbsent(cause) { AtomicInteger() }.incrementAndGet()
@@ -1134,7 +1183,10 @@ class MatrixRepository(context: Context) {
     private fun recordDiagnosticTimelineCategory(roomId: String, eventId: String, category: String) {
         if (!BuildConfig.DEBUG) return
         val seenEvents = diagnosticTimelineEventIdsByRoom.computeIfAbsent(roomId) { ConcurrentHashMap.newKeySet() }
-        if (!seenEvents.add(eventId)) return
+        // An SDK item can move through multiple projection stages. Deduplicate each
+        // event/category pair so later local-send-state and body-availability evidence
+        // is not hidden by the initial timeline-kind observation.
+        if (!seenEvents.add("$eventId\u0000$category")) return
         val categoryCounts = diagnosticTimelineCategoriesByRoom.computeIfAbsent(roomId) { ConcurrentHashMap() }
         categoryCounts.computeIfAbsent(category) { AtomicInteger() }.incrementAndGet()
     }
@@ -1535,6 +1587,7 @@ class MatrixRepository(context: Context) {
             stage = "release-previous-timeline"
             stopReadReceiptRefresh()
             activeRoomId = null
+            closeActiveRoomSendQueueUpdates()
             val previousTimeline = activeTimeline
             activeTimeline = null
             timelineListenerHandle?.cancel()
@@ -1545,6 +1598,29 @@ class MatrixRepository(context: Context) {
             previousTimeline?.close()
             clearTimelineMessages()
             activeRoomId = roomId
+            stage = "subscribe-room-send-queue-updates"
+            val roomQueueListener = object : SendQueueListener {
+                override fun onUpdate(update: RoomSendQueueUpdate) {
+                    try {
+                        // The room-level subscription is the authoritative observer while its
+                        // conversation is open. Keep the global observer for background rooms.
+                        observeSendQueueUpdate(roomId, update)
+                    } catch (error: Throwable) {
+                        if (BuildConfig.DEBUG) {
+                            diagnosticSendQueueUpdateFailures
+                                .computeIfAbsent(roomId) { AtomicInteger() }
+                                .incrementAndGet()
+                            android.util.Log.e(
+                                "FriendlineSendQueue",
+                                "room update callback failed type=${update.javaClass.simpleName} " +
+                                    "error=${error.javaClass.simpleName}",
+                            )
+                        }
+                    }
+                }
+            }
+            activeRoomSendQueueUpdatesListener = roomQueueListener
+            activeRoomSendQueueUpdatesHandle = room.subscribeToSendQueueUpdates(roomQueueListener)
             stage = "refresh-peer-trust"
             refreshPeerTrust(room)
             stage = "create-timeline"
@@ -1608,9 +1684,12 @@ class MatrixRepository(context: Context) {
             _composerDraft.value = savedDraft?.plainText.orEmpty()
             savedDraft?.destroy()
         } catch (failure: CancellationException) {
+            closeActiveRoomSendQueueUpdates()
+            activeRoomId = null
             throw failure
         } catch (failure: Throwable) {
             stopReadReceiptRefresh()
+            closeActiveRoomSendQueueUpdates()
             runCatching { timelineListenerHandle?.cancel() }
             runCatching { timelineListenerHandle?.close() }
             runCatching { typingListenerHandle?.cancel() }
@@ -1653,6 +1732,7 @@ class MatrixRepository(context: Context) {
         }
         stopReadReceiptRefresh()
         activeRoomId = null
+        closeActiveRoomSendQueueUpdates()
         val timeline = activeTimeline
         activeTimeline = null
         timelineListenerHandle?.cancel()
@@ -1682,7 +1762,16 @@ class MatrixRepository(context: Context) {
         ) ?: throw IllegalStateException("This message could not be prepared")
         try {
             val handle = withSendQueueGate {
-                val sendHandle = withDeliverySnapshotReservation(roomId, room) {
+                val sendHandle = withDeliverySnapshotReservation(
+                    roomId = roomId,
+                    room = room,
+                    pendingLocalTextEcho = PendingLocalTextEcho(
+                        sender = ownUserId.orEmpty(),
+                        body = body.trim(),
+                        timestampMillis = System.currentTimeMillis(),
+                        replyToEventId = replyToEventId,
+                    ),
+                ) {
                     if (replyToEventId == null) {
                         timeline.send(content)
                     } else {
@@ -1701,31 +1790,166 @@ class MatrixRepository(context: Context) {
     }
 
     /**
-     * Send encrypted call control over the existing Matrix room. The 256-bit media key is
-     * included only on an invitation and remains inside Matrix's encrypted event payload.
+     * Creates a one-to-one call invitation and sends its fresh media key only in SDK-Olm-
+     * encrypted to-device messages. Any unresolved device delivery aborts call setup.
      */
-    suspend fun sendCallSignal(
+    suspend fun startSecureCall(
         roomId: String,
-        action: MessengerCallAction,
-        callId: String,
-        kind: MessengerCallKind? = null,
-        mediaKeyBase64: String? = null,
-    ) = withContext(Dispatchers.IO) {
-        check(!logoutInProgress && activeRoomId == roomId) { "Open the conversation before placing a call" }
+        kind: MessengerCallKind,
+    ): OutgoingCallKeyMaterial = withContext(Dispatchers.IO) {
+        check(!logoutInProgress) { "Secure sign-out is in progress" }
+        val matrixClient = requireClient()
         val room = requireRoom(roomId)
+        try {
         check(room.encryptionState().name == "ENCRYPTED") {
-            "Calls are disabled because this conversation is not end-to-end encrypted"
+            "Calls are disabled because this conversation is not encrypted"
         }
-        check(_peerTrust.value == PeerTrustStatus.VERIFIED) {
-            "Verify this conversation before starting or joining a call"
+        check(room.isDirect()) { "Calls are currently limited to one-to-one conversations" }
+
+        val ownUserId = room.ownUserId()
+        val members = room.activeHumanMemberIds()
+        val peerUserId = members.singleOrNull { it != ownUserId }
+            ?: error("Calls require exactly one other joined or invited member")
+        val verifiedDeviceIds = matrixClient.encryption()
+            .verifiedCrossSignedDeviceIdsForUser(peerUserId)
+        val recipients = verifiedCallKeyRecipients(
+            roomIsEncrypted = true,
+            roomIsDirect = true,
+            roomMemberIds = members,
+            ownUserId = ownUserId,
+            verifiedDeviceIds = verifiedDeviceIds,
+        ) ?: error("Calls require verified peer devices in an encrypted one-to-one room")
+
+        val issuedAtMillis = System.currentTimeMillis()
+        val expiresAtMillis = issuedAtMillis + CALL_INVITE_TTL_MILLIS
+        val matrixSession = matrixClient.session()
+        val credentials = CallAuthClient().createCall(
+            homeserverUrl = matrixSession.homeserverUrl,
+            accessToken = matrixSession.accessToken,
+            roomId = roomId,
+        )
+        val callId = credentials.callId
+        val callKey = ByteArray(CALL_KEY_BYTES).also(SecureRandom()::nextBytes)
+        try {
+            val invite = CallProtocol.encryptedInviteContent(
+                roomId = roomId,
+                callId = callId,
+                kind = kind,
+                callKey = callKey,
+                nowMillis = issuedAtMillis,
+            )
+            val outcome = matrixClient.sendEncryptedToDeviceMessage(
+                eventType = CALL_KEY_EVENT_TYPE,
+                recipients = mapOf(recipients.userId to recipients.deviceIds),
+                content = invite,
+            )
+            check(outcome.failures.isEmpty()) {
+                "Call key delivery failed for one or more verified peer devices"
+            }
+            OutgoingCallKeyMaterial(
+                roomId = roomId,
+                callId = callId,
+                kind = kind,
+                expiresAtMillis = expiresAtMillis,
+                liveKitUrl = credentials.liveKitUrl,
+                liveKitToken = credentials.liveKitToken,
+                callKey = callKey.copyOf(),
+            )
+        } finally {
+            callKey.fill(0)
         }
-        check(expectedDeliveryMemberIdsByRoom[roomId]?.size == 1) {
-            "Calls are currently available only in verified one-to-one conversations"
+        } finally {
+            room.close()
         }
-        val content = CallProtocol.envelope(action, callId, kind, mediaKeyBase64)
-        withSendQueueGate {
-            check(activeRoomId == roomId && !logoutInProgress) { "The conversation changed before the call signal was sent" }
-            room.sendRaw("m.room.message", content)
+    }
+
+    /** Obtain a fresh short-lived media token only after validating the live invitation again. */
+    suspend fun authorizeIncomingSecureCall(signal: MessengerCallSignal): IncomingCallMediaMaterial =
+        withContext(Dispatchers.IO) {
+            check(!logoutInProgress) { "Secure sign-out is in progress" }
+            check(signal.action == dev.friendline.messenger.calls.MessengerCallAction.INVITE) {
+                "This is not a call invitation"
+            }
+            check(signal.expiresAtMillis > System.currentTimeMillis()) { "This call invitation has expired" }
+            val kind = signal.kind ?: error("Call invitation is missing its media type")
+            val matrixClient = requireClient()
+            val room = requireRoom(signal.roomId)
+            try {
+            check(room.encryptionState().name == "ENCRYPTED" && room.isDirect()) {
+                "Calls require an encrypted one-to-one conversation"
+            }
+            val members = room.activeHumanMemberIds().toSet()
+            val ownUserId = room.ownUserId()
+            check(members.size == 2 && ownUserId in members && signal.senderId in members &&
+                ownUserId != signal.senderId) {
+                "The call invitation is not from the other conversation member"
+            }
+            val identity = matrixClient.encryption().userIdentity(signal.senderId, true)
+                ?: error("Verify this contact before joining a call")
+            try {
+                check(!identity.hasVerificationViolation() && identity.isVerified()) {
+                    "Verify this contact before joining a call"
+                }
+            } finally {
+                identity.close()
+            }
+            val callKey = signal.copyCallKey() ?: error("Call invitation has no media key")
+            try {
+                val matrixSession = matrixClient.session()
+                val credentials = CallAuthClient().joinCall(
+                    homeserverUrl = matrixSession.homeserverUrl,
+                    accessToken = matrixSession.accessToken,
+                    roomId = signal.roomId,
+                    callId = signal.callId,
+                )
+                IncomingCallMediaMaterial(
+                    roomId = signal.roomId,
+                    callId = signal.callId,
+                    kind = kind,
+                    expiresAtMillis = signal.expiresAtMillis,
+                    liveKitUrl = credentials.liveKitUrl,
+                    liveKitToken = credentials.liveKitToken,
+                    callKey = callKey.copyOf(),
+                )
+            } finally {
+                callKey.fill(0)
+            }
+            } finally {
+                room.close()
+            }
+        }
+
+    /** Send non-secret call state through the Matrix encrypted room timeline. */
+    suspend fun sendSecureCallControl(
+        roomId: String,
+        callId: String,
+        action: dev.friendline.messenger.calls.MessengerCallAction,
+        kind: MessengerCallKind? = null,
+    ) = withContext(Dispatchers.IO) {
+        check(action != dev.friendline.messenger.calls.MessengerCallAction.INVITE) {
+            "Call invitations must use the verified encrypted to-device channel"
+        }
+        check(!logoutInProgress) { "Secure sign-out is in progress" }
+        val room = requireRoom(roomId)
+        try {
+            check(room.encryptionState().name == "ENCRYPTED" && room.isDirect()) {
+                "Call controls require an encrypted one-to-one conversation"
+            }
+            val envelope = JSONObject(CallProtocol.envelope(action, callId, kind))
+            val timeline = activeTimeline?.takeIf { activeRoomId == roomId } ?: room.timeline()
+            val ownsTimeline = timeline !== activeTimeline
+            val content = timeline.createMessageContent(
+                MessageType.Other(CALL_MESSAGE_TYPE, envelope.getString("body")),
+            ) ?: error("Couldn't prepare encrypted call control")
+            try {
+                val extraContent = JSONObject().put(CALL_CONTENT_KEY, envelope.getJSONObject(CALL_CONTENT_KEY)).toString()
+                timeline.sendWithExtraContent(content, extraContent).destroy()
+            } finally {
+                content.destroy()
+                if (ownsTimeline) timeline.close()
+            }
+        } finally {
+            room.close()
         }
     }
 
@@ -1858,7 +2082,7 @@ class MatrixRepository(context: Context) {
                     try {
                         val send = withSendQueueGate {
                             onQueueAttempt()
-                            withDeliverySnapshotReservation(record.roomId, room) {
+                                withDeliverySnapshotReservation(record.roomId, room, mediaRecordId = record.id) {
                                 trackAttachmentSend(timeline.sendImage(parameters, null, info))
                             }
                         }
@@ -1881,7 +2105,7 @@ class MatrixRepository(context: Context) {
                     try {
                         val send = withSendQueueGate {
                             onQueueAttempt()
-                            withDeliverySnapshotReservation(record.roomId, room) {
+                            withDeliverySnapshotReservation(record.roomId, room, mediaRecordId = record.id) {
                                 trackAttachmentSend(timeline.sendVideo(parameters, null, info))
                             }
                         }
@@ -1898,7 +2122,7 @@ class MatrixRepository(context: Context) {
                     )
                     val send = withSendQueueGate {
                         onQueueAttempt()
-                        withDeliverySnapshotReservation(record.roomId, room) {
+                        withDeliverySnapshotReservation(record.roomId, room, mediaRecordId = record.id) {
                             trackAttachmentSend(timeline.sendAudio(parameters, info))
                         }
                     }
@@ -1914,7 +2138,7 @@ class MatrixRepository(context: Context) {
                     try {
                         val send = withSendQueueGate {
                             onQueueAttempt()
-                            withDeliverySnapshotReservation(record.roomId, room) {
+                        withDeliverySnapshotReservation(record.roomId, room, mediaRecordId = record.id) {
                                 trackAttachmentSend(timeline.sendFile(parameters, info))
                             }
                         }
@@ -2149,10 +2373,29 @@ class MatrixRepository(context: Context) {
                 MessageType.Text(TextMessageContent(body, null)),
             ) ?: throw IllegalStateException("This edit could not be prepared")
             val editedContent = EditedContent.RoomMessage(content)
+            val editKey = deliveryAckKey(roomId, message.eventId)
+            val previousOptimisticBody = optimisticEditBodiesByEvent.put(editKey, body)
             try {
                 withSendQueueGate {
                     timeline.edit(EventOrTransactionId.EventId(message.eventId), editedContent)
                 }
+                val optimisticTargetUpdated = synchronized(timelineMessagesLock) {
+                    val index = timelineMessages.indexOfFirst { it?.eventId == message.eventId }
+                    if (index >= 0) {
+                        val current = checkNotNull(timelineMessages[index])
+                        timelineMessages[index] = current.copy(body = body, isEdited = true)
+                        publishTimelineMessagesLocked()
+                        true
+                    } else {
+                        false
+                    }
+                }
+                optimisticEditTargetsUpdatedByEvent[editKey] = optimisticTargetUpdated
+                refreshEditedMessageBody(roomId, message.eventId, body)
+            } catch (failure: Throwable) {
+                if (previousOptimisticBody == null) optimisticEditBodiesByEvent.remove(editKey, body)
+                else optimisticEditBodiesByEvent.replace(editKey, body, previousOptimisticBody)
+                throw failure
             } finally {
                 editedContent.destroy()
             }
@@ -2171,8 +2414,29 @@ class MatrixRepository(context: Context) {
         }
         val timeline = activeTimeline?.takeIf { activeRoomId == roomId } ?: room.timeline()
         try {
-            withSendQueueGate {
-                timeline.redactEvent(EventOrTransactionId.EventId(message.eventId), null)
+            val redactionKey = deliveryAckKey(roomId, message.eventId)
+            optimisticRedactedEventIds += redactionKey
+            optimisticEditBodiesByEvent.remove(redactionKey)
+            try {
+                withSendQueueGate {
+                    timeline.redactEvent(EventOrTransactionId.EventId(message.eventId), null)
+                }
+                synchronized(timelineMessagesLock) {
+                    val index = timelineMessages.indexOfFirst { it?.eventId == message.eventId }
+                    if (index >= 0) {
+                        val current = checkNotNull(timelineMessages[index])
+                        timelineMessages[index] = current.copy(
+                            body = "Message removed",
+                            canEdit = false,
+                            canRedact = false,
+                            isEdited = false,
+                        )
+                        publishTimelineMessagesLocked()
+                    }
+                }
+            } catch (failure: Throwable) {
+                optimisticRedactedEventIds.remove(redactionKey)
+                throw failure
             }
         } finally {
             if (activeTimeline !== timeline) timeline.close()
@@ -2301,6 +2565,8 @@ class MatrixRepository(context: Context) {
                 _verification.value = null
                 stopReadReceiptRefresh()
                 activeRoomId = null
+                closeCallKeySubscription()
+                closeActiveRoomSendQueueUpdates()
                 val timeline = activeTimeline
                 activeTimeline = null
                 syncStateHandle?.cancel()
@@ -2362,7 +2628,9 @@ class MatrixRepository(context: Context) {
 
     /** Stop background Matrix work without signing out or deleting the encrypted local store. */
     suspend fun close() = withContext(Dispatchers.IO) {
+        recordDebugLifecycleClose("waiting-lock")
         withLifecycleLock {
+        recordDebugLifecycleClose("lock-acquired")
         syncServiceRunning = false
         stopReadReceiptRefresh()
         cancelPendingDataMediaReplay(resetRetryBudget = true)
@@ -2379,11 +2647,14 @@ class MatrixRepository(context: Context) {
         _verification.value = null
         syncStateHandle?.cancel()
         syncStateHandle?.close()
+        closeCallKeySubscription()
         sendQueueStatusHandle?.cancel()
         sendQueueStatusHandle?.close()
         closeSendQueueUpdates()
         syncService?.stop()
+        recordDebugLifecycleClose("sync-stopped")
         activeRoomId = null
+        closeActiveRoomSendQueueUpdates()
         val timeline = activeTimeline
         activeTimeline = null
         timelineListenerHandle?.cancel()
@@ -2398,7 +2669,9 @@ class MatrixRepository(context: Context) {
         failedAckSendHandles.values.forEach { it.close() }
         failedAckSendHandles.clear()
         syncService?.close()
+        recordDebugLifecycleClose("sync-closed")
         client?.close()
+        recordDebugLifecycleClose("client-closed")
         syncStateHandle = null
         sendQueueStatusHandle = null
         timelineListenerHandle = null
@@ -2412,7 +2685,12 @@ class MatrixRepository(context: Context) {
         _connection.value = "Offline"
         _peerTrust.value = PeerTrustStatus.UNKNOWN
         syncServiceRunning = false
+        recordDebugLifecycleClose("complete")
         }
+    }
+
+    private fun recordDebugLifecycleClose(stage: String) {
+        if (BuildConfig.DEBUG) android.util.Log.i("FriendlineLifecycle", "repository close stage=$stage")
     }
 
     private suspend fun buildClient(homeserverUrl: String): Client {
@@ -2427,7 +2705,8 @@ class MatrixRepository(context: Context) {
             .enableAutomaticBackPagination(true)
             .autoEnableCrossSigning(true)
             .slidingSyncVersionBuilder(SlidingSyncVersionBuilder.NATIVE)
-            .roomKeyRecipientStrategy(CollectStrategy.ONLY_TRUSTED_DEVICES)
+            .roomKeyRecipientStrategy(CollectStrategy.IDENTITY_BASED_STRATEGY)
+            .decryptionSettings(DecryptionSettings(TrustRequirement.CROSS_SIGNED))
             .withSearchIndexStore(
                 File(matrixRoot, "search-index").absolutePath,
                 vault.loadOrCreateStoreKey().joinToString("") { byte -> "%02x".format(byte) },
@@ -2443,6 +2722,7 @@ class MatrixRepository(context: Context) {
     private suspend fun startSync(matrixClient: Client) {
         var stage = "install-udt-diagnostic-listener"
         try {
+            installCallKeySubscription(matrixClient)
             if (BuildConfig.DEBUG) {
                 matrixClient.setUtdDelegate(object : UnableToDecryptDelegate {
                     override fun onUtd(info: UnableToDecryptInfo) {
@@ -2469,7 +2749,21 @@ class MatrixRepository(context: Context) {
             closeSendQueueUpdates()
             val updateListener = object : SendQueueRoomUpdateListener {
                 override fun onUpdate(roomId: String, update: RoomSendQueueUpdate) {
-                    observeSendQueueUpdate(roomId, update)
+                    if (activeRoomId == roomId) return
+                    try {
+                        observeSendQueueUpdate(roomId, update)
+                    } catch (error: Throwable) {
+                        if (BuildConfig.DEBUG) {
+                            diagnosticSendQueueUpdateFailures
+                                .computeIfAbsent(roomId) { AtomicInteger() }
+                                .incrementAndGet()
+                            android.util.Log.e(
+                                "FriendlineSendQueue",
+                                "update callback failed type=${update.javaClass.simpleName} " +
+                                    "error=${error.javaClass.simpleName}",
+                            )
+                        }
+                    }
                 }
             }
             sendQueueUpdatesListener = updateListener
@@ -2530,23 +2824,118 @@ class MatrixRepository(context: Context) {
         }
     }
 
+    private fun installCallKeySubscription(matrixClient: Client) {
+        closeCallKeySubscription()
+        val listener = object : ToDeviceMessageListener {
+            override fun onMessage(message: ToDeviceMessage) {
+                if (message.eventType != CALL_KEY_EVENT_TYPE || message.encryptionInfo == null ||
+                    message.content.length > MAX_CALL_INVITE_JSON_CHARS
+                ) return
+                callbackScope.launch {
+                    runCatching { processEncryptedCallInvite(matrixClient, message) }
+                }
+            }
+        }
+        callKeyListener = listener
+        callKeySubscription = runCatching {
+            matrixClient.subscribeToCustomToDeviceMessages(listOf(CALL_KEY_EVENT_TYPE), listener)
+        }.getOrNull()
+        if (callKeySubscription == null) callKeyListener = null
+    }
+
+    private suspend fun processEncryptedCallInvite(matrixClient: Client, message: ToDeviceMessage) {
+        if (logoutInProgress || client !== matrixClient || message.eventType != CALL_KEY_EVENT_TYPE) return
+        val encryptionInfo = message.encryptionInfo ?: return
+        val attestedSender = encryptionInfo.senderId
+        if (attestedSender.isBlank() || encryptionInfo.senderDeviceId.isNullOrBlank() ||
+            encryptionInfo.shieldStateStrict != ShieldState.None
+        ) return
+        val invite = CallProtocol.parseEncryptedInviteContent(attestedSender, message.content) ?: return
+        var room: Room? = null
+        var identity: org.matrix.rustcomponents.sdk.UserIdentity? = null
+        var emitted = false
+        try {
+            val currentUserId = ownUserId ?: matrixClient.userId()
+            val callRoom = matrixClient.getRoom(invite.roomId) ?: return
+            room = callRoom
+            if (callRoom.encryptionState().name != "ENCRYPTED" || !callRoom.isDirect()) return
+            val members = callRoom.activeHumanMemberIds().toSet()
+            if (members.size != 2 || currentUserId !in members || attestedSender !in members) return
+            val verifiedIdentity = matrixClient.encryption().userIdentity(attestedSender, true) ?: return
+            identity = verifiedIdentity
+            if (verifiedIdentity.hasVerificationViolation() || !verifiedIdentity.isVerified()) return
+            if (_callSignals.subscriptionCount.value == 0) return
+            if (!claimCallInviteReplay(invite.senderId, invite.roomId, invite.callId, invite.expiresAtMillis)) return
+            emitted = _callSignals.tryEmit(invite)
+        } catch (_: Exception) {
+            // Fail closed; the key is destroyed below unless it was delivered to the UI flow.
+        } finally {
+            identity?.close()
+            room?.close()
+            if (!emitted) invite.destroy()
+        }
+    }
+
+    private fun claimCallInviteReplay(
+        senderId: String,
+        roomId: String,
+        callId: String,
+        expiresAtMillis: Long,
+    ): Boolean = synchronized(callInviteReplayLock) {
+        val now = System.currentTimeMillis()
+        val iterator = seenCallInvites.entries.iterator()
+        while (iterator.hasNext()) {
+            if (iterator.next().value <= now) iterator.remove()
+        }
+        val replayKey = "$senderId|$roomId|$callId"
+        if (seenCallInvites.containsKey(replayKey)) return@synchronized false
+        while (seenCallInvites.size >= MAX_TRACKED_CALL_INVITES) {
+            val oldest = seenCallInvites.entries.iterator()
+            if (!oldest.hasNext()) break
+            oldest.next()
+            oldest.remove()
+        }
+        seenCallInvites[replayKey] = expiresAtMillis
+        true
+    }
+
+    private fun closeCallKeySubscription() {
+        callKeySubscription?.cancel()
+        callKeySubscription?.close()
+        callKeySubscription = null
+        callKeyListener = null
+        synchronized(callInviteReplayLock) { seenCallInvites.clear() }
+    }
+
     private fun applyTimelineUpdate(roomId: String, update: TimelineDiff, acknowledgements: MutableList<String>) {
+        val editedEventIds = LinkedHashSet<String>()
+        fun project(item: TimelineItem): ChatMessage? = messageFrom(item, roomId, acknowledgements).also { message ->
+            if (message?.eventId != null && message.isRemote && !message.isOwn && message.attachment == null) {
+                // The SDK can expose a newly received edit as a separate timeline
+                // update while retaining the original item's unedited body. Refresh
+                // the local revision history for changed remote text items so the UI
+                // still renders the authoritative latest revision.
+                editedEventIds += message.eventId
+            } else if (message?.isEdited == true && message.eventId != null) {
+                editedEventIds += message.eventId
+            }
+        }
         synchronized(timelineMessagesLock) {
             when (update) {
-                is TimelineDiff.Append -> timelineMessages.addAll(update.values.map { messageFrom(it, roomId, acknowledgements) })
+                is TimelineDiff.Append -> timelineMessages.addAll(update.values.map(::project))
                 TimelineDiff.Clear -> timelineMessages.clear()
-                is TimelineDiff.PushFront -> timelineMessages.add(0, messageFrom(update.value, roomId, acknowledgements))
-                is TimelineDiff.PushBack -> timelineMessages.add(messageFrom(update.value, roomId, acknowledgements))
+                is TimelineDiff.PushFront -> timelineMessages.add(0, project(update.value))
+                is TimelineDiff.PushBack -> timelineMessages.add(project(update.value))
                 TimelineDiff.PopFront -> if (timelineMessages.isNotEmpty()) timelineMessages.removeAt(0)
                 TimelineDiff.PopBack -> if (timelineMessages.isNotEmpty()) timelineMessages.removeAt(timelineMessages.lastIndex)
                 is TimelineDiff.Insert -> {
                     val index = update.index.toInt().coerceIn(0, timelineMessages.size)
-                    timelineMessages.add(index, messageFrom(update.value, roomId, acknowledgements))
+                    timelineMessages.add(index, project(update.value))
                 }
                 is TimelineDiff.Set -> {
                     val index = update.index.toInt()
                     if (index in timelineMessages.indices) {
-                        timelineMessages[index] = messageFrom(update.value, roomId, acknowledgements)
+                        timelineMessages[index] = project(update.value)
                     }
                 }
                 is TimelineDiff.Remove -> {
@@ -2559,10 +2948,55 @@ class MatrixRepository(context: Context) {
                 }
                 is TimelineDiff.Reset -> {
                     timelineMessages.clear()
-                    timelineMessages.addAll(update.values.map { messageFrom(it, roomId, acknowledgements) })
+                    timelineMessages.addAll(update.values.map(::project))
                 }
             }
             publishTimelineMessagesLocked()
+        }
+        editedEventIds.forEach { eventId -> refreshEditedMessageBody(roomId, eventId) }
+    }
+
+    private fun refreshEditedMessageBody(roomId: String, eventId: String, expectedBody: String? = null) {
+        val key = deliveryAckKey(roomId, eventId)
+        if (!editRevisionRefreshScheduled.add(key)) return
+        callbackScope.launch {
+            var timeline: Timeline? = null
+            try {
+                if (logoutInProgress) return@launch
+                val room = requireRoom(roomId)
+                timeline = room.timeline()
+                var latestBody: String? = null
+                val deadline = System.currentTimeMillis() + if (expectedBody == null) 0L else 15_000L
+                do {
+                    val revisions = timeline.editRevisions(eventId)
+                    latestBody = try {
+                        revisions.lastOrNull()?.content?.readableBody()
+                    } finally {
+                        revisions.forEach { it.destroy() }
+                    }
+                    if (latestBody == null || expectedBody == null || latestBody == expectedBody) break
+                    delay(250)
+                } while (System.currentTimeMillis() < deadline)
+                val resolvedBody = latestBody ?: return@launch
+                synchronized(timelineMessagesLock) {
+                    val index = timelineMessages.indexOfFirst { it?.eventId == eventId }
+                    if (index >= 0) {
+                        val message = checkNotNull(timelineMessages[index])
+                        if (message.attachment == null && message.body != "Message removed") {
+                            timelineMessages[index] = message.copy(body = resolvedBody, isEdited = true)
+                            publishTimelineMessagesLocked()
+                        }
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Keep sync responsive if local edit history cannot be read. A later
+                // timeline update can retry the revision projection.
+            } finally {
+                timeline?.close()
+                editRevisionRefreshScheduled.remove(key)
+            }
         }
     }
 
@@ -2649,7 +3083,22 @@ class MatrixRepository(context: Context) {
     }
 
     private fun publishTimelineMessagesLocked() {
-        val current = timelineMessages.filterNotNull()
+        val current = timelineMessages.filterNotNull().map { message ->
+            val eventId = message.eventId
+            val projectionKey = eventId?.let { deliveryAckKey(activeRoomId.orEmpty(), it) }
+            if (projectionKey != null && projectionKey in optimisticRedactedEventIds) {
+                message.copy(body = "Message removed", canEdit = false, canRedact = false, isEdited = false)
+            } else if (eventId != null && message.attachment == null &&
+                optimisticEditBodiesByEvent[deliveryAckKey(activeRoomId.orEmpty(), eventId)] != null
+            ) {
+                val editedBody = checkNotNull(
+                    optimisticEditBodiesByEvent[deliveryAckKey(activeRoomId.orEmpty(), eventId)],
+                )
+                message.copy(body = editedBody, isEdited = true)
+            } else {
+                message
+            }
+        }
         val latestById = current.associateBy(ChatMessage::id)
         val seen = HashSet<String>(current.size)
         _messages.value = current.mapNotNull { message ->
@@ -2659,7 +3108,9 @@ class MatrixRepository(context: Context) {
 
     private fun messageFrom(item: TimelineItem, roomId: String, acknowledgements: MutableList<String>): ChatMessage? {
         val event = item.asEvent() ?: return null
+        var projectionStage = "event"
         return try {
+            projectionStage = "content"
             val msgLike = (event.content as? TimelineItemContent.MsgLike)?.content
             val eventId = (event.eventOrTransactionId as? EventOrTransactionId.EventId)?.eventId
             if (BuildConfig.DEBUG && event.isRemote && eventId != null) {
@@ -2686,6 +3137,62 @@ class MatrixRepository(context: Context) {
                 val direction = if (event.isOwn) "OWN_REMOTE" else "REMOTE"
                 recordDiagnosticTimelineCategory(roomId, eventId, "${direction}_$itemKind")
             }
+            if (BuildConfig.DEBUG && event.isOwn && !event.isRemote) {
+                val localIdentifier = eventId ?:
+                    (event.eventOrTransactionId as? EventOrTransactionId.TransactionId)?.transactionId
+                if (localIdentifier != null) {
+                    val localKind = when (val content = event.content) {
+                        is TimelineItemContent.MsgLike -> when (content.content.kind) {
+                            is MsgLikeKind.Message -> "MESSAGE"
+                            is MsgLikeKind.UnableToDecrypt -> "UTD"
+                            MsgLikeKind.Redacted -> "REDACTED"
+                            else -> "OTHER"
+                        }
+                        else -> "OTHER"
+                    }
+                    recordDiagnosticTimelineCategory(roomId, localIdentifier, "OWN_LOCAL_$localKind")
+                    // Keep diagnostic evidence for the exact projection gates reached. The
+                    // acceptance probe deliberately sends through the repository, so a local
+                    // event that stops projecting must be distinguishable from an ack/control
+                    // event without logging any body, user ID, transaction ID, or event ID.
+                    val contentKind = when (val content = event.content) {
+                        is TimelineItemContent.MsgLike -> when (val kind = content.content.kind) {
+                            is MsgLikeKind.Message -> when (kind.content.msgType) {
+                                is MessageType.Text -> "TEXT"
+                                is MessageType.Image -> "IMAGE"
+                                is MessageType.Video -> "VIDEO"
+                                is MessageType.Audio -> "AUDIO"
+                                is MessageType.File -> "FILE"
+                                is MessageType.Other -> "OTHER"
+                                else -> "NONSTANDARD"
+                            }
+                            is MsgLikeKind.UnableToDecrypt -> "UTD"
+                            MsgLikeKind.Redacted -> "REDACTED"
+                            else -> "NONMESSAGE"
+                        }
+                        else -> "NONMESSAGE"
+                    }
+                    recordDiagnosticTimelineCategory(roomId, localIdentifier, "OWN_LOCAL_TYPE_$contentKind")
+                    if (contentKind in setOf("IMAGE", "VIDEO", "AUDIO", "FILE")) {
+                        recordDiagnosticTimelineCategory(
+                            roomId,
+                            localIdentifier,
+                            if (event.eventOrTransactionId is EventOrTransactionId.TransactionId) {
+                                "OWN_LOCAL_MEDIA_TXN_PRESENT"
+                            } else {
+                                "OWN_LOCAL_MEDIA_TXN_MISSING"
+                            },
+                        )
+                    }
+                    val localSendStateKind = when (event.localSendState) {
+                        is EventSendState.NotSentYet -> "PENDING"
+                        is EventSendState.SendingFailed -> "FAILED"
+                        is EventSendState.Sent -> "SENT"
+                        null -> "NONE"
+                    }
+                    recordDiagnosticTimelineCategory(roomId, localIdentifier, "OWN_LOCAL_STATE_$localSendStateKind")
+                }
+            }
             if (BuildConfig.DEBUG && !event.isOwn && event.isRemote) {
                 val unableToDecrypt = msgLike?.kind as? MsgLikeKind.UnableToDecrypt
                 if (unableToDecrypt != null) {
@@ -2698,8 +3205,60 @@ class MatrixRepository(context: Context) {
                 }
             }
             val messageContent = (msgLike?.kind as? MsgLikeKind.Message)?.content
+            val transactionId = (event.eventOrTransactionId as? EventOrTransactionId.TransactionId)?.transactionId
+            val diagnosticLocalIdentifier = eventId ?: transactionId
+            val sendState = event.localSendState
+            projectionStage = "reconcile-send-state"
+            // A timeline local echo can expose the authoritative server event ID even when
+            // the send-queue observer missed its SentEvent callback. Use only this exact SDK
+            // transaction/event pairing; never infer it from message contents or timestamps.
+            val responseEventId = (sendState as? EventSendState.Sent)?.eventId
+            if (transactionId != null && responseEventId != null) {
+                rememberAcceptedSendEvent(roomId, transactionId, responseEventId)
+                promoteDeliverySnapshot(roomId, transactionId, responseEventId)
+            }
+            val acceptedEventId = transactionId?.let { acceptedSendEventIdsByTransaction[deliveryAckKey(roomId, it)] }
+            if (BuildConfig.DEBUG && event.isOwn && !event.isRemote && diagnosticLocalIdentifier != null) {
+                recordDiagnosticTimelineCategory(roomId, diagnosticLocalIdentifier, "OWN_LOCAL_STAGE_RECONCILED")
+            }
+            val projectedEventId = eventId ?: responseEventId ?: acceptedEventId
+            // Keep exact send-response mappings until their bounded cache eviction.
+            // A remote timeline echo can arrive before its transaction snapshot is
+            // bound (especially for media); removing the mapping here would make a
+            // later snapshot impossible to promote even though SentEvent was observed.
+            if (event.isOwn && transactionId != null &&
+                messageContent?.msgType?.let { it.isDeliveryAckEligible() && it.deliveryAckTarget() == null } == true
+            ) {
+                if (BuildConfig.DEBUG && !event.isRemote && diagnosticLocalIdentifier != null) {
+                    recordDiagnosticTimelineCategory(roomId, diagnosticLocalIdentifier, "OWN_LOCAL_STAGE_RESERVATION")
+                }
+                val isMediaMessage = when (messageContent.msgType) {
+                    is MessageType.Image,
+                    is MessageType.Video,
+                    is MessageType.Audio,
+                    is MessageType.File,
+                    -> true
+                    else -> false
+                }
+                if (!isMediaMessage) bindDeliverySnapshotReservation(
+                    roomId = roomId,
+                    transactionId = transactionId,
+                )?.let { pending ->
+                    appendPendingTextLocalEcho(roomId, transactionId, pending)
+                }
+            }
+            if (BuildConfig.DEBUG && event.isOwn && !event.isRemote && diagnosticLocalIdentifier != null) {
+                recordDiagnosticTimelineCategory(roomId, diagnosticLocalIdentifier, "OWN_LOCAL_STAGE_AFTER_RESERVATION")
+            }
             val customMessage = messageContent?.msgType as? MessageType.Other
             if (customMessage?.msgtype == CALL_MESSAGE_TYPE) {
+                if (BuildConfig.DEBUG && event.isOwn && !event.isRemote) {
+                    val localIdentifier = eventId ?:
+                        (event.eventOrTransactionId as? EventOrTransactionId.TransactionId)?.transactionId
+                    if (localIdentifier != null) {
+                        recordDiagnosticTimelineCategory(roomId, localIdentifier, "OWN_LOCAL_CALL_CONTROL")
+                    }
+                }
                 val senderId = event.sender
                 val incomingEventId = eventId
                 if (!event.isOwn && event.isRemote && incomingEventId != null &&
@@ -2719,7 +3278,17 @@ class MatrixRepository(context: Context) {
                 return null
             }
             val acknowledgedId = messageContent?.msgType?.deliveryAckTarget()
+            if (BuildConfig.DEBUG && event.isOwn && !event.isRemote && diagnosticLocalIdentifier != null) {
+                recordDiagnosticTimelineCategory(roomId, diagnosticLocalIdentifier, "OWN_LOCAL_STAGE_AFTER_ACK_PARSE")
+            }
             if (acknowledgedId != null) {
+                if (BuildConfig.DEBUG && event.isOwn && !event.isRemote) {
+                    val localIdentifier = eventId ?:
+                        (event.eventOrTransactionId as? EventOrTransactionId.TransactionId)?.transactionId
+                    if (localIdentifier != null) {
+                        recordDiagnosticTimelineCategory(roomId, localIdentifier, "OWN_LOCAL_DELIVERY_ACK")
+                    }
+                }
                 if (event.isOwn) {
                     recordOwnDeliveryAck(roomId, acknowledgedId, event.localSendState)
                     observedAckTargetsByRoom.computeIfAbsent(roomId) { ConcurrentHashMap.newKeySet() }
@@ -2735,25 +3304,60 @@ class MatrixRepository(context: Context) {
                 return null
             }
             val attachment = messageContent?.msgType?.chatAttachment()
-            val body = if (attachment != null) {
+            projectionStage = "read-body"
+            val rawBody = if (attachment != null) {
                 messageContent.msgType.attachmentCaption().orEmpty()
             } else {
-                event.content.readableBody() ?: return null
+                event.content.readableBody()
+            }
+            val bodyOverrideEventId = projectedEventId ?: eventId
+            val body = when {
+                attachment != null || bodyOverrideEventId == null -> rawBody
+                else -> {
+                    val key = deliveryAckKey(roomId, bodyOverrideEventId)
+                    val override = optimisticEditBodiesByEvent[key]
+                    if (override != null) {
+                        optimisticEditOverlayProjectionCounts.computeIfAbsent(key) { AtomicInteger() }
+                            .incrementAndGet()
+                    }
+                    override ?: rawBody
+                }
+            }
+            if (BuildConfig.DEBUG && event.isOwn && !event.isRemote && diagnosticLocalIdentifier != null) {
+                recordDiagnosticTimelineCategory(roomId, diagnosticLocalIdentifier, "OWN_LOCAL_STAGE_AFTER_BODY_READ")
+            }
+            if (body == null) {
+                if (BuildConfig.DEBUG && event.isOwn && !event.isRemote) {
+                    val localIdentifier = eventId ?:
+                        (event.eventOrTransactionId as? EventOrTransactionId.TransactionId)?.transactionId
+                    if (localIdentifier != null) {
+                        recordDiagnosticTimelineCategory(roomId, localIdentifier, "OWN_LOCAL_BODY_UNREADABLE")
+                    }
+                }
+                return null
+            }
+            projectionStage = "build-chat-message"
+            if (BuildConfig.DEBUG && event.isOwn && !event.isRemote) {
+                val localIdentifier = eventId ?:
+                    (event.eventOrTransactionId as? EventOrTransactionId.TransactionId)?.transactionId
+                if (localIdentifier != null) {
+                    recordDiagnosticTimelineCategory(roomId, localIdentifier, "OWN_LOCAL_BODY_READABLE")
+                }
             }
             if (!event.isOwn && event.isRemote && eventId != null &&
                 messageContent?.msgType?.isDeliveryAckEligible() == true
             ) {
                 if (recordIncomingEventForAck(roomId, eventId)) acknowledgements += eventId
             }
-            val sendState = event.localSendState
             val state = when (sendState) {
                 is EventSendState.NotSentYet -> if (_connection.value == "Connected") "Sending" else "Queued"
                 is EventSendState.SendingFailed -> if (sendState.isRecoverable) "Retry needed" else "Not sent"
-                is EventSendState.Sent -> if (eventId != null) deliveryStateFor(roomId, eventId) else "Sent"
-                null -> if (eventId != null) deliveryStateFor(roomId, eventId) else "Sent"
+                is EventSendState.Sent -> if (projectedEventId != null) deliveryStateFor(roomId, projectedEventId) else "Sent"
+                null -> if (projectedEventId != null) deliveryStateFor(roomId, projectedEventId) else "Sent"
             }
             val replyTo = msgLike?.inReplyTo?.eventId()
-            val reactions = msgLike?.reactions.orEmpty().map { reaction ->
+            // SDK 26.09.28 moved aggregated reaction summaries onto EventTimelineItem.
+            val reactions = event.reactions.map { reaction ->
                 ReactionSummary(
                     key = reaction.key,
                     count = reaction.senders.size,
@@ -2763,24 +3367,43 @@ class MatrixRepository(context: Context) {
             val hasBeenRead = event.isOwn && event.readReceipts.keys.any { it != ownUserId }
             recordReadReceiptDiagnostic(eventId, event.isOwn, event.readReceipts.keys.any { it != ownUserId }, hasBeenRead)
             ChatMessage(
-                id = eventId ?: (event.eventOrTransactionId as? EventOrTransactionId.TransactionId)?.transactionId.orEmpty(),
-                eventId = eventId,
-                isRemote = event.isRemote,
+                id = projectedEventId ?: transactionId.orEmpty(),
+                eventId = projectedEventId,
+                isRemote = event.isRemote || responseEventId != null || acceptedEventId != null,
                 sender = event.sender,
                 body = body,
                 timestampMillis = event.timestamp.toLong(),
                 isOwn = event.isOwn,
                 deliveryState = state,
+                deliveryMemberDetails = if (event.isOwn && projectedEventId != null) {
+                    deliveryMemberDetailsFor(roomId, projectedEventId)
+                } else {
+                    emptyList()
+                },
                 canRetry = (sendState as? EventSendState.SendingFailed)?.isRecoverable == true,
-                canReply = event.canBeRepliedTo && eventId != null,
-                canEdit = event.isOwn && event.isRemote && event.isEditable &&
+                canReply = event.canBeRepliedTo && projectedEventId != null,
+                canEdit = event.isOwn && (event.isRemote || responseEventId != null) && event.isEditable &&
                     messageContent?.msgType is MessageType.Text,
-                canRedact = event.isOwn && event.isRemote && eventId != null && messageContent != null,
+                isEdited = messageContent?.isEdited == true,
+                canRedact = event.isOwn && projectedEventId != null && messageContent != null,
                 replyToEventId = replyTo,
                 reactions = reactions,
                 hasBeenRead = hasBeenRead,
                 attachment = attachment,
             )
+        } catch (failure: Throwable) {
+            if (BuildConfig.DEBUG && event.isOwn && !event.isRemote) {
+                val localIdentifier = (event.eventOrTransactionId as? EventOrTransactionId.TransactionId)?.transactionId
+                    ?: (event.eventOrTransactionId as? EventOrTransactionId.EventId)?.eventId
+                if (localIdentifier != null) {
+                    recordDiagnosticTimelineCategory(roomId, localIdentifier, "OWN_LOCAL_PROJECTION_ERROR_$projectionStage")
+                }
+                android.util.Log.e(
+                    "FriendlineTimeline",
+                    "local event projection failed stage=$projectionStage error=${failure.javaClass.simpleName}",
+                )
+            }
+            throw failure
         } finally {
             event.destroy()
         }
@@ -2979,24 +3602,162 @@ class MatrixRepository(context: Context) {
     private fun deliveryAckKey(roomId: String, eventId: String): String = "$roomId\u0000$eventId"
 
     private fun observeSendQueueUpdate(roomId: String, update: RoomSendQueueUpdate) {
+        if (BuildConfig.DEBUG) {
+            val kind = when (update) {
+                is RoomSendQueueUpdate.NewLocalEvent -> "local"
+                is RoomSendQueueUpdate.SentEvent -> "sent"
+                is RoomSendQueueUpdate.SendError -> "error"
+                else -> null
+            }
+            if (kind != null) {
+                diagnosticSendQueueUpdateCounts
+                    .computeIfAbsent(roomId) { ConcurrentHashMap() }
+                    .computeIfAbsent(kind) { AtomicInteger() }
+                    .incrementAndGet()
+            }
+        }
         when (update) {
-            is RoomSendQueueUpdate.NewLocalEvent -> bindDeliverySnapshotReservation(roomId, update.transactionId)
-            is RoomSendQueueUpdate.SentEvent -> promoteDeliverySnapshot(roomId, update.transactionId, update.eventId)
+            // This callback exposes only a transaction ID, not the event's message
+            // type. Do not bind an in-flight delivery snapshot here: an older ACK or
+            // control event can be reported while a later text/media enqueue owns the
+            // reservation. The typed timeline projection below is the first safe place
+            // to bind the reservation to its exact transaction ID.
+            is RoomSendQueueUpdate.NewLocalEvent -> Unit
+            is RoomSendQueueUpdate.SentEvent -> {
+                rememberAcceptedSendEvent(roomId, update.transactionId, update.eventId)
+                promoteDeliverySnapshot(roomId, update.transactionId, update.eventId)
+                promoteTimelineLocalEcho(roomId, update.transactionId, update.eventId)
+            }
             is RoomSendQueueUpdate.CancelledLocalEvent -> discardPendingDeliverySnapshot(roomId, update.transactionId)
             is RoomSendQueueUpdate.ReplacedLocalEvent -> discardPendingDeliverySnapshot(roomId, update.transactionId)
             else -> Unit
         }
     }
 
-    private fun bindDeliverySnapshotReservation(roomId: String, transactionId: String) {
-        synchronized(deliverySnapshotReservationLock) {
-            val reservation = activeDeliverySnapshotReservation ?: return
-            if (reservation.roomId != roomId) return
-            if (!reservation.abandoned && reservation.expectedMembers != null) {
-                persistPendingDeliverySnapshot(roomId, transactionId, reservation.expectedMembers)
-            }
-            activeDeliverySnapshotReservation = null
+    private fun rememberAcceptedSendEvent(roomId: String, transactionId: String, eventId: String) {
+        val key = deliveryAckKey(roomId, transactionId)
+        acceptedSendEventIdsByTransaction[key] = eventId
+        if (acceptedSendEventIdsByTransaction.size > 512) {
+            acceptedSendEventIdsByTransaction.keys.take(acceptedSendEventIdsByTransaction.size - 512)
+                .forEach(acceptedSendEventIdsByTransaction::remove)
         }
+    }
+
+    /**
+     * The SDK send response is authoritative proof that the homeserver accepted the event.
+     * Reconcile the optimistic row immediately even if the subsequent /sync timeline echo is
+     * delayed or omitted by an SDK diff. The later event sync replaces this projection normally.
+     */
+    private fun promoteTimelineLocalEcho(roomId: String, transactionId: String, eventId: String) {
+        synchronized(timelineMessagesLock) {
+            if (logoutInProgress || activeRoomId != roomId) return
+            val index = timelineMessages.indexOfFirst { message ->
+                message?.isOwn == true && message.id == transactionId && message.eventId == null
+            }
+            if (index < 0) return
+            val message = checkNotNull(timelineMessages[index])
+            timelineMessages[index] = promoteLocalMessageWithEditOverride(
+                roomId = roomId,
+                message = message,
+                transactionId = transactionId,
+                eventId = eventId,
+                deliveryState = deliveryStateFor(roomId, eventId, "Sent"),
+            ) ?: return
+            publishTimelineMessagesLocked()
+        }
+    }
+
+    private fun appendPendingTextLocalEcho(
+        roomId: String,
+        transactionId: String,
+        pending: PendingLocalTextEcho,
+    ) {
+        if (pending.sender.isBlank() || pending.body.isBlank()) return
+        synchronized(timelineMessagesLock) {
+            if (logoutInProgress || activeRoomId != roomId) return
+            if (timelineMessages.any { it?.id == transactionId }) return
+            val localEcho = ChatMessage(
+                id = transactionId,
+                eventId = null,
+                isRemote = false,
+                sender = pending.sender,
+                body = pending.body,
+                timestampMillis = pending.timestampMillis,
+                isOwn = true,
+                deliveryState = if (_connection.value == "Connected") "Sending" else "Queued",
+                replyToEventId = pending.replyToEventId,
+            )
+            val acceptedEventId = acceptedSendEventIdsByTransaction[deliveryAckKey(roomId, transactionId)]
+            timelineMessages += if (acceptedEventId == null) {
+                localEcho
+            } else {
+                promoteLocalMessageWithEditOverride(
+                    roomId = roomId,
+                    message = localEcho,
+                    transactionId = transactionId,
+                    eventId = acceptedEventId,
+                    deliveryState = deliveryStateFor(roomId, acceptedEventId, "Sent"),
+                ) ?: localEcho
+            }
+            publishTimelineMessagesLocked()
+        }
+    }
+
+    private fun promoteLocalMessageWithEditOverride(
+        roomId: String,
+        message: ChatMessage,
+        transactionId: String,
+        eventId: String,
+        deliveryState: String,
+    ): ChatMessage? {
+        val promoted = promoteAcceptedLocalMessage(message, transactionId, eventId, deliveryState) ?: return null
+        val editedBody = optimisticEditBodiesByEvent[deliveryAckKey(roomId, eventId)]
+            ?: return promoted
+        return promoted.copy(body = editedBody, isEdited = true)
+    }
+
+    private fun bindDeliverySnapshotReservation(
+        roomId: String,
+        transactionId: String,
+        mediaRecordId: String? = null,
+    ): PendingLocalTextEcho? {
+        var pendingLocalTextEcho: PendingLocalTextEcho? = null
+        var expectedMembersToPersist: Set<String>? = null
+        synchronized(deliverySnapshotReservationLock) {
+            val reservation = if (mediaRecordId != null) {
+                mediaDeliverySnapshotReservations.remove(deliveryAckKey(roomId, mediaRecordId))
+            } else {
+                activeDeliverySnapshotReservation?.takeIf {
+                    it.roomId == roomId && it.mediaRecordId == null
+                }
+            } ?: return null
+            if (reservation.roomId != roomId || reservation.mediaRecordId != mediaRecordId) return null
+            pendingLocalTextEcho = reservation.pendingLocalTextEcho
+            if (BuildConfig.DEBUG) {
+                android.util.Log.i(
+                    "FriendlineAckSnapshot",
+                    "bind mediaReservation=${reservation.mediaRecordId != null} " +
+                        "snapshotKnown=${reservation.expectedMembers != null} " +
+                        "recipientCount=${reservation.expectedMembers?.size ?: 0}",
+                )
+            }
+            if (!reservation.abandoned && reservation.expectedMembers != null) {
+                expectedMembersToPersist = reservation.expectedMembers
+            }
+            if (mediaRecordId == null) activeDeliverySnapshotReservation = null
+        }
+        // Journal persistence refreshes the visible delivery projection, which takes
+        // timelineMessagesLock. Never acquire it while holding the reservation lock:
+        // timeline projection can bind a reservation while it already holds that lock.
+        expectedMembersToPersist?.let { expectedMembers ->
+            persistPendingDeliverySnapshot(roomId, transactionId, expectedMembers)
+            // The SDK can publish SentEvent before the matching NewLocalEvent is
+            // observed (notably for media sends). In that order the first promotion
+            // sees no snapshot; reconcile again immediately after binding it.
+            acceptedSendEventIdsByTransaction[deliveryAckKey(roomId, transactionId)]
+                ?.let { eventId -> promoteDeliverySnapshot(roomId, transactionId, eventId) }
+        }
+        return pendingLocalTextEcho
     }
 
     private fun persistPendingDeliverySnapshot(roomId: String, transactionId: String, expectedMembers: Set<String>) {
@@ -3455,8 +4216,55 @@ class MatrixRepository(context: Context) {
             acknowledgedRecipientCount = record?.acknowledgedMembers?.size ?: 0,
             provisionalAcknowledgementCount = record?.provisionalAcknowledgedMembers?.size ?: 0,
             remoteAckMessageCount = remoteAckMessageCounts[roomId]?.get() ?: 0,
+            sendQueueUpdatesObserverInstalled = sendQueueUpdatesHandle != null,
+            activeSnapshotReservation = synchronized(deliverySnapshotReservationLock) {
+                activeDeliverySnapshotReservation?.abandoned == false
+            },
         )
     }
+
+    internal suspend fun editRevisionDiagnosticForTest(
+        roomId: String,
+        eventId: String,
+        expectedBody: String,
+    ): String = withContext(Dispatchers.IO) {
+        val room = requireRoom(roomId)
+        val timeline = activeTimeline?.takeIf { activeRoomId == roomId } ?: room.timeline()
+        try {
+            val revisions = timeline.editRevisions(eventId)
+            try {
+                val containsExpectedBody = revisions.any { it.content.readableBody() == expectedBody }
+                val latestContainsExpectedBody = revisions.lastOrNull()?.content?.readableBody() == expectedBody
+                val optimisticOverlayPresent = optimisticEditBodiesByEvent[
+                    deliveryAckKey(roomId, eventId)
+                ] == expectedBody
+                val optimisticTargetUpdated = optimisticEditTargetsUpdatedByEvent[
+                    deliveryAckKey(roomId, eventId)
+                ] == true
+                val overlayProjectionCount = optimisticEditOverlayProjectionCounts[
+                    deliveryAckKey(roomId, eventId)
+                ]?.get() ?: 0
+                "${revisions.size}:$containsExpectedBody:$latestContainsExpectedBody:" +
+                    "$optimisticOverlayPresent:$optimisticTargetUpdated:$overlayProjectionCount"
+            } finally {
+                revisions.forEach { it.destroy() }
+            }
+        } finally {
+            if (activeTimeline !== timeline) timeline.close()
+        }
+    }
+
+    internal fun sendPipelineDiagnosticSnapshot(roomId: String): String = listOf(
+        sendQueuesEnabled == true,
+        syncServiceRunning,
+        sendQueueStatusHandle != null,
+        sendQueueUpdatesHandle != null,
+        _connection.value,
+        diagnosticSendQueueUpdateCounts[roomId]?.get("local")?.get() ?: 0,
+        diagnosticSendQueueUpdateCounts[roomId]?.get("sent")?.get() ?: 0,
+        diagnosticSendQueueUpdateCounts[roomId]?.get("error")?.get() ?: 0,
+        diagnosticSendQueueUpdateFailures[roomId]?.get() ?: 0,
+    ).joinToString("|")
 
     private fun recordRemoteAckMessageObserved(roomId: String) {
         remoteAckMessageCounts.computeIfAbsent(roomId) { AtomicInteger() }.incrementAndGet()
@@ -3506,7 +4314,13 @@ class MatrixRepository(context: Context) {
                 val message = timelineMessages[index] ?: return@forEach
                 if (message.isOwn && message.eventId != null) {
                     val status = deliveryStateFor(roomId, message.eventId, message.deliveryState)
-                    if (status != message.deliveryState) timelineMessages[index] = message.copy(deliveryState = status)
+                    val memberDetails = deliveryMemberDetailsFor(roomId, message.eventId)
+                    if (status != message.deliveryState || memberDetails != message.deliveryMemberDetails) {
+                        timelineMessages[index] = message.copy(
+                            deliveryState = status,
+                            deliveryMemberDetails = memberDetails,
+                        )
+                    }
                 }
             }
             publishTimelineMessagesLocked()
@@ -3522,6 +4336,12 @@ class MatrixRepository(context: Context) {
             fallback = fallback,
             legacyDelivered = record.delivered,
         )
+    }
+
+    private fun deliveryMemberDetailsFor(roomId: String, eventId: String): List<DeliveryMemberStatus> {
+        val record = getDeliveryAckRecord(roomId, eventId) ?: return emptyList()
+        if (!record.snapshotKnown || record.expectedMembers.size <= 1) return emptyList()
+        return deliveryMemberStatuses(record.expectedMembers, record.acknowledgedMembers)
     }
 
     private suspend fun getSearchService(): SearchService {
@@ -3647,6 +4467,7 @@ class MatrixRepository(context: Context) {
             verificationController = controller
             controller.setDelegate(object : SessionVerificationControllerDelegate {
             override fun didReceiveVerificationRequest(details: org.matrix.rustcomponents.sdk.SessionVerificationRequestDetails) {
+                recordVerificationCallback("request")
                 verificationWasInitiatedHere = false
                 val userId = details.senderProfile.userId
                 val deviceName = details.deviceDisplayName ?: details.deviceId
@@ -3659,6 +4480,7 @@ class MatrixRepository(context: Context) {
             }
 
             override fun didAcceptVerificationRequest() {
+                recordVerificationCallback("accepted")
                 updateVerificationProgress()
                 // Both the requester and accepter reach Ready. Only the requester starts
                 // SAS; the accepter waits for the SDK to receive and accept the Start event.
@@ -3672,10 +4494,12 @@ class MatrixRepository(context: Context) {
             }
 
             override fun didStartSasVerification() {
+                recordVerificationCallback("sas-started")
                 updateVerificationProgress()
             }
 
             override fun didReceiveVerificationData(data: SessionVerificationData) {
+                recordVerificationCallback("sas-received")
                 val sas = try {
                     when (data) {
                         is SessionVerificationData.Emojis -> data.emojis.joinToString("  ·  ") { emoji ->
@@ -3699,16 +4523,19 @@ class MatrixRepository(context: Context) {
             }
 
             override fun didFail() {
+                recordVerificationCallback("failed")
                 updateVerificationTerminal(DeviceVerificationStatus.FAILED, "Verification couldn't be completed.")
             }
 
             override fun didCancel() {
+                recordVerificationCallback("cancelled")
                 pendingVerificationRequest = null
                 verificationWasInitiatedHere = false
                 updateVerificationTerminal(DeviceVerificationStatus.CANCELLED)
             }
 
             override fun didFinish() {
+                recordVerificationCallback("finished")
                 pendingVerificationRequest = null
                 verificationWasInitiatedHere = false
                 updateVerificationTerminal(DeviceVerificationStatus.VERIFIED)
@@ -3779,18 +4606,67 @@ class MatrixRepository(context: Context) {
      * unresolved reservation becomes discard-only; a late callback is never attributed to
      * the next message.
      */
+    private suspend fun joinedHumanDeliveryCandidates(room: Room): List<DeliveryRecipientCandidate> {
+        val iterator = room.members()
+        return try {
+            buildList {
+                while (true) {
+                    val chunk = iterator.nextChunk(64u) ?: break
+                    addAll(chunk.map { member ->
+                        DeliveryRecipientCandidate(
+                            userId = member.userId,
+                            isJoined = member.membership is MembershipState.Join,
+                            isServiceMember = member.isServiceMember,
+                        )
+                    })
+                }
+            }
+        } finally {
+            iterator.close()
+        }
+    }
+
     private suspend fun <T> withDeliverySnapshotReservation(
         roomId: String,
         room: Room,
+        mediaRecordId: String? = null,
+        pendingLocalTextEcho: PendingLocalTextEcho? = null,
         enqueue: suspend () -> T,
     ): T {
-        if (sendQueueUpdatesHandle == null) return enqueue()
-
         val expectedMembers = runCatching {
             val senderId = checkNotNull(ownUserId)
             snapshotJoinedDeliveryRecipients(joinedHumanDeliveryCandidates(room), senderId)
         }.getOrNull()
-        val reservation = DeliverySnapshotReservation(roomId, expectedMembers)
+        if (BuildConfig.DEBUG) {
+            android.util.Log.i(
+                "FriendlineAckSnapshot",
+                "reserve media=${mediaRecordId != null} snapshotKnown=${expectedMembers != null} " +
+                    "recipientCount=${expectedMembers?.size ?: 0}",
+            )
+        }
+        val reservation = DeliverySnapshotReservation(
+            roomId = roomId,
+            expectedMembers = expectedMembers,
+            mediaRecordId = mediaRecordId,
+            pendingLocalTextEcho = pendingLocalTextEcho,
+        )
+        if (mediaRecordId != null) {
+            val key = deliveryAckKey(roomId, mediaRecordId)
+            check(mediaDeliverySnapshotReservations.putIfAbsent(key, reservation) == null) {
+                "This media item already has a delivery snapshot reservation"
+            }
+            try {
+                val result = enqueue()
+                callbackScope.launch {
+                    delay(DELIVERY_MEDIA_SNAPSHOT_RESERVATION_TTL_MS)
+                    mediaDeliverySnapshotReservations.remove(key, reservation)
+                }
+                return result
+            } catch (failure: Throwable) {
+                mediaDeliverySnapshotReservations.remove(key, reservation)
+                throw failure
+            }
+        }
         val installed = synchronized(deliverySnapshotReservationLock) {
             if (activeDeliverySnapshotReservation != null) {
                 // Do not let a later send steal an unresolved transaction callback.
@@ -3827,9 +4703,18 @@ class MatrixRepository(context: Context) {
         sendQueueUpdatesHandle?.close()
         sendQueueUpdatesHandle = null
         sendQueueUpdatesListener = null
+        closeActiveRoomSendQueueUpdates()
         synchronized(deliverySnapshotReservationLock) {
             activeDeliverySnapshotReservation = null
         }
+        mediaDeliverySnapshotReservations.clear()
+    }
+
+    private fun closeActiveRoomSendQueueUpdates() {
+        activeRoomSendQueueUpdatesHandle?.cancel()
+        activeRoomSendQueueUpdatesHandle?.close()
+        activeRoomSendQueueUpdatesHandle = null
+        activeRoomSendQueueUpdatesListener = null
     }
 
     /**
@@ -4269,20 +5154,39 @@ class MatrixRepository(context: Context) {
             } else {
                 null
             }
+            val candidate = findPendingMediaRecord(
+                roomId = roomId,
+                identity = identity,
+                pendingMediaRecordId = pendingMediaRecordId,
+                transactionId = transactionId,
+                eventId = eventId,
+                localCreatedAtMillis = localCreatedAt,
+            )
+            if (!event.isRemote && transactionId != null && candidate != null) {
+                // Some native attachment sends surface their local echo before the send-queue
+                // observer reports NewLocalEvent. Bind the same pre-send recipient snapshot
+                // from this event only after matching it to our durable media record.
+                bindDeliverySnapshotReservation(
+                    roomId = roomId,
+                    transactionId = transactionId,
+                    mediaRecordId = candidate.id,
+                )
+                updatePendingMediaRecord(
+                    candidate.copy(transactionId = transactionId, eventId = eventId ?: candidate.eventId),
+                )
+            }
             return callbackScope.launch {
                 var retainedSendHandle = false
                 try {
                     if (logoutInProgress) return@launch
-                    val candidate = findPendingMediaRecord(
-                        roomId = roomId,
-                        identity = identity,
-                        pendingMediaRecordId = pendingMediaRecordId,
-                        transactionId = transactionId,
-                        eventId = eventId,
-                        localCreatedAtMillis = localCreatedAt,
-                    ) ?: return@launch
+                    val candidate = candidate ?: return@launch
                     if (isSent) {
                         markPendingMediaSent(candidate.id, transactionId, eventId)
+                        val sentEventId = eventId ?: candidate.eventId
+                        val sentTransactionId = transactionId ?: candidate.transactionId
+                        if (sentEventId != null && sentTransactionId != null) {
+                            promoteDeliverySnapshot(roomId, sentTransactionId, sentEventId)
+                        }
                     } else if (transactionId != null || eventId != null) {
                         updatePendingMediaRecord(candidate.copy(transactionId = transactionId, eventId = eventId))
                         if (recoverableSendHandle != null) {
@@ -4606,26 +5510,6 @@ class MatrixRepository(context: Context) {
             runCatching { observer.handle.close() }
             runCatching { observer.timeline.close() }
         }
-    private suspend fun joinedHumanDeliveryCandidates(room: Room): List<DeliveryRecipientCandidate> {
-        val iterator = room.members()
-        return try {
-            buildList {
-                while (true) {
-                    val chunk = iterator.nextChunk(64u) ?: break
-                    addAll(chunk.map { member ->
-                        DeliveryRecipientCandidate(
-                            userId = member.userId,
-                            isJoined = member.membership is MembershipState.Join,
-                            isServiceMember = member.isServiceMember,
-                        )
-                    })
-                }
-            }
-        } finally {
-            iterator.close()
-        }
-    }
-
         pendingMediaObservers.clear()
     }
 
@@ -4966,9 +5850,12 @@ class MatrixRepository(context: Context) {
         const val MEDIA_EVENT_MATCH_WINDOW_MS = 5L * 60L * 1000L
         const val PENDING_MEDIA_SNAPSHOT_TIMEOUT_MS = 10_000L
         const val DELIVERY_SNAPSHOT_BIND_GRACE_MS = 100L
+        const val DELIVERY_MEDIA_SNAPSHOT_RESERVATION_TTL_MS = 15L * 60L * 1000L
         const val PROVISIONAL_ACK_TTL_MS = 24L * 60L * 60L * 1000L
         const val MAX_PROVISIONAL_ACK_TARGETS = 256
         const val MAX_PROVISIONAL_ACK_SENDERS_PER_TARGET = 32
+        const val MAX_TRACKED_CALL_INVITES = 256
+        const val MAX_CALL_INVITE_JSON_CHARS = 4_096
         const val VERIFICATION_IDENTITY_WAIT_TIMEOUT_MS = 20_000L
         const val VERIFICATION_IDENTITY_POLL_MS = 1_000L
         const val PEER_TRUST_REFRESH_TIMEOUT_MS = 60_000L
@@ -5003,7 +5890,15 @@ class MatrixRepository(context: Context) {
     private data class DeliverySnapshotReservation(
         val roomId: String,
         val expectedMembers: Set<String>?,
+        val mediaRecordId: String? = null,
+        val pendingLocalTextEcho: PendingLocalTextEcho? = null,
         var abandoned: Boolean = false,
+    )
+    private data class PendingLocalTextEcho(
+        val sender: String,
+        val body: String,
+        val timestampMillis: Long,
+        val replyToEventId: String?,
     )
     private data class PendingMediaRecord(
         val id: String,

@@ -22,9 +22,18 @@ import dev.friendline.messenger.data.MatrixRepository
 import dev.friendline.messenger.data.FriendAddressQrPayload
 import dev.friendline.messenger.data.PendingVoiceNoteStillQueuedException
 import dev.friendline.messenger.data.PeerTrustStatus
+import dev.friendline.messenger.calls.IncomingCallMediaMaterial
+import dev.friendline.messenger.calls.LiveKitE2eeCallSession
+import dev.friendline.messenger.calls.MessengerCallAction
+import dev.friendline.messenger.calls.MessengerCallKind
+import dev.friendline.messenger.calls.MessengerCallSignal
+import dev.friendline.messenger.calls.OutgoingCallKeyMaterial
+import io.livekit.android.room.track.VideoTrack
+import io.livekit.android.renderer.TextureViewRenderer
 import dev.friendline.messenger.push.PushRegistrationStatus
 import dev.friendline.messenger.BuildConfig
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -74,6 +83,7 @@ data class MessengerUiState(
     val searchResults: List<MessageSearchHit> = emptyList(),
     val searchHasMore: Boolean = false,
     val searchLoading: Boolean = false,
+    val navigationTargetEventId: String? = null,
     val readReceiptsEnabled: Boolean = false,
     val pushNotificationsEnabled: Boolean = false,
     val pushRegistrationStatus: PushRegistrationStatus = PushRegistrationStatus.NOT_ENABLED,
@@ -83,7 +93,15 @@ data class MessengerUiState(
     val currentRoomTitle: String = "",
     val currentRoomEncrypted: Boolean = false,
     val currentRoomIsGroup: Boolean = false,
-    val navigationTargetEventId: String? = null,
+    val incomingCall: MessengerCallSignal? = null,
+    val callBusy: Boolean = false,
+    val callConnected: Boolean = false,
+    val activeCallKind: MessengerCallKind? = null,
+    val activeCallId: String? = null,
+    val callPeerAccepted: Boolean = false,
+    val callMicrophoneEnabled: Boolean = false,
+    val callCameraEnabled: Boolean = false,
+    val remoteVideoTrack: VideoTrack? = null,
     val showNewConversation: Boolean = false,
     val error: String? = null,
 )
@@ -111,6 +129,10 @@ class MessengerViewModel(context: Context) : ViewModel() {
     private var audioLoadJob: Job? = null
     private var audioProgressJob: Job? = null
     private var audioPlaybackGeneration = 0L
+    private var callSession: LiveKitE2eeCallSession? = null
+    private var callOperationJob: Job? = null
+    private var remoteVideoTrackJob: Job? = null
+    private val earlyCallControls = LinkedHashMap<String, MessengerCallAction>()
 
     init {
         viewModelScope.launch {
@@ -151,6 +173,47 @@ class MessengerViewModel(context: Context) : ViewModel() {
         }
         viewModelScope.launch {
             repository.pushRegistrationStatus.collect { value -> _state.update { it.copy(pushRegistrationStatus = value) } }
+        }
+        viewModelScope.launch {
+            repository.callSignals.collect { signal ->
+                val current = _state.value
+                if (signal.action != MessengerCallAction.INVITE && signal.senderId != current.userId &&
+                    (signal.callId == current.activeCallId || current.activeCallId == null && current.callBusy)
+                ) {
+                    if (current.activeCallId == null && current.callBusy) {
+                        earlyCallControls[signal.callId] = signal.action
+                        while (earlyCallControls.size > 8) earlyCallControls.remove(earlyCallControls.keys.first())
+                    }
+                    when {
+                        signal.callId != current.activeCallId -> Unit
+                        signal.action == MessengerCallAction.ACCEPT -> {
+                            _state.update { it.copy(callPeerAccepted = true) }
+                            enableOutgoingCallMedia()
+                        }
+                        signal.action == MessengerCallAction.DECLINE || signal.action == MessengerCallAction.HANGUP ->
+                            endSecureCall(notifyPeer = false)
+                        else -> Unit
+                    }
+                    signal.destroy()
+                } else if (signal.action != MessengerCallAction.INVITE || signal.expiresAtMillis <= System.currentTimeMillis()) {
+                    signal.destroy()
+                } else if (!_state.value.callBusy && !logoutRequested) {
+                    _state.update { old ->
+                        old.incomingCall?.destroy()
+                        old.copy(incomingCall = signal)
+                    }
+                    viewModelScope.launch {
+                        val remaining = signal.expiresAtMillis - System.currentTimeMillis()
+                        delay(remaining.coerceAtLeast(0))
+                        _state.update { old ->
+                            if (old.incomingCall === signal) {
+                                signal.destroy()
+                                old.copy(incomingCall = null)
+                            } else old
+                        }
+                    }
+                } else signal.destroy()
+            }
         }
     }
 
@@ -273,6 +336,10 @@ class MessengerViewModel(context: Context) : ViewModel() {
     }
 
     fun openConversation(roomId: String) {
+        openConversation(roomId, focusEventId = null)
+    }
+
+    private fun openConversation(roomId: String, focusEventId: String?) {
         val beforeOpen = _state.value
         if (beforeOpen.currentRoomId != null && beforeOpen.currentRoomId != roomId &&
             !beforeOpen.isSendingVoiceNote &&
@@ -299,6 +366,7 @@ class MessengerViewModel(context: Context) : ViewModel() {
                     currentRoomTitle = conversation?.title ?: "Private conversation",
                     currentRoomEncrypted = conversation?.isEncrypted == true,
                     currentRoomIsGroup = conversation?.isGroup == true,
+                    navigationTargetEventId = null,
                 )
             }
             runCatching {
@@ -320,6 +388,7 @@ class MessengerViewModel(context: Context) : ViewModel() {
                             isBusy = false,
                             currentRoomId = null,
                             currentRoomIsGroup = false,
+                            navigationTargetEventId = null,
                             error = "Couldn't open this conversation. Try again after syncing.",
                         )
                     }
@@ -342,10 +411,6 @@ class MessengerViewModel(context: Context) : ViewModel() {
                     _state.update {
                         it.copy(
                             isBusy = false,
-        openConversation(roomId, focusEventId = null)
-    }
-
-    private fun openConversation(roomId: String, focusEventId: String?) {
                             error = "Couldn't join this verification channel. Confirm it's from someone in an existing encrypted conversation, then sync and try again.",
                         )
                     }
@@ -353,7 +418,191 @@ class MessengerViewModel(context: Context) : ViewModel() {
         }
     }
 
+    fun startSecureCall(kind: MessengerCallKind) {
+        val roomId = _state.value.currentRoomId ?: return
+        if (logoutRequested || !_state.value.currentRoomEncrypted || _state.value.currentRoomIsGroup || _state.value.callBusy) return
+        callOperationJob?.cancel()
+        _state.update { it.copy(callBusy = true, callConnected = false, activeCallKind = null, activeCallId = null, callPeerAccepted = false, callMicrophoneEnabled = false, callCameraEnabled = false, error = null) }
+        callOperationJob = viewModelScope.launch {
+            var material: OutgoingCallKeyMaterial? = null
+            var opened: LiveKitE2eeCallSession? = null
+            try {
+                material = repository.startSecureCall(roomId, kind)
+                val earlyAction = earlyCallControls.remove(material.callId)
+                check(earlyAction != MessengerCallAction.DECLINE && earlyAction != MessengerCallAction.HANGUP) {
+                    "The contact declined or ended the call"
+                }
+                _state.update {
+                    it.copy(
+                        activeCallKind = kind,
+                        activeCallId = material.callId,
+                        callPeerAccepted = earlyAction == MessengerCallAction.ACCEPT,
+                    )
+                }
+                val key = material.copyCallKey()
+                try {
+                    opened = LiveKitE2eeCallSession.open(appContext, material.liveKitUrl, material.liveKitToken, key)
+                } finally {
+                    key.fill(0)
+                }
+                material.destroy()
+                callSession = opened
+                observeRemoteVideoTrack(opened ?: error("The call session did not open"))
+                _state.update { it.copy(activeCallKind = kind, callBusy = true, callConnected = true, callMicrophoneEnabled = false, callCameraEnabled = false) }
+                if (_state.value.callPeerAccepted) enableOutgoingCallMedia()
+            } catch (cancelled: CancellationException) {
+                runCatching { opened?.close() }
+                material?.destroy()
+                throw cancelled
+            } catch (failure: Throwable) {
+                runCatching { opened?.close() }
+                material?.destroy()
+                _state.update {
+                    it.copy(callBusy = false, callConnected = false, activeCallKind = null, activeCallId = null, callPeerAccepted = false, callMicrophoneEnabled = false, callCameraEnabled = false,
+                        error = failure.message?.takeIf(String::isNotBlank) ?: "Couldn't start the encrypted call. Verify the contact and try again.")
+                }
+            }
+        }
+    }
+
+    fun acceptIncomingSecureCall(expectedRoomId: String, expectedCallId: String) {
+        val signal = _state.value.incomingCall?.takeIf {
+            it.roomId == expectedRoomId && it.callId == expectedCallId
+        } ?: return
+        if (signal.expiresAtMillis <= System.currentTimeMillis() || logoutRequested || _state.value.callBusy) {
+            declineIncomingSecureCall()
+            return
+        }
+        if (_state.value.currentRoomId != signal.roomId) {
+            _state.update { it.copy(error = "Open this contact's conversation to accept the call.") }
+            return
+        }
+        _state.update { it.copy(callBusy = true, callConnected = false, activeCallKind = null, activeCallId = signal.callId, callPeerAccepted = true, error = null) }
+        callOperationJob = viewModelScope.launch {
+            var material: IncomingCallMediaMaterial? = null
+            var opened: LiveKitE2eeCallSession? = null
+            try {
+                material = repository.authorizeIncomingSecureCall(signal)
+                val key = material.copyCallKey()
+                try {
+                    opened = LiveKitE2eeCallSession.open(appContext, material.liveKitUrl, material.liveKitToken, key)
+                } finally {
+                    key.fill(0)
+                }
+                material.destroy()
+                check(opened.setMicrophoneEnabled(true)) { "The microphone could not be enabled" }
+                val cameraOn = material.kind == MessengerCallKind.VIDEO && opened.setCameraEnabled(true)
+                repository.sendSecureCallControl(signal.roomId, signal.callId, MessengerCallAction.ACCEPT)
+                callSession = opened
+                observeRemoteVideoTrack(opened ?: error("The call session did not open"))
+                signal.destroy()
+                _state.update { it.copy(incomingCall = null, callBusy = true, callConnected = true, activeCallKind = material.kind, activeCallId = material.callId, callPeerAccepted = true, callMicrophoneEnabled = true, callCameraEnabled = cameraOn) }
+            } catch (cancelled: CancellationException) {
+                runCatching { opened?.close() }
+                material?.destroy()
+                signal.destroy()
+                throw cancelled
+            } catch (failure: Throwable) {
+                runCatching { opened?.close() }
+                material?.destroy()
+                signal.destroy()
+                _state.update {
+                    it.copy(incomingCall = null, callBusy = false, callConnected = false, activeCallKind = null, activeCallId = null, callPeerAccepted = false, callMicrophoneEnabled = false, callCameraEnabled = false,
+                        error = failure.message?.takeIf(String::isNotBlank) ?: "Couldn't accept this encrypted call. Verify the contact and try again.")
+                }
+            }
+        }
+    }
+
+    fun declineIncomingSecureCall() {
+        val incoming = _state.value.incomingCall
+        if (incoming != null && incoming.expiresAtMillis > System.currentTimeMillis()) {
+            viewModelScope.launch {
+                runCatching { repository.sendSecureCallControl(incoming.roomId, incoming.callId, MessengerCallAction.DECLINE) }
+            }
+        }
+        _state.update { old ->
+            old.incomingCall?.destroy()
+            old.copy(incomingCall = null)
+        }
+    }
+
+    fun endSecureCall(notifyPeer: Boolean = true) {
+        callOperationJob?.cancel()
+        callOperationJob = null
+        remoteVideoTrackJob?.cancel()
+        remoteVideoTrackJob = null
+        val active = callSession
+        callSession = null
+        val snapshot = _state.value
+        earlyCallControls.clear()
+        if (notifyPeer && snapshot.activeCallId != null && snapshot.currentRoomId != null) {
+            viewModelScope.launch {
+                runCatching {
+                    repository.sendSecureCallControl(snapshot.currentRoomId, snapshot.activeCallId, MessengerCallAction.HANGUP)
+                }
+            }
+        }
+        viewModelScope.launch { runCatching { active?.close() } }
+        _state.update { it.copy(callBusy = false, callConnected = false, activeCallKind = null, activeCallId = null, callPeerAccepted = false, callMicrophoneEnabled = false, callCameraEnabled = false, remoteVideoTrack = null) }
+    }
+
+    private fun observeRemoteVideoTrack(session: LiveKitE2eeCallSession) {
+        remoteVideoTrackJob?.cancel()
+        remoteVideoTrackJob = viewModelScope.launch {
+            session.remoteVideoTrack.collect { track ->
+                if (callSession === session) _state.update { it.copy(remoteVideoTrack = track) }
+            }
+        }
+    }
+
+    fun attachVideoRenderer(track: VideoTrack, renderer: TextureViewRenderer) {
+        checkNotNull(callSession) { "There is no active call to render" }.attachVideoRenderer(track, renderer)
+    }
+
+    fun detachVideoRenderer(renderer: TextureViewRenderer) {
+        callSession?.detachVideoRenderer(renderer)
+    }
+
+    private fun enableOutgoingCallMedia() {
+        val active = callSession ?: return
+        val kind = _state.value.activeCallKind ?: return
+        viewModelScope.launch {
+            runCatching {
+                val mic = active.setMicrophoneEnabled(true)
+                check(mic) { "The microphone could not be enabled" }
+                val camera = kind == MessengerCallKind.VIDEO && active.setCameraEnabled(true)
+                mic to camera
+            }.onSuccess { (mic, camera) ->
+                _state.update { it.copy(callMicrophoneEnabled = mic, callCameraEnabled = camera) }
+            }.onFailure {
+                _state.update { state -> state.copy(error = "Couldn't enable encrypted call media.") }
+                endSecureCall()
+            }
+        }
+    }
+
+    fun toggleCallMicrophone() {
+        val active = callSession ?: return
+        viewModelScope.launch {
+            runCatching { active.setMicrophoneEnabled(!_state.value.callMicrophoneEnabled) }
+                .onSuccess { enabled -> _state.update { it.copy(callMicrophoneEnabled = enabled) } }
+                .onFailure { _state.update { it.copy(error = "Couldn't change the call microphone state.") } }
+        }
+    }
+
+    fun toggleCallCamera() {
+        val active = callSession ?: return
+        viewModelScope.launch {
+            runCatching { active.setCameraEnabled(!_state.value.callCameraEnabled) }
+                .onSuccess { enabled -> _state.update { it.copy(callCameraEnabled = enabled) } }
+                .onFailure { _state.update { it.copy(error = "Couldn't change the call camera state.") } }
+        }
+    }
+
     fun closeConversation() {
+        endSecureCall()
+        declineIncomingSecureCall()
         val snapshot = _state.value
         val roomId = snapshot.currentRoomId
         val currentDraft = snapshot.composerDraft
@@ -388,7 +637,6 @@ class MessengerViewModel(context: Context) : ViewModel() {
     }
 
     fun updateComposerDraft(body: String) {
-                            navigationTargetEventId = null,
         if (logoutRequested) return
         _state.update { it.copy(composerDraft = body) }
         val roomId = _state.value.currentRoomId ?: return
@@ -657,7 +905,6 @@ class MessengerViewModel(context: Context) : ViewModel() {
     }
 
     fun microphonePermissionDenied() {
-                    navigationTargetEventId = null,
         _state.update { it.copy(error = "Microphone access was denied. Allow it in Android Settings to record a voice message.") }
     }
 
@@ -959,6 +1206,8 @@ class MessengerViewModel(context: Context) : ViewModel() {
     fun logout() {
         if (logoutRequested) return
         logoutRequested = true
+        endSecureCall()
+        declineIncomingSecureCall()
         stopAudioPlayback()
         _state.update { it.copy(isBusy = true, error = null) }
         viewModelScope.launch {
@@ -1002,6 +1251,8 @@ class MessengerViewModel(context: Context) : ViewModel() {
     }
 
     override fun onCleared() {
+        endSecureCall()
+        declineIncomingSecureCall()
         if (!_state.value.isSendingVoiceNote) discardVoiceNote()
         stopAudioPlayback()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {

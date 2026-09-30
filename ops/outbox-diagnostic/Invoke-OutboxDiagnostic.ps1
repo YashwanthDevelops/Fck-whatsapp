@@ -3,7 +3,8 @@
 param(
     [switch] $LoginOnly,
     [switch] $ForceBuild,
-    [switch] $PeerAcceptance
+    [switch] $PeerAcceptance,
+    [switch] $SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -246,9 +247,43 @@ function Invoke-DiagnosticInstrumentation {
     }
     $arguments += "$testApplicationId/androidx.test.runner.AndroidJUnitRunner"
 
+    # Keep diagnostics run-scoped, then supplement the instrumentation protocol with
+    # explicitly allow-listed, content-free callback lines from logcat.
+    $null = & $adb -s $Device logcat -c 2>$null
     $output = & $adb @arguments 2>&1
     $exitCode = $LASTEXITCODE
     $safeOutput = [string]::Join([Environment]::NewLine, [string[]] $output)
+    $voiceProjectionStatus = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_voice_projection=(true|false)\|(true|false)\|(true|false)\|(true|false)\|(Connected|Disconnected|Syncing|Reconnecting)\|(\d{1,3})\|(\d{1,3})\|(\d{1,3})\|(\d{1,3})\|([A-Z_,=0-9]+|none)"
+    )
+    if ($voiceProjectionStatus.Success) {
+        Write-Output "OUTBOX_DIAG_VOICE_PROJECTION queueEnabled=$($voiceProjectionStatus.Groups[1].Value) syncRunning=$($voiceProjectionStatus.Groups[2].Value) queueStatusObserver=$($voiceProjectionStatus.Groups[3].Value) queueUpdatesObserver=$($voiceProjectionStatus.Groups[4].Value) connection=$($voiceProjectionStatus.Groups[5].Value) localUpdates=$($voiceProjectionStatus.Groups[6].Value) sentUpdates=$($voiceProjectionStatus.Groups[7].Value) sendErrors=$($voiceProjectionStatus.Groups[8].Value) callbackFailures=$($voiceProjectionStatus.Groups[9].Value) categories=$($voiceProjectionStatus.Groups[10].Value)"
+    }
+    foreach ($projection in @(
+        @{ Key = "sender"; Pattern = "outbox_diag_edit_projection_sender=(true|false)\|(true|false)\|(true|false)\|(true|false)\|(true|false)\|(true|false)\|(true|false)\|(\d{1,3}:(?:true|false):(?:true|false):(?:true|false):(?:true|false):\d{1,4}|unavailable)" },
+        @{ Key = "recipient"; Pattern = "outbox_diag_edit_projection_recipient=(true|false)\|(true|false)\|(true|false)\|(true|false)\|(true|false)\|(true|false)" }
+    )) {
+        $projectionMatch = [regex]::Match($safeOutput, $projection.Pattern)
+        if ($projectionMatch.Success) {
+            $fields = @($projectionMatch.Groups | Select-Object -Skip 1 | ForEach-Object { $_.Value })
+            $isEdited = if ($projection.Key -eq "sender") { $fields[6] } else { $fields[5] }
+            $revisionSummary = if ($projection.Key -eq "sender") { " revisionSummary=$($fields[7])" } else { "" }
+            Write-Output "OUTBOX_DIAG_EDIT_PROJECTION side=$($projection.Key) observed=$($fields[0]) eventPresent=$($fields[1]) remote=$($fields[2]) originalBody=$($fields[3]) editedBody=$($fields[4]) canEdit=$($fields[5]) isEdited=$isEdited$revisionSummary"
+        }
+    }
+    $logOutput = @(& $adb -s $Device logcat -d -t 5000 2>$null)
+    $allowListedLogLines = @($logOutput | Where-Object {
+        $_ -match "OUTBOX_DIAG_EDIT_ECHO pipeline=" -or
+        $_ -match "OUTBOX_DIAG_EDIT_SUBMIT result=(failed reason=(empty_body_guard|unchanged_body_guard|ownership_or_editability_guard|encryption_guard|content_creation_unavailable|sdk_or_internal_failure) failureClass=[A-Za-z]+|accepted)" -or
+        $_ -match "OUTBOX_DIAG_VOICE_PROJECTION pipeline=(true|false)\|(true|false)\|(true|false)\|(true|false)\|(Connected|Disconnected|Syncing|Reconnecting)\|\d{1,3}\|\d{1,3}\|\d{1,3}\|\d{1,3} categories=([A-Z_,=0-9]+|none)" -or
+        $_ -match "FriendlineAckSnapshot: (reserve|bind) media=(true|false) snapshotKnown=(true|false) recipientCount=\d{1,3}( allowMedia=(true|false))?" -or
+        $_ -match "FriendlineSendQueue: update callback failed type=[A-Za-z]+ error=[A-Za-z]+" -or
+        $_ -match "FriendlineLifecycle: repository close stage=(waiting-lock|lock-acquired|sync-stopped|sync-closed|client-closed|complete)"
+    })
+    if ($allowListedLogLines.Count -gt 0) {
+        $safeOutput += [Environment]::NewLine + [string]::Join([Environment]::NewLine, [string[]] $allowListedLogLines)
+    }
     $verificationObservation = [regex]::Match(
         $safeOutput,
         "outbox_diag_verification_observation=(true|false)\|(true|false)\|(true|false)\|(true|false)"
@@ -287,6 +322,49 @@ function Invoke-DiagnosticInstrumentation {
     $peerTrustObservation = [regex]::Match($safeOutput, "outbox_diag_peer_trust=(true|false)\|(true|false)")
     if ($peerTrustObservation.Success) {
         Write-Output "OUTBOX_DIAG_PEER_TRUST senderTrustsRecipient=$($peerTrustObservation.Groups[1].Value) recipientTrustsSender=$($peerTrustObservation.Groups[2].Value)"
+    }
+    $verificationCallbacks = [regex]::Match(
+        $safeOutput,
+        "OUTBOX_DIAG_VERIFY_CALLBACKS sender=(request=\d{1,3},accepted=\d{1,3},sas-started=\d{1,3},sas-received=\d{1,3},failed=\d{1,3},cancelled=\d{1,3},finished=\d{1,3}) recipient=(request=\d{1,3},accepted=\d{1,3},sas-started=\d{1,3},sas-received=\d{1,3},failed=\d{1,3},cancelled=\d{1,3},finished=\d{1,3})"
+    )
+    if ($verificationCallbacks.Success) {
+        Write-Output "OUTBOX_DIAG_VERIFY_CALLBACKS sender=$($verificationCallbacks.Groups[1].Value) recipient=$($verificationCallbacks.Groups[2].Value)"
+    } else {
+        $verificationCallbackStatus = [regex]::Match(
+            $safeOutput,
+            "outbox_diag_verification_callbacks=(request=\d{1,3},accepted=\d{1,3},sas-started=\d{1,3},sas-received=\d{1,3},failed=\d{1,3},cancelled=\d{1,3},finished=\d{1,3})\|(request=\d{1,3},accepted=\d{1,3},sas-started=\d{1,3},sas-received=\d{1,3},failed=\d{1,3},cancelled=\d{1,3},finished=\d{1,3})"
+        )
+        if ($verificationCallbackStatus.Success) {
+            Write-Output "OUTBOX_DIAG_VERIFY_CALLBACKS sender=$($verificationCallbackStatus.Groups[1].Value) recipient=$($verificationCallbackStatus.Groups[2].Value)"
+        }
+    }
+    $editEchoObservation = [regex]::Match(
+        $safeOutput,
+        "OUTBOX_DIAG_EDIT_ECHO pipeline=(true|false)\|(true|false)\|(true|false)\|(true|false)\|(Connected|Disconnected|Syncing|Reconnecting)\|(\d{1,3})\|(\d{1,3})\|(\d{1,3})\|(\d{1,3}) matches=(\d{1,2}) remote=(\d{1,2}) eventId=(\d{1,2}) states=([A-Za-z ,]+) categories=([A-Z_,=0-9]+|none)"
+    )
+    if ($editEchoObservation.Success) {
+        Write-Output "OUTBOX_DIAG_EDIT_ECHO queueEnabled=$($editEchoObservation.Groups[1].Value) syncRunning=$($editEchoObservation.Groups[2].Value) statusObserver=$($editEchoObservation.Groups[3].Value) updateObserver=$($editEchoObservation.Groups[4].Value) connection=$($editEchoObservation.Groups[5].Value) localEvents=$($editEchoObservation.Groups[6].Value) sentEvents=$($editEchoObservation.Groups[7].Value) sendErrors=$($editEchoObservation.Groups[8].Value) callbackFailures=$($editEchoObservation.Groups[9].Value) matches=$($editEchoObservation.Groups[10].Value) remote=$($editEchoObservation.Groups[11].Value) eventId=$($editEchoObservation.Groups[12].Value) states=$($editEchoObservation.Groups[13].Value.Trim()) categories=$($editEchoObservation.Groups[14].Value)"
+    }
+    $voiceAckObservation = [regex]::Match(
+        $safeOutput,
+        "OUTBOX_DIAG_VOICE_ACK delivered=(true|false) eventIdPresent=(true|false) senderObserver=([A-Za-z-]{1,20}) senderRecord=([A-Za-z-]{1,20}) senderState=([A-Za-z_-]{1,20}) senderSnapshot=([A-Za-z-]{1,20}) senderExpected=(-?\d{1,3}) senderAcked=(-?\d{1,3}) senderProvisional=(-?\d{1,3}) senderRemoteAckEvents=(-?\d{1,3}) recipientObserver=([A-Za-z-]{1,20}) recipientRecord=([A-Za-z-]{1,20}) recipientState=([A-Za-z_-]{1,20}) recipientRemoteAckEvents=(-?\d{1,3}) senderQueueUpdates=([A-Za-z-]{1,20}) senderSnapshotReservation=([A-Za-z-]{1,20}) recipientQueueUpdates=([A-Za-z-]{1,20}) recipientSnapshotReservation=([A-Za-z-]{1,20})"
+    )
+    if ($voiceAckObservation.Success) {
+        Write-Output "OUTBOX_DIAG_VOICE_ACK delivered=$($voiceAckObservation.Groups[1].Value) eventIdPresent=$($voiceAckObservation.Groups[2].Value) senderObserver=$($voiceAckObservation.Groups[3].Value) senderRecord=$($voiceAckObservation.Groups[4].Value) senderState=$($voiceAckObservation.Groups[5].Value) senderSnapshot=$($voiceAckObservation.Groups[6].Value) senderExpected=$($voiceAckObservation.Groups[7].Value) senderAcked=$($voiceAckObservation.Groups[8].Value) senderProvisional=$($voiceAckObservation.Groups[9].Value) senderRemoteAckEvents=$($voiceAckObservation.Groups[10].Value) recipientObserver=$($voiceAckObservation.Groups[11].Value) recipientRecord=$($voiceAckObservation.Groups[12].Value) recipientState=$($voiceAckObservation.Groups[13].Value) recipientRemoteAckEvents=$($voiceAckObservation.Groups[14].Value) senderQueueUpdates=$($voiceAckObservation.Groups[15].Value) senderSnapshotReservation=$($voiceAckObservation.Groups[16].Value) recipientQueueUpdates=$($voiceAckObservation.Groups[17].Value) recipientSnapshotReservation=$($voiceAckObservation.Groups[18].Value)"
+    } elseif ($safeOutput.Contains("OUTBOX_DIAG_VOICE_ACK")) {
+        Write-Output "OUTBOX_DIAG_VOICE_ACK present=true parsed=false"
+    } else {
+        $voiceAckStatus = [regex]::Match(
+            $safeOutput,
+            "outbox_diag_voice_ack=(true|false)\|(true|false)\|([A-Za-z-]{1,20})\|([A-Za-z-]{1,20})\|([A-Za-z_-]{1,20})\|([A-Za-z-]{1,20})\|(-?\d{1,3})\|(-?\d{1,3})\|(-?\d{1,3})\|(-?\d{1,3})\|([A-Za-z-]{1,20})\|([A-Za-z-]{1,20})\|([A-Za-z_-]{1,20})\|(-?\d{1,3})\|([A-Za-z-]{1,20})\|([A-Za-z-]{1,20})\|([A-Za-z-]{1,20})\|([A-Za-z-]{1,20})"
+        )
+        if ($voiceAckStatus.Success) {
+            Write-Output "OUTBOX_DIAG_VOICE_ACK delivered=$($voiceAckStatus.Groups[1].Value) eventIdPresent=$($voiceAckStatus.Groups[2].Value) senderObserver=$($voiceAckStatus.Groups[3].Value) senderRecord=$($voiceAckStatus.Groups[4].Value) senderState=$($voiceAckStatus.Groups[5].Value) senderSnapshot=$($voiceAckStatus.Groups[6].Value) senderExpected=$($voiceAckStatus.Groups[7].Value) senderAcked=$($voiceAckStatus.Groups[8].Value) senderProvisional=$($voiceAckStatus.Groups[9].Value) senderRemoteAckEvents=$($voiceAckStatus.Groups[10].Value) recipientObserver=$($voiceAckStatus.Groups[11].Value) recipientRecord=$($voiceAckStatus.Groups[12].Value) recipientState=$($voiceAckStatus.Groups[13].Value) recipientRemoteAckEvents=$($voiceAckStatus.Groups[14].Value) senderQueueUpdates=$($voiceAckStatus.Groups[15].Value) senderSnapshotReservation=$($voiceAckStatus.Groups[16].Value) recipientQueueUpdates=$($voiceAckStatus.Groups[17].Value) recipientSnapshotReservation=$($voiceAckStatus.Groups[18].Value)"
+        } elseif ($safeOutput.Contains("outbox_diag_voice_ack=")) {
+            Write-Output "OUTBOX_DIAG_VOICE_ACK present=true parsed=false"
+        } else {
+            Write-Output "OUTBOX_DIAG_VOICE_ACK present=false"
+        }
     }
     $identityConvergenceObservation = [regex]::Match(
         $safeOutput,
@@ -329,6 +407,20 @@ function Invoke-DiagnosticInstrumentation {
     )
     if ($addedDeviceResultStatus.Success) {
         Write-Output "OUTBOX_DIAG_ADDED_DEVICE_RESULT localIdentity=$($addedDeviceResultStatus.Groups[1].Value) selfSigningKeyPresent=$($addedDeviceResultStatus.Groups[2].Value) deviceCrossSigned=$($addedDeviceResultStatus.Groups[3].Value) primaryDecrypted=$($addedDeviceResultStatus.Groups[4].Value) newDeviceUndecryptable=$($addedDeviceResultStatus.Groups[5].Value) newDeviceDecrypted=$($addedDeviceResultStatus.Groups[6].Value) roomKeyRecipientList=$($addedDeviceResultStatus.Groups[7].Value)"
+    }
+    $addedDeviceFinalTrustStatus = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_added_device_final_trust=(missing|verified|unverified|unavailable)\|(true|false)\|(true|false)"
+    )
+    if ($addedDeviceFinalTrustStatus.Success) {
+        Write-Output "OUTBOX_DIAG_ADDED_DEVICE_FINAL_TRUST localIdentity=$($addedDeviceFinalTrustStatus.Groups[1].Value) selfSigningKeyPresent=$($addedDeviceFinalTrustStatus.Groups[2].Value) deviceCrossSigned=$($addedDeviceFinalTrustStatus.Groups[3].Value)"
+    }
+    $addedDeviceProjectionStatus = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_added_device_projection=(missing|utd|plaintext|other)\|(missing|utd|plaintext|other)\|(utd-only|utd-to-plaintext|utd-to-other|utd-to-missing)\|(\d{1,3})"
+    )
+    if ($addedDeviceProjectionStatus.Success) {
+        Write-Output "OUTBOX_DIAG_ADDED_DEVICE_PROJECTION before=$($addedDeviceProjectionStatus.Groups[1].Value) after=$($addedDeviceProjectionStatus.Groups[2].Value) transition=$($addedDeviceProjectionStatus.Groups[3].Value) windowSeconds=$($addedDeviceProjectionStatus.Groups[4].Value)"
     }
     $groupDeliveryObservations = [regex]::Matches(
         $safeOutput,
@@ -375,6 +467,20 @@ function Invoke-DiagnosticInstrumentation {
     )
     if ($readReceiptTraceObservation.Success) {
         Write-Output "OUTBOX_DIAG_READ_RECEIPT_TRACE eventSeen=$($readReceiptTraceObservation.Groups[1].Value) ownEvent=$($readReceiptTraceObservation.Groups[2].Value) otherReader=$($readReceiptTraceObservation.Groups[3].Value) mappedRead=$($readReceiptTraceObservation.Groups[4].Value) appRead=$($readReceiptTraceObservation.Groups[5].Value) updates=$($readReceiptTraceObservation.Groups[6].Value) sdkCache=$($readReceiptTraceObservation.Groups[7].Value)"
+    }
+    $replyRelationObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_reply_relation=(true|false)\|(true|false)\|(true|false)\|(true|false)"
+    )
+    if ($replyRelationObservation.Success) {
+        Write-Output "OUTBOX_DIAG_REPLY_RELATION matched=$($replyRelationObservation.Groups[1].Value) firstProjection=$($replyRelationObservation.Groups[2].Value) targetPresent=$($replyRelationObservation.Groups[3].Value) latestProjection=$($replyRelationObservation.Groups[4].Value)"
+    }
+    $searchStateObservation = [regex]::Match(
+        $safeOutput,
+        "outbox_diag_search_state=(\d{1,3})\|(true|false)\|(true|false)\|(true|false)"
+    )
+    if ($searchStateObservation.Success) {
+        Write-Output "OUTBOX_DIAG_SEARCH_STATE resultCount=$($searchStateObservation.Groups[1].Value) loading=$($searchStateObservation.Groups[2].Value) hasMore=$($searchStateObservation.Groups[3].Value) roomResult=$($searchStateObservation.Groups[4].Value)"
     }
     $ackReplayObservation = [regex]::Match(
         $safeOutput,
@@ -463,7 +569,7 @@ function Invoke-DiagnosticInstrumentation {
         } else {
             "test-method-not-reached"
         }
-        $progressPattern = "OUTBOX_DIAG_PROGRESS stage=$([regex]::Escape($Stage)) step=(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|createGroupConversation|verifyGroupPeer|awaitGroupDeliveryPartial|awaitGroupDeliveryComplete|sendGroupMessage|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|unverifiedDeviceKeyExclusion|editAndRedactEncryptedMessage|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|verificationPeerTrust|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|awaitBackgroundDelivery|awaitOfflineDeliveryAck|awaitOfflineBacklog|sendReadReceipt|awaitReadReceipt|awaitTyping|verifyExactlyOnce) state=(start|complete)"
+        $progressPattern = "OUTBOX_DIAG_PROGRESS stage=$([regex]::Escape($Stage)) step=(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|createGroupConversation|verifyGroupPeer|awaitGroupDeliveryPartial|awaitGroupDeliveryComplete|sendGroupMessage|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|editProbeSend|editProbeAwaitSenderEcho|editProbeAwaitPeerEcho|editProbeEdit|awaitEditedSenderProjection|awaitEditedPeerProjection|awaitRedactionSenderProjection|awaitRedactionPeerProjection|awaitEditHistory|awaitReplyEcho|awaitReplyRelation|sendReplyTarget|awaitReplyTarget|sendReply|sendSearchMarker|awaitSearchMarker|executeLocalSearch|awaitLocalSearch|localStoreMarkerScan|voiceNoteRoundTrip|voiceNotePermission|voiceRecorderPrepare|voiceRecorderStart|voiceRecorderStop|voiceUpload|voicePeerDecrypt|voiceDeliveredAck|unverifiedDeviceKeyExclusion|unverifiedAddedDeviceLogin|unverifiedAddedDeviceRoomSync|unverifiedAddedDeviceOpenRoom|unverifiedAddedDeviceTrust|unverifiedProbeSend|unverifiedProbePeerDecrypt|unverifiedProbeUtdProjection|editAndRedactEncryptedMessage|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|verificationPeerTrust|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|awaitBackgroundDelivery|awaitOfflineDeliveryAck|awaitOfflineBacklog|sendReadReceipt|awaitReadReceipt|awaitTyping|verifyExactlyOnce) state=(start|complete)"
         $progressMatches = [regex]::Matches($safeOutput, $progressPattern)
         $progressEvents = @(
             foreach ($progressMatch in $progressMatches) {
@@ -471,7 +577,7 @@ function Invoke-DiagnosticInstrumentation {
             }
         )
         if ($progressEvents.Count -eq 0) {
-            $statusProgressPattern = "outbox_diag_progress=$([regex]::Escape($Stage))\|(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|createGroupConversation|verifyGroupPeer|awaitGroupDeliveryPartial|awaitGroupDeliveryComplete|sendGroupMessage|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|unverifiedDeviceKeyExclusion|editAndRedactEncryptedMessage|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|verificationPeerTrust|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|awaitBackgroundDelivery|awaitOfflineDeliveryAck|awaitOfflineBacklog|sendReadReceipt|awaitReadReceipt|awaitTyping|verifyExactlyOnce)\|(start|complete)"
+            $statusProgressPattern = "outbox_diag_progress=$([regex]::Escape($Stage))\|(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|createGroupConversation|verifyGroupPeer|awaitGroupDeliveryPartial|awaitGroupDeliveryComplete|sendGroupMessage|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|editProbeSend|editProbeAwaitSenderEcho|editProbeAwaitPeerEcho|editProbeEdit|unverifiedDeviceKeyExclusion|unverifiedAddedDeviceLogin|unverifiedAddedDeviceRoomSync|unverifiedAddedDeviceOpenRoom|unverifiedAddedDeviceTrust|unverifiedProbeSend|unverifiedProbePeerDecrypt|unverifiedProbeUtdProjection|editAndRedactEncryptedMessage|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|verificationPeerTrust|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|awaitBackgroundDelivery|awaitOfflineDeliveryAck|awaitOfflineBacklog|sendReadReceipt|awaitReadReceipt|awaitTyping|verifyExactlyOnce)\|(start|complete)"
             $statusProgressMatches = [regex]::Matches($safeOutput, $statusProgressPattern)
             $progressEvents = @(
                 foreach ($progressMatch in $statusProgressMatches) {
@@ -864,7 +970,9 @@ function Get-VerificationAccessDiagnosis {
     if ($sendToDeviceCount -gt 0) {
         $request = "sent"
     } elseif ($Step -in @("verificationIncomingRequest", "verificationAccept", "verificationSafetyCode", "verificationApprove", "verificationComplete")) {
-        $request = "controller-prefiltered"
+        # Friendline intentionally routes SAS through its private verification
+        # control room. No to-device traffic is expected on this flow.
+        $request = "room-routed-no-to-device-traffic"
     } elseif ($Step -in @("verificationPeerCheck", "verificationPrepareSender", "verificationPrepareRecipient", "verificationRequest")) {
         $request = "not-sent"
     } else {
@@ -958,8 +1066,11 @@ function Write-SynapseAccessDelta {
 $composeTouched = $false
 $serverStoppedForOfflineStage = $false
 try {
-    Write-Output "OUTBOX_DIAG build=starting variant=outboxDiagDebug"
-    $buildArguments = @(
+    if ($SkipBuild) {
+        Write-Output "OUTBOX_DIAG build=skipped existingArtifacts=required"
+    } else {
+        Write-Output "OUTBOX_DIAG build=starting variant=outboxDiagDebug"
+        $buildArguments = @(
         "run", "--rm",
         "--volume", "${workspace}:/workspace",
         "--workdir", "/workspace",
@@ -970,20 +1081,25 @@ try {
         "--env", "PRIVATE_MESSENGER_DEBUG_KEYSTORE=/workspace/.tools/private-messenger-debug.keystore",
         "--env", "PRIVATE_MESSENGER_DEBUG_KEYSTORE_PASSWORD=android",
         "gradle:9.5.0-jdk17", "gradle",
+        "--project-prop=privateMessengerSplitApks=true",
+        "--project-prop=kotlin.compiler.execution.strategy=in-process",
+        "--system-prop=org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8",
         ":app:testOutboxDiagDebugUnitTest",
         ":app:assembleOutboxDiagDebug", ":app:assembleOutboxDiagDebugAndroidTest",
-        "--no-daemon", "--console=plain"
-    )
-    if ($ForceBuild) { $buildArguments += @("--rerun-tasks", "--max-workers=2") }
-    & $docker @buildArguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "The isolated outbox diagnostic APK build failed."
+        "--max-workers=1", "--no-daemon", "--console=plain"
+        )
+        if ($ForceBuild) { $buildArguments += @("--rerun-tasks") }
+        & $docker @buildArguments
+        if ($LASTEXITCODE -ne 0) {
+            throw "The isolated outbox diagnostic APK build failed."
+        }
     }
 
     $diagnosticApks = Get-ChildItem -LiteralPath $apkOutputDirectory -Filter "*.apk" -File -Recurse |
         Where-Object { $_.Name -match "outbox.?diag.*debug" }
     $appApk = $diagnosticApks |
-        Where-Object { $_.FullName -notmatch "androidTest" } | Select-Object -First 1
+        Where-Object { $_.FullName -notmatch "androidTest" -and $_.Name -match "x86_64" } |
+        Select-Object -First 1
     $testApk = $diagnosticApks |
         Where-Object { $_.FullName -match "androidTest" } | Select-Object -First 1
     if ($null -eq $appApk -or $null -eq $testApk) {
@@ -998,6 +1114,11 @@ try {
     $device = ($emulatorDevices[0] -split "\s+")[0]
     New-DiagnosticReverseMapping -Device $device
 
+    # Windows and containerized Gradle builds can sign the isolated diagnostic
+    # variant with different local debug keys. Remove only these disposable test
+    # packages before installing the selected artifacts.
+    $null = & $adb -s $device uninstall $applicationId 2>$null
+    $null = & $adb -s $device uninstall $testApplicationId 2>$null
     Invoke-AdbChecked -Arguments @("-s", $device, "install", "-r", $appApk.FullName)
     Invoke-AdbChecked -Arguments @("-s", $device, "install", "-r", $testApk.FullName)
     Invoke-AdbChecked -Arguments @("-s", $device, "shell", "pm", "clear", $applicationId)

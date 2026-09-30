@@ -34,6 +34,20 @@ val splitApksForDistribution = providers.gradleProperty("privateMessengerSplitAp
 
 val localDebugKeystore = providers.environmentVariable("PRIVATE_MESSENGER_DEBUG_KEYSTORE").orNull
 val localDebugKeystorePassword = providers.environmentVariable("PRIVATE_MESSENGER_DEBUG_KEYSTORE_PASSWORD").orNull ?: "android"
+val privateReleaseKeystore = providers.environmentVariable("PRIVATE_MESSENGER_RELEASE_KEYSTORE").orNull
+val privateReleaseKeystorePassword = providers.environmentVariable("PRIVATE_MESSENGER_RELEASE_KEYSTORE_PASSWORD").orNull
+val privateReleaseKeyAlias = providers.environmentVariable("PRIVATE_MESSENGER_RELEASE_KEY_ALIAS").orNull
+val privateReleaseKeyPassword = providers.environmentVariable("PRIVATE_MESSENGER_RELEASE_KEY_PASSWORD").orNull
+val privateReleaseSigningValues = listOf(
+    privateReleaseKeystore,
+    privateReleaseKeystorePassword,
+    privateReleaseKeyAlias,
+    privateReleaseKeyPassword,
+)
+val privateReleaseSigningConfigured = privateReleaseSigningValues.all { !it.isNullOrBlank() }
+require(privateReleaseSigningConfigured || privateReleaseSigningValues.all { it.isNullOrBlank() }) {
+    "Private release signing requires the keystore path, store password, key alias, and key password."
+}
 
 fun buildConfigString(value: String): String =
     "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
@@ -77,6 +91,14 @@ android {
                 keyPassword = localDebugKeystorePassword
             }
         }
+        if (privateReleaseSigningConfigured) {
+            create("privateRelease") {
+                storeFile = file(checkNotNull(privateReleaseKeystore))
+                storePassword = checkNotNull(privateReleaseKeystorePassword)
+                keyAlias = checkNotNull(privateReleaseKeyAlias)
+                keyPassword = checkNotNull(privateReleaseKeyPassword)
+            }
+        }
     }
 
     buildTypes {
@@ -89,6 +111,9 @@ android {
         }
         release {
             isMinifyEnabled = true
+            if (privateReleaseSigningConfigured) {
+                signingConfig = signingConfigs.getByName("privateRelease")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -112,6 +137,9 @@ android {
 
     packaging {
         jniLibs.useLegacyPackaging = false
+        // The Matrix Rust FFI is stripped with the pinned NDK before packaging; AGP's
+        // host stripper cannot handle the GNU-built ELF produced on this Windows host.
+        jniLibs.keepDebugSymbols += "**/libmatrix_sdk_ffi.so"
     }
 }
 
@@ -129,13 +157,20 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("com.google.firebase:firebase-messaging")
-    implementation("org.matrix.rustcomponents:sdk-android:26.09.9")
+    // Locally generated from Matrix Rust SDK revision 2a3db80e with the
+    // verified per-device call-key query patch. See ops/sdk-build/README.md.
+    implementation(files("libs/sdk-android-private-2a3db80.aar"))
+    implementation("net.java.dev.jna:jna:5.18.1@aar")
+    implementation("androidx.annotation:annotation:1.9.1")
     implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
     implementation("com.google.zxing:core:3.5.4")
     implementation("io.livekit:livekit-android:2.29.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
+    // Android's org.json implementation is backed by mock methods in local JVM tests.
+    // Use the compatible JSON.org implementation so protocol tests exercise real parsing.
+    testImplementation("org.json:json:20250517")
     androidTestImplementation(composeBom)
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")

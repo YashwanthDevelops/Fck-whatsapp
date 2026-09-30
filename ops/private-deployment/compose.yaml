@@ -73,10 +73,10 @@ services:
     logging: *bounded-logging
     environment:
       MATRIX_DOMAIN: ${MATRIX_DOMAIN:?Set MATRIX_DOMAIN to the stable domain you own}
+      CALLS_DOMAIN: ${CALLS_DOMAIN:-localhost}
     ports:
       - "80:80/tcp"
       - "443:443/tcp"
-      - "443:443/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -95,6 +95,7 @@ services:
         aliases:
           - ${MATRIX_DOMAIN:?Set MATRIX_DOMAIN to the stable domain you own}
         ipv4_address: ${CADDY_PROXY_IP:-172.30.255.2}
+      rtc: {}
       edge: {}
 
   sygnal:
@@ -124,6 +125,86 @@ services:
       - proxy
       - edge
 
+  call-auth:
+    profiles:
+      - calls
+    build:
+      context: ./call-auth
+    restart: unless-stopped
+    logging: *bounded-logging
+    environment:
+      MATRIX_BASE_URL: http://synapse:8008
+      LIVEKIT_URL: wss://${CALLS_DOMAIN:-localhost}
+      LIVEKIT_KEYS_FILE: /run/secrets/livekit_keys
+      PORT: "8080"
+    secrets:
+      - livekit_keys
+    expose:
+      - "8080"
+    depends_on:
+      synapse:
+        condition: service_healthy
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=1m
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    networks:
+      - proxy
+
+  livekit:
+    image: ${LIVEKIT_IMAGE:-livekit/livekit-server:v1.13.7}
+    profiles:
+      - calls
+    restart: unless-stopped
+    logging: *bounded-logging
+    command: ["--key-file", "/run/secrets/livekit_keys"]
+    environment:
+      LIVEKIT_CONFIG: |
+        port: 7880
+        log_level: warn
+        rtc:
+          tcp_port: 7881
+          port_range_start: 50000
+          port_range_end: 50100
+          use_external_ip: true
+        turn:
+          enabled: true
+          domain: ${CALLS_DOMAIN:-localhost}
+          udp_port: 443
+          relay_range_start: 40000
+          relay_range_end: 40099
+          per_user_relay_allocation_limit: 8
+    secrets:
+      - livekit_keys
+    ports:
+      - "443:443/udp"
+      - "7881:7881/tcp"
+      - "40000-40099:40000-40099/udp"
+      - "50000-50100:50000-50100/udp"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - rtc
+      - edge
+
 networks:
   database:
     internal: true
@@ -132,6 +213,8 @@ networks:
     ipam:
       config:
         - subnet: ${PROXY_NETWORK_SUBNET:-172.30.255.0/29}
+  rtc:
+    internal: true
   edge:
     driver: bridge
 
@@ -144,3 +227,5 @@ volumes:
 secrets:
   postgres_password:
     file: ${POSTGRES_PASSWORD_FILE:?Set POSTGRES_PASSWORD_FILE to a protected password file}
+  livekit_keys:
+    file: ${LIVEKIT_KEYS_FILE:-./call-auth/livekit_keys.disabled.example}

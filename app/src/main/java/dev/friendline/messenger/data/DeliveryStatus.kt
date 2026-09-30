@@ -50,6 +50,16 @@ internal fun validateProvisionalDeliveryAcknowledgements(
     provisionalMemberIds: Set<String>,
 ): Set<String> = provisionalMemberIds.intersect(expectedMemberIds)
 
+internal fun deliveryMemberStatuses(
+    expectedMemberIds: Set<String>,
+    acknowledgedMemberIds: Set<String>,
+): List<DeliveryMemberStatus> {
+    val acknowledged = acknowledgedMemberIds.intersect(expectedMemberIds)
+    return expectedMemberIds.sorted().map { userId ->
+        DeliveryMemberStatus(userId = userId, delivered = userId in acknowledged)
+    }
+}
+
 internal fun isProvisionalOnlyDeliveryAckRecord(
     state: String,
     snapshotKnown: Boolean,
@@ -66,4 +76,24 @@ internal data class DeliveryAckDiagnosticSnapshot(
     val acknowledgedRecipientCount: Int,
     val provisionalAcknowledgementCount: Int,
     val remoteAckMessageCount: Int,
+    val sendQueueUpdatesObserverInstalled: Boolean,
+    val activeSnapshotReservation: Boolean,
 )
+
+/** Promote an optimistic own-message row only when the send response confirms its transaction. */
+internal fun promoteAcceptedLocalMessage(
+    message: ChatMessage,
+    transactionId: String,
+    eventId: String,
+    deliveryState: String,
+): ChatMessage? {
+    if (!message.isOwn || message.id != transactionId || message.eventId != null) {
+        return null
+    }
+    return message.copy(
+        id = eventId,
+        eventId = eventId,
+        isRemote = true,
+        deliveryState = deliveryState,
+    )
+}
