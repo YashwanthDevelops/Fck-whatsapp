@@ -4,11 +4,19 @@ param(
     [switch] $LoginOnly,
     [switch] $ForceBuild,
     [switch] $PeerAcceptance,
+    [switch] $RoomInvite,
     [switch] $SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+if ($PeerAcceptance -and $RoomInvite) {
+    throw "Choose either -PeerAcceptance or -RoomInvite."
+}
+if ($LoginOnly -and ($PeerAcceptance -or $RoomInvite)) {
+    throw "-LoginOnly cannot be combined with a peer acceptance stage."
+}
 
 $workspace = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $composeFile = Join-Path $PSScriptRoot "compose.yaml"
@@ -1149,10 +1157,7 @@ try {
     Write-Output "OUTBOX_DIAG accounts=provisioned count=3 output=redacted"
     $script:synapseAccessBaseline = Get-SynapseAccessCounts
 
-    if ($PeerAcceptance) {
-        if ($LoginOnly) {
-            throw "Peer acceptance runs all stages and cannot be combined with -LoginOnly."
-        }
+    if ($PeerAcceptance -or $RoomInvite) {
         $peerArguments = @(
             "-e", "homeserver_url", $deviceHomeserverUrl,
             "-e", "sender_user_id", $senderUserId,
@@ -1164,27 +1169,34 @@ try {
         )
         $peerClass = "dev.friendline.messenger.data.AndroidPeerAcceptanceIntegrationTest"
 
-        Invoke-DiagnosticInstrumentation -Device $device -ClassName $peerClass `
-            -Stage "core" -Marker $marker -ExtraArguments $peerArguments
-        Invoke-AdbChecked -Arguments @("-s", $device, "shell", "am", "force-stop", $applicationId)
+        if ($RoomInvite) {
+            Invoke-DiagnosticInstrumentation -Device $device -ClassName $peerClass `
+                -Stage "room-invite" -Marker $marker -ExtraArguments $peerArguments
+            Invoke-AdbChecked -Arguments @("-s", $device, "shell", "am", "force-stop", $applicationId)
+            Write-Output "OUTBOX_DIAG result=room-invite completed=encrypted-invite-join-exchange"
+        } else {
+            Invoke-DiagnosticInstrumentation -Device $device -ClassName $peerClass `
+                -Stage "core" -Marker $marker -ExtraArguments $peerArguments
+            Invoke-AdbChecked -Arguments @("-s", $device, "shell", "am", "force-stop", $applicationId)
 
-        $null = Invoke-DockerCompose -Arguments @("stop", "synapse")
-        $serverStoppedForOfflineStage = $true
-        if (Test-DiagnosticSynapse) {
-            throw "The isolated Synapse listener remained reachable during attachment outage validation."
+            $null = Invoke-DockerCompose -Arguments @("stop", "synapse")
+            $serverStoppedForOfflineStage = $true
+            if (Test-DiagnosticSynapse) {
+                throw "The isolated Synapse listener remained reachable during attachment outage validation."
+            }
+            Write-Output "OUTBOX_DIAG server=stopped phase=attachment-outage"
+            Invoke-DiagnosticInstrumentation -Device $device -ClassName $peerClass `
+                -Stage "attachment-offline" -Marker $marker -ExtraArguments $peerArguments
+            Invoke-AdbChecked -Arguments @("-s", $device, "shell", "am", "force-stop", $applicationId)
+
+            $null = Invoke-DockerCompose -Arguments @("up", "-d", "synapse")
+            $serverStoppedForOfflineStage = $false
+            Wait-DiagnosticSynapse
+            Write-Output "OUTBOX_DIAG server=ready phase=attachment-resume"
+            Invoke-DiagnosticInstrumentation -Device $device -ClassName $peerClass `
+                -Stage "attachment-resume" -Marker $marker -ExtraArguments $peerArguments
+            Write-Output "OUTBOX_DIAG result=peer-acceptance completed=core,offline-attachment,retry"
         }
-        Write-Output "OUTBOX_DIAG server=stopped phase=attachment-outage"
-        Invoke-DiagnosticInstrumentation -Device $device -ClassName $peerClass `
-            -Stage "attachment-offline" -Marker $marker -ExtraArguments $peerArguments
-        Invoke-AdbChecked -Arguments @("-s", $device, "shell", "am", "force-stop", $applicationId)
-
-        $null = Invoke-DockerCompose -Arguments @("up", "-d", "synapse")
-        $serverStoppedForOfflineStage = $false
-        Wait-DiagnosticSynapse
-        Write-Output "OUTBOX_DIAG server=ready phase=attachment-resume"
-        Invoke-DiagnosticInstrumentation -Device $device -ClassName $peerClass `
-            -Stage "attachment-resume" -Marker $marker -ExtraArguments $peerArguments
-        Write-Output "OUTBOX_DIAG result=peer-acceptance completed=core,offline-attachment,retry"
     } else {
         Invoke-DiagnosticInstrumentation -Device $device -Stage "prepare" -Marker $marker `
             -Username $senderUserId -Password $senderPassword -RecipientUserId $recipientUserId `

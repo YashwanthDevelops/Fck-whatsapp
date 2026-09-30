@@ -55,7 +55,7 @@ class EncryptedMessagingIntegrationTest {
                 "The recipient did not sync the room invitation; sync=${recipient.connection.value}, " +
                     "rooms=${recipient.conversations.value.size}"
             }
-            recipient.joinConversation(roomId)
+            recipient.acceptConversationInvitation(roomId)
             recipient.openConversation(roomId)
 
             if (!sender.isPeerVerified(roomId)) {

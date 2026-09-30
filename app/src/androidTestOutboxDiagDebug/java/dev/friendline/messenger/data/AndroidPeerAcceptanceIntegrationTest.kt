@@ -35,7 +35,7 @@ import java.security.MessageDigest
  * Fresh-account, same-emulator Android peer acceptance. All Matrix stores are rooted below
  * independent diagnostic directories; this test never restores the regular app account.
  * The host harness provisions the accounts on its loopback-only Synapse and invokes the
- * core, attachment-offline, and attachment-resume stages.
+ * core, room-invite, attachment-offline, and attachment-resume stages.
  */
 @RunWith(AndroidJUnit4::class)
 class AndroidPeerAcceptanceIntegrationTest {
@@ -105,6 +105,22 @@ class AndroidPeerAcceptanceIntegrationTest {
                     },
                 )
 
+                "room-invite" -> runRoomInvitationAcceptance(
+                    homeserver,
+                    senderId,
+                    senderPassword,
+                    recipientId,
+                    recipientPassword,
+                    groupPeerId,
+                    groupPeerPassword,
+                    marker,
+                    activeSender,
+                    activeRecipient,
+                    activeGroupPeer,
+                    instrumentation,
+                    onStep = { step = it },
+                )
+
                 "attachment-offline" -> queueAttachmentWhileServerIsOffline(
                     homeserver,
                     senderId,
@@ -169,6 +185,104 @@ class AndroidPeerAcceptanceIntegrationTest {
         }
     }
 
+    private suspend fun runRoomInvitationAcceptance(
+        homeserver: String,
+        senderId: String,
+        senderPassword: String,
+        recipientId: String,
+        recipientPassword: String,
+        groupPeerId: String,
+        groupPeerPassword: String,
+        marker: String,
+        sender: MatrixRepository,
+        recipient: MatrixRepository,
+        groupPeer: MatrixRepository,
+        instrumentation: android.app.Instrumentation,
+        onStep: (String) -> Unit,
+    ) {
+        onStep("repositoryLogin")
+        reportProgress(instrumentation, "room-invite", "repositoryLogin", "start")
+        loginFresh(sender, homeserver, senderId, senderPassword)
+        loginFresh(recipient, homeserver, recipientId, recipientPassword)
+        loginFresh(groupPeer, homeserver, groupPeerId, groupPeerPassword)
+        reportProgress(instrumentation, "room-invite", "repositoryLogin", "complete")
+
+        onStep("createEncryptedConversation")
+        reportProgress(instrumentation, "room-invite", "createEncryptedConversation", "start")
+        val roomId = sender.createEncryptedConversation(
+            invitedUserIds = listOf(recipientId),
+            name = null,
+            isGroup = false,
+        )
+        reportProgress(instrumentation, "room-invite", "createEncryptedConversation", "complete")
+
+        onStep("awaitRoomReady")
+        reportProgress(instrumentation, "room-invite", "awaitRoomReady", "start")
+        await("direct conversation invitation") {
+            recipient.refreshConversations()
+            recipient.conversations.value.any {
+                it.roomId == roomId && it.membership == "INVITED" && it.isEncrypted
+            }
+        }
+        recipient.acceptConversationInvitation(roomId)
+        await("joined encrypted direct conversation") {
+            sender.refreshConversations()
+            recipient.refreshConversations()
+            isJoinedEncrypted(sender, roomId) && isJoinedEncrypted(recipient, roomId)
+        }
+        sender.openConversation(roomId)
+        recipient.openConversation(roomId)
+        reportProgress(instrumentation, "room-invite", "awaitRoomReady", "complete")
+
+        onStep("verifyGroupPeer")
+        reportProgress(instrumentation, "room-invite", "verifyGroupPeer", "start")
+        sender.inviteConversationParticipant(roomId, groupPeerId)
+        await("third participant invitation") {
+            groupPeer.refreshConversations()
+            groupPeer.conversations.value.any {
+                it.roomId == roomId && it.membership == "INVITED" && it.isEncrypted
+            }
+        }
+        groupPeer.acceptConversationInvitation(roomId)
+        await("all invited members joined the encrypted room") {
+            sender.refreshConversations()
+            recipient.refreshConversations()
+            groupPeer.refreshConversations()
+            isJoinedEncrypted(sender, roomId) &&
+                isJoinedEncrypted(recipient, roomId) &&
+                isJoinedEncrypted(groupPeer, roomId) &&
+                sender.conversations.value.any { it.roomId == roomId && it.isGroup }
+        }
+        reportProgress(instrumentation, "room-invite", "verifyGroupPeer", "complete")
+
+        sender.openConversation(roomId)
+        recipient.openConversation(roomId)
+        groupPeer.openConversation(roomId)
+        val body = "room-invite-$marker"
+        onStep("sendGroupMessage")
+        reportProgress(instrumentation, "room-invite", "sendGroupMessage", "start")
+        assertTrue("The encrypted group message must enter the SDK send queue", sender.sendText(roomId, body))
+        reportProgress(instrumentation, "room-invite", "sendGroupMessage", "complete")
+
+        onStep("awaitDelivery")
+        reportProgress(instrumentation, "room-invite", "awaitDelivery", "start")
+        awaitMessage(sender, "sender's room-invite message") {
+            it.body == body && it.isOwn && it.eventId != null
+        }
+        awaitMessage(recipient, "existing member's room-invite message") {
+            it.body == body && !it.isOwn && it.eventId != null
+        }
+        awaitMessage(groupPeer, "new member's room-invite message") {
+            it.body == body && !it.isOwn && it.eventId != null
+        }
+        reportProgress(instrumentation, "room-invite", "awaitDelivery", "complete")
+        reportSafeResult(instrumentation, "room-invite", "joined", "encrypted-exchange")
+        println(
+            "OUTBOX_DIAG_RESULT stage=room-invite directPeerJoined=true thirdPeerInvitedAndJoined=true " +
+                "encryptedMessageReceivedByBoth=true",
+        )
+    }
+
     private suspend fun runCoreAcceptance(
         homeserver: String,
         senderId: String,
@@ -206,7 +320,7 @@ class AndroidPeerAcceptanceIntegrationTest {
             recipient.refreshConversations()
             recipient.conversations.value.any { it.roomId == roomId }
         }
-        recipient.joinConversation(roomId)
+        recipient.acceptConversationInvitation(roomId)
         await("joined encrypted room") {
             sender.refreshConversations()
             recipient.refreshConversations()
@@ -248,7 +362,7 @@ class AndroidPeerAcceptanceIntegrationTest {
             recipient.refreshConversations()
             recipient.conversations.value.any { it.roomId == backgroundRoomId }
         }
-        recipient.joinConversation(backgroundRoomId)
+        recipient.acceptConversationInvitation(backgroundRoomId)
         await("joined background room") {
             sender.refreshConversations()
             recipient.refreshConversations()
@@ -677,8 +791,8 @@ class AndroidPeerAcceptanceIntegrationTest {
             recipient.conversations.value.any { it.roomId == groupRoomId } &&
                 groupPeer.conversations.value.any { it.roomId == groupRoomId }
         }
-        recipient.joinConversation(groupRoomId)
-        groupPeer.joinConversation(groupRoomId)
+        recipient.acceptConversationInvitation(groupRoomId)
+        groupPeer.acceptConversationInvitation(groupRoomId)
         await("all group members joined") {
             sender.refreshConversations()
             recipient.refreshConversations()
@@ -698,7 +812,7 @@ class AndroidPeerAcceptanceIntegrationTest {
             groupPeer.refreshConversations()
             groupPeer.conversations.value.any { it.roomId == groupVerificationRoomId }
         }
-        groupPeer.joinConversation(groupVerificationRoomId)
+        groupPeer.acceptConversationInvitation(groupVerificationRoomId)
         await("group peer verification room joined") {
             sender.refreshConversations()
             groupPeer.refreshConversations()
