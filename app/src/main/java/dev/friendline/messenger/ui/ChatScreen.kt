@@ -109,6 +109,7 @@ fun ChatScreen(
     searchResults: List<MessageSearchHit>,
     searchHasMore: Boolean,
     searchLoading: Boolean,
+    navigationTargetEventId: String?,
     error: String?,
     isSendingAttachment: Boolean,
     isRecordingVoiceNote: Boolean,
@@ -130,10 +131,10 @@ fun ChatScreen(
     onOpenAttachment: (ChatMessage) -> Unit,
     onRetry: () -> Unit,
     onReply: (ChatMessage) -> Unit,
+    onOpenReferencedMessage: (String) -> Unit,
     onCancelReply: () -> Unit,
     onToggleReaction: (ChatMessage, String) -> Unit,
     onEditMessage: (ChatMessage, String) -> Unit,
-    navigationTargetEventId: String?,
     onRedactMessage: (ChatMessage) -> Unit,
     onVerifyPeer: () -> Unit,
     onMessageSearchQueryChange: (String) -> Unit,
@@ -551,6 +552,7 @@ fun ChatScreen(
                             isEncrypted = isEncrypted,
                             onRetry = onRetry,
                             onReply = onReply,
+                            onOpenReferencedMessage = onOpenReferencedMessage,
                             onToggleReaction = onToggleReaction,
                             onEdit = { selected ->
                                 editingBody = selected.body
@@ -707,6 +709,7 @@ private fun MessageLine(
     isEncrypted: Boolean,
     onRetry: () -> Unit,
     onReply: (ChatMessage) -> Unit,
+    onOpenReferencedMessage: (String) -> Unit,
     onToggleReaction: (ChatMessage, String) -> Unit,
     onEdit: (ChatMessage) -> Unit,
     onRedact: (ChatMessage) -> Unit,
@@ -740,7 +743,14 @@ private fun MessageLine(
             ) {
                 Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                     if (!message.isOwn) Text(author, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
-                    if (message.replyToEventId != null) Text("↪ Reply", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                    if (message.replyToEventId != null) {
+                        Text(
+                            "↪ Reply",
+                            modifier = Modifier.clickable { onOpenReferencedMessage(message.replyToEventId) },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
                     message.attachment?.let { attachment ->
                         if (attachment.kind == AttachmentKind.AUDIO || attachment.mimeType.startsWith("audio/")) {
                             AudioMessageCard(

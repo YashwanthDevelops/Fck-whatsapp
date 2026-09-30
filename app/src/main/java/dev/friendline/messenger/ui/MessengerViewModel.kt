@@ -454,6 +454,11 @@ class MessengerViewModel(context: Context) : ViewModel() {
         openConversation(hit.roomId, focusEventId = hit.eventId)
     }
 
+    fun openReferencedMessage(eventId: String) {
+        val roomId = _state.value.currentRoomId ?: return
+        openConversation(roomId, focusEventId = eventId)
+    }
+
     fun completeMessageNavigation(eventId: String) {
         _state.update {
             if (it.navigationTargetEventId == eventId) it.copy(navigationTargetEventId = null) else it
