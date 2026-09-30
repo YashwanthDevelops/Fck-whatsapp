@@ -1680,7 +1680,7 @@ class MatrixRepository(context: Context) {
                 }
                 sendHandle.destroy()
                 runCatching { room.typingNotice(false) }
-                room.clearComposerDraft(null)
+                runCatching { room.clearComposerDraft(null) }
                 _composerDraft.value = ""
             }
         } finally {

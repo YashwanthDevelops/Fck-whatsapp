@@ -515,10 +515,14 @@ class MessengerViewModel(context: Context) : ViewModel() {
             runCatching { repository.sendText(roomId, body, replyTo) }
                 .onFailure { error ->
                     _state.update {
-                        it.copy(
-                            composerDraft = it.composerDraft.ifBlank { body },
-                            error = error.message ?: "Couldn't send this message.",
-                        )
+                        if (it.currentRoomId == roomId) {
+                            it.copy(
+                                composerDraft = it.composerDraft.ifBlank { body },
+                                error = error.message ?: "Couldn't send this message.",
+                            )
+                        } else {
+                            it
+                        }
                     }
                 }
         }
