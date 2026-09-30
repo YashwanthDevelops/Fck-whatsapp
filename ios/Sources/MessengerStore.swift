@@ -1203,7 +1203,7 @@ final class MessengerStore: ObservableObject {
             .filter { !$0.isEmpty }
         var seenIds = Set<String>()
         let ids = parsedIds.filter { seenIds.insert($0).inserted }
-        guard ids.allSatisfy({ $0.range(of: "^@[^:\\s]+:[^\\s]+$", options: .regularExpression) != nil }) else {
+        guard ids.allSatisfy({ MatrixUserIdPolicy.normalize($0) != nil }) else {
             errorMessage = "Enter complete Matrix IDs, such as @alex:example.org."
             return
         }
@@ -1381,6 +1381,52 @@ final class MessengerStore: ObservableObject {
             await refreshConversations()
         } catch {
             errorMessage = "Couldn't leave this conversation. Try again when connected."
+            await refreshConversations()
+        }
+    }
+
+    func inviteConversationParticipant(_ roomId: String, matrixUserId: String) async {
+        guard !invitationActionsInProgress.contains(roomId), beginClientOperation() else { return }
+        invitationActionsInProgress.insert(roomId)
+        defer {
+            invitationActionsInProgress.remove(roomId)
+            endClientOperation()
+        }
+
+        guard let targetUserId = MatrixUserIdPolicy.normalize(matrixUserId) else {
+            errorMessage = "Enter a complete Matrix ID, such as @alex:example.org."
+            return
+        }
+        guard targetUserId != userId else {
+            errorMessage = "You cannot invite yourself."
+            return
+        }
+        guard let client,
+              let room = client.rooms().first(where: { $0.id() == roomId }) else {
+            errorMessage = "This conversation is no longer available. Refresh the conversation list."
+            return
+        }
+
+        do {
+            let info = try await room.roomInfo()
+            guard info.membership == .joined else {
+                errorMessage = "You must be a joined member to invite someone."
+                return
+            }
+            guard info.topic != Self.verificationControlRoomTopic,
+                  info.encryptionState == .encrypted else {
+                errorMessage = "Only encrypted conversations can invite participants."
+                return
+            }
+            let activeMembers = try await room.activeHumanMemberIds()
+            guard !activeMembers.contains(targetUserId) else {
+                errorMessage = "This person is already invited or joined."
+                return
+            }
+            try await room.inviteUserById(userId: targetUserId)
+            await refreshConversations()
+        } catch {
+            errorMessage = "Couldn't invite this person. Check the Matrix ID and try again."
             await refreshConversations()
         }
     }

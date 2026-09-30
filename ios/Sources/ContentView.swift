@@ -37,6 +37,7 @@ struct ContentView: View {
     @State private var showingPrivacySettings = false
     @State private var searchText = ""
     @State private var conversationToLeave: Conversation?
+    @State private var conversationToInvite: Conversation?
 
     private var filteredConversations: [Conversation] {
         guard !searchText.isEmpty else { return messenger.conversations }
@@ -89,6 +90,12 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showingPrivacySettings) {
             PrivacySettingsScreen(canVerifyConversationPeer: messenger.currentPeerUserId != nil)
+                .modifier(PrivateScenePrivacyShield())
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
+        .sheet(item: $conversationToInvite) { conversation in
+            InviteParticipantSheet(conversation: conversation)
                 .modifier(PrivateScenePrivacyShield())
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
@@ -189,6 +196,16 @@ struct ContentView: View {
                                         .accessibilityLabel("Updating conversation membership")
                                 } else {
                                     Menu {
+                                        if conversation.isEncrypted {
+                                            Button {
+                                                conversationToInvite = conversation
+                                            } label: {
+                                                Label(
+                                                    conversation.isGroup ? "Invite participant" : "Add participant",
+                                                    systemImage: "person.badge.plus"
+                                                )
+                                            }
+                                        }
                                         Button(role: .destructive) {
                                             conversationToLeave = conversation
                                         } label: {
@@ -418,6 +435,52 @@ private struct PrivacySettingsScreen: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+private struct InviteParticipantSheet: View {
+    @EnvironmentObject private var messenger: MessengerStore
+    @Environment(\.dismiss) private var dismiss
+    let conversation: Conversation
+    @State private var matrixUserId = ""
+
+    private var normalizedMatrixUserId: String? {
+        MatrixUserIdPolicy.normalize(matrixUserId)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Text("Enter a full Matrix ID. The person will appear as invited until they accept.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    TextField("@name:example.org", text: $matrixUserId)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .textContentType(.username)
+                        .privacySensitive()
+                }
+                Section {
+                    Button(conversation.isGroup ? "Invite participant" : "Add participant") {
+                        guard let normalizedMatrixUserId else { return }
+                        Task {
+                            await messenger.inviteConversationParticipant(conversation.id, matrixUserId: normalizedMatrixUserId)
+                            dismiss()
+                        }
+                    }
+                    .disabled(messenger.isBusy || messenger.invitationActionsInProgress.contains(conversation.id) || normalizedMatrixUserId == nil)
+                }
+            }
+            .navigationTitle(conversation.isGroup ? "Invite to group" : "Add participant")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                        .disabled(messenger.invitationActionsInProgress.contains(conversation.id))
                 }
             }
         }

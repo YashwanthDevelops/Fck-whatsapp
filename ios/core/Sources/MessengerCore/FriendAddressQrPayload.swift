@@ -1,13 +1,13 @@
 import Foundation
 
-struct FriendAddressQrPayload: Equatable {
-    static let scheme = "friendline"
-    static let host = "friend"
+public struct FriendAddressQrPayload: Equatable {
+    public static let scheme = "friendline"
+    public static let host = "friend"
 
-    let matrixId: String
-    let homeserverUrl: String
+    public let matrixId: String
+    public let homeserverUrl: String
 
-    static func encode(matrixId: String, homeserverUrl: String, allowDevelopmentHTTP: Bool = false) throws -> String {
+    public static func encode(matrixId: String, homeserverUrl: String, allowDevelopmentHTTP: Bool = false) throws -> String {
         guard isValidMatrixId(matrixId) else { throw FriendAddressQrError.invalidMatrixId }
         let normalizedHomeserver = try normalizeHomeserver(homeserverUrl, allowDevelopmentHTTP: allowDevelopmentHTTP)
         let queryItems = [
@@ -21,7 +21,7 @@ struct FriendAddressQrPayload: Equatable {
         return "\(scheme)://\(host)?\(query)"
     }
 
-    static func parse(_ rawValue: String, allowDevelopmentHTTP: Bool = false) throws -> Self {
+    public static func parse(_ rawValue: String, allowDevelopmentHTTP: Bool = false) throws -> Self {
         guard rawValue.utf8.count <= 2_048,
               let components = URLComponents(string: rawValue),
               components.scheme?.lowercased() == scheme,
@@ -50,7 +50,7 @@ struct FriendAddressQrPayload: Equatable {
         )
     }
 
-    func resolve(forHomeserver currentHomeserver: String, allowDevelopmentHTTP: Bool = false) throws -> String {
+    public func resolve(forHomeserver currentHomeserver: String, allowDevelopmentHTTP: Bool = false) throws -> String {
         let current = try Self.normalizeHomeserver(currentHomeserver, allowDevelopmentHTTP: allowDevelopmentHTTP)
         guard Self.sameHomeserver(homeserverUrl, current) else { throw FriendAddressQrError.homeserverMismatch }
         return matrixId
@@ -120,7 +120,7 @@ struct FriendAddressQrPayload: Equatable {
     }
 }
 
-enum FriendAddressQrError: Error, Equatable {
+public enum FriendAddressQrError: Error, Equatable {
     case invalidMatrixId
     case invalidHomeserver
     case invalidPayload
