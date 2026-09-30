@@ -1357,6 +1357,34 @@ final class MessengerStore: ObservableObject {
         }
     }
 
+    func leaveConversation(_ roomId: String) async {
+        guard !invitationActionsInProgress.contains(roomId), beginClientOperation() else { return }
+        invitationActionsInProgress.insert(roomId)
+        defer {
+            invitationActionsInProgress.remove(roomId)
+            endClientOperation()
+        }
+        guard let client, let room = client.rooms().first(where: { $0.id() == roomId }) else {
+            errorMessage = "This conversation is no longer available. Refresh the conversation list."
+            return
+        }
+
+        do {
+            let info = try await room.roomInfo()
+            guard info.membership == .joined,
+                  info.topic != Self.verificationControlRoomTopic else {
+                errorMessage = "Only joined conversations can be left here."
+                await refreshConversations()
+                return
+            }
+            try await room.leave()
+            await refreshConversations()
+        } catch {
+            errorMessage = "Couldn't leave this conversation. Try again when connected."
+            await refreshConversations()
+        }
+    }
+
     func openConversation(_ roomId: String, focusing eventId: String? = nil) async {
         guard beginClientOperation() else { return }
         defer { endClientOperation() }

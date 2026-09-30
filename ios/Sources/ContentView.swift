@@ -36,6 +36,7 @@ struct ContentView: View {
     @State private var showingNewConversation = false
     @State private var showingPrivacySettings = false
     @State private var searchText = ""
+    @State private var conversationToLeave: Conversation?
 
     private var filteredConversations: [Conversation] {
         guard !searchText.isEmpty else { return messenger.conversations }
@@ -62,6 +63,23 @@ struct ContentView: View {
             Button("OK", role: .cancel) { messenger.errorMessage = nil }
         } message: {
             Text(messenger.errorMessage ?? "Please try again.")
+        }
+        .confirmationDialog(
+            conversationToLeave?.isGroup == true ? "Leave this group?" : "Leave this conversation?",
+            isPresented: Binding(
+                get: { conversationToLeave != nil },
+                set: { if !$0 { conversationToLeave = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Leave", role: .destructive) {
+                guard let roomId = conversationToLeave?.id else { return }
+                conversationToLeave = nil
+                Task { await messenger.leaveConversation(roomId) }
+            }
+            Button("Cancel", role: .cancel) { conversationToLeave = nil }
+        } message: {
+            Text("You will stop receiving new messages here. You can be invited again later.")
         }
         .sheet(isPresented: $showingNewConversation) {
             NewConversationScreen()
@@ -156,13 +174,39 @@ struct ContentView: View {
                                 }
                             }
                         } else {
-                            Button {
-                                Task { await messenger.openConversation(conversation.id) }
-                            } label: {
-                                ConversationRow(conversation: conversation)
+                            HStack(spacing: 8) {
+                                Button {
+                                    Task { await messenger.openConversation(conversation.id) }
+                                } label: {
+                                    ConversationRow(conversation: conversation)
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(messenger.isBusy || messenger.invitationActionsInProgress.contains(conversation.id))
+
+                                if messenger.invitationActionsInProgress.contains(conversation.id) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .accessibilityLabel("Updating conversation membership")
+                                } else {
+                                    Menu {
+                                        Button(role: .destructive) {
+                                            conversationToLeave = conversation
+                                        } label: {
+                                            Label(
+                                                conversation.isGroup ? "Leave group" : "Leave conversation",
+                                                systemImage: "rectangle.portrait.and.arrow.right"
+                                            )
+                                        }
+                                    } label: {
+                                        Image(systemName: "ellipsis.circle")
+                                            .font(.title3)
+                                            .foregroundStyle(.secondary)
+                                            .frame(minWidth: 44, minHeight: 44)
+                                    }
+                                    .accessibilityLabel("Actions for \(conversation.title)")
+                                    .disabled(messenger.isBusy)
+                                }
                             }
-                            .buttonStyle(.plain)
-                            .disabled(messenger.isBusy)
                         }
                         .listRowInsets(EdgeInsets(top: 12, leading: 20, bottom: 12, trailing: 20))
                     }
