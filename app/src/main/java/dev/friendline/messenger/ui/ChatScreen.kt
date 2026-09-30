@@ -133,6 +133,7 @@ fun ChatScreen(
     onCancelReply: () -> Unit,
     onToggleReaction: (ChatMessage, String) -> Unit,
     onEditMessage: (ChatMessage, String) -> Unit,
+    navigationTargetEventId: String?,
     onRedactMessage: (ChatMessage) -> Unit,
     onVerifyPeer: () -> Unit,
     onMessageSearchQueryChange: (String) -> Unit,
@@ -162,7 +163,8 @@ fun ChatScreen(
     val documentPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { onSendAttachment(it.toString()) }
     }
-    LaunchedEffect(roomId, messages.size, searchVisible) {
+    onMessageNavigationCompleted: (String) -> Unit,
+    LaunchedEffect(roomId, messages.size, searchVisible, navigationTargetEventId) {
         if (!searchVisible && messages.isNotEmpty()) {
             val layout = listState.layoutInfo
             val lastVisibleIndex = layout.visibleItemsInfo.lastOrNull()?.index
@@ -214,6 +216,15 @@ fun ChatScreen(
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.primary,
                                     fontWeight = FontWeight.Bold,
+            if (navigationTargetEventId != null) {
+                val targetIndex = messages.indexOfFirst { it.eventId == navigationTargetEventId }
+                if (targetIndex >= 0) {
+                    listState.scrollToItem(targetIndex)
+                    scrollToLatestOnLoad = false
+                    onMessageNavigationCompleted(navigationTargetEventId)
+                }
+                return@LaunchedEffect
+            }
                                 )
                             }
                         }

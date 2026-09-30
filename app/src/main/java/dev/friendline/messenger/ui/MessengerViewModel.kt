@@ -82,6 +82,7 @@ data class MessengerUiState(
     val currentRoomTitle: String = "",
     val currentRoomEncrypted: Boolean = false,
     val currentRoomIsGroup: Boolean = false,
+    val navigationTargetEventId: String? = null,
     val showNewConversation: Boolean = false,
     val error: String? = null,
 )
@@ -301,10 +302,16 @@ class MessengerViewModel(context: Context) : ViewModel() {
             }
             runCatching {
                 if (conversation?.membership == "INVITED") repository.joinConversation(roomId)
-                repository.openConversation(roomId)
+                repository.openConversation(roomId, focusEventId)
             }
                 .onSuccess {
-                    _state.update { it.copy(isBusy = false, composerDraft = repository.composerDraft.value) }
+                    _state.update {
+                        it.copy(
+                            isBusy = false,
+                            composerDraft = repository.composerDraft.value,
+                            navigationTargetEventId = focusEventId,
+                        )
+                    }
                 }
                 .onFailure {
                     _state.update {
@@ -334,6 +341,10 @@ class MessengerViewModel(context: Context) : ViewModel() {
                     _state.update {
                         it.copy(
                             isBusy = false,
+        openConversation(roomId, focusEventId = null)
+    }
+
+    private fun openConversation(roomId: String, focusEventId: String?) {
                             error = "Couldn't join this verification channel. Confirm it's from someone in an existing encrypted conversation, then sync and try again.",
                         )
                     }
@@ -360,6 +371,7 @@ class MessengerViewModel(context: Context) : ViewModel() {
                     peerTrust = PeerTrustStatus.UNKNOWN,
                     composerDraft = "",
                     replyTarget = null,
+                    navigationTargetEventId = null,
                     messageSearchQuery = "",
                     typingUsers = emptyList(),
                     error = if (it.voiceNoteFilePath != null &&
@@ -375,6 +387,7 @@ class MessengerViewModel(context: Context) : ViewModel() {
     }
 
     fun updateComposerDraft(body: String) {
+                            navigationTargetEventId = null,
         if (logoutRequested) return
         _state.update { it.copy(composerDraft = body) }
         val roomId = _state.value.currentRoomId ?: return
@@ -438,7 +451,13 @@ class MessengerViewModel(context: Context) : ViewModel() {
 
     fun openSearchHit(hit: MessageSearchHit) {
         updateMessageSearchQuery("")
-        openConversation(hit.roomId)
+        openConversation(hit.roomId, focusEventId = hit.eventId)
+    }
+
+    fun completeMessageNavigation(eventId: String) {
+        _state.update {
+            if (it.navigationTargetEventId == eventId) it.copy(navigationTargetEventId = null) else it
+        }
     }
 
     fun verifyConversationPeer() {
@@ -607,6 +626,7 @@ class MessengerViewModel(context: Context) : ViewModel() {
     }
 
     fun microphonePermissionDenied() {
+                    navigationTargetEventId = null,
         _state.update { it.copy(error = "Microphone access was denied. Allow it in Android Settings to record a voice message.") }
     }
 

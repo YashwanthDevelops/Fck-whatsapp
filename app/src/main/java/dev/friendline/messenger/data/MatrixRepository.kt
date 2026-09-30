@@ -1520,7 +1520,9 @@ class MatrixRepository(context: Context) {
         _verification.value = null
     }
 
-    suspend fun openConversation(roomId: String) = withContext(Dispatchers.IO) {
+    suspend fun openConversation(roomId: String) = openConversation(roomId, focusEventId = null)
+
+    suspend fun openConversation(roomId: String, focusEventId: String?) = withContext(Dispatchers.IO) {
         var stage = "select-room"
         try {
             val room = requireClient().rooms().firstOrNull { it.id() == roomId }
@@ -1547,7 +1549,15 @@ class MatrixRepository(context: Context) {
             refreshPeerTrust(room)
             stage = "create-timeline"
             val timelineConfiguration = TimelineConfiguration(
-                TimelineFocus.Live(false),
+                focusEventId?.let { eventId ->
+                    TimelineFocus.Event(
+                        eventId = eventId,
+                        numContextEvents = 40u.toUShort(),
+                        threadMode = uniffi.matrix_sdk_ui.TimelineEventFocusThreadMode.Automatic(
+                            hideThreadedEvents = false,
+                        ),
+                    )
+                } ?: TimelineFocus.Live(false),
                 TimelineFilter.All,
                 "conversation-${UUID.randomUUID()}",
                 DateDividerMode.DAILY,
