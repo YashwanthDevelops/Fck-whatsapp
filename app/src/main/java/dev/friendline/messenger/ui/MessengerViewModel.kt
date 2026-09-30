@@ -19,6 +19,7 @@ import dev.friendline.messenger.data.ConversationSummary
 import dev.friendline.messenger.data.DeviceVerificationUiState
 import dev.friendline.messenger.data.MessageSearchHit
 import dev.friendline.messenger.data.MatrixRepository
+import dev.friendline.messenger.data.MatrixUserIdPolicy
 import dev.friendline.messenger.data.FriendAddressQrPayload
 import dev.friendline.messenger.data.PendingVoiceNoteStillQueuedException
 import dev.friendline.messenger.data.PeerTrustStatus
@@ -308,7 +309,7 @@ class MessengerViewModel(context: Context) : ViewModel() {
             .map(String::trim)
             .filter(String::isNotEmpty)
             .distinct()
-        val invalid = invitees.firstOrNull { !it.matches(Regex("^@[^:\\s]+:[^\\s]+$")) }
+        val invalid = invitees.firstOrNull { MatrixUserIdPolicy.normalize(it) == null }
         if (invalid != null) {
             _state.update { it.copy(error = "Enter complete Matrix IDs, such as @alex:example.org.") }
             return
@@ -418,6 +419,13 @@ class MessengerViewModel(context: Context) : ViewModel() {
         runConversationMembershipAction(
             errorMessage = "Couldn't leave this conversation. Try again when connected.",
             action = { repository.leaveConversation(roomId) },
+        )
+    }
+
+    fun inviteConversationParticipant(roomId: String, matrixUserId: String) {
+        runConversationMembershipAction(
+            errorMessage = "Couldn't invite this person. Check the Matrix ID and try again.",
+            action = { repository.inviteConversationParticipant(roomId, matrixUserId) },
         )
     }
 

@@ -118,6 +118,7 @@ fun MessengerApp(viewModel: MessengerViewModel) {
             onAcceptInvitation = viewModel::acceptRoomInvitation,
             onDeclineInvitation = viewModel::declineRoomInvitation,
             onLeaveConversation = viewModel::leaveConversation,
+            onInviteParticipant = viewModel::inviteConversationParticipant,
             onNew = { viewModel.showNewConversation(true) },
             onLogout = viewModel::logout,
             onReadReceiptsChange = viewModel::setReadReceiptsEnabled,

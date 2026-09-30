@@ -374,7 +374,7 @@ class MatrixRepository(context: Context) {
             require(if (isGroup) invitees.size >= 2 else invitees.size == 1) {
                 if (isGroup) "A group needs at least two invitees." else "A one-to-one conversation needs one invitee."
             }
-            require(invitees.all { it.matches(Regex("^@[^:\\s]+:[^\\s]+$")) }) {
+            require(invitees.all { MatrixUserIdPolicy.normalize(it) != null }) {
                 "Every invitee must be a complete Matrix user ID."
             }
             val accountUserId = ownUserId
@@ -968,6 +968,29 @@ class MatrixRepository(context: Context) {
                 "You are no longer a member of this conversation"
             }
             room.leave()
+        } finally {
+            info.destroy()
+        }
+        refreshConversations()
+    }
+
+    suspend fun inviteConversationParticipant(roomId: String, matrixUserId: String) = withContext(Dispatchers.IO) {
+        val targetUserId = MatrixUserIdPolicy.normalize(matrixUserId)
+            ?: throw IllegalArgumentException("Enter a complete Matrix user ID")
+        check(targetUserId != ownUserId) { "You cannot invite yourself" }
+        val room = requireClient().rooms().firstOrNull { it.id() == roomId }
+            ?: throw IllegalArgumentException("This conversation is no longer available")
+        val info = room.roomInfo()
+        try {
+            check(info.membership == org.matrix.rustcomponents.sdk.Membership.JOINED) {
+                "You must be a joined member to invite someone"
+            }
+            check(info.topic != VERIFICATION_CONTROL_ROOM_TOPIC && room.encryptionState().name == "ENCRYPTED") {
+                "Only encrypted conversations can invite participants"
+            }
+            val activeMembers = room.activeHumanMemberIds().toSet()
+            check(targetUserId !in activeMembers) { "This person is already invited or joined" }
+            room.inviteUserById(targetUserId)
         } finally {
             info.destroy()
         }

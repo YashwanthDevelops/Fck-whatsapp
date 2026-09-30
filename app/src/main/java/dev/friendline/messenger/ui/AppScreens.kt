@@ -84,6 +84,7 @@ import dev.friendline.messenger.push.PushRegistrationStatus
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import dev.friendline.messenger.data.ConversationSummary
+import dev.friendline.messenger.data.MatrixUserIdPolicy
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
@@ -197,6 +198,7 @@ fun ConversationListScreen(
     onAcceptInvitation: (String) -> Unit,
     onDeclineInvitation: (String) -> Unit,
     onLeaveConversation: (String) -> Unit,
+    onInviteParticipant: (String, String) -> Unit,
     onNew: () -> Unit,
     onLogout: () -> Unit,
     onReadReceiptsChange: (Boolean) -> Unit,
@@ -210,6 +212,8 @@ fun ConversationListScreen(
     var query by rememberSaveable { mutableStateOf("") }
     var showPrivacySettings by rememberSaveable { mutableStateOf(false) }
     var conversationPendingLeave by remember { mutableStateOf<ConversationSummary?>(null) }
+    var conversationPendingInvite by remember { mutableStateOf<ConversationSummary?>(null) }
+    var participantMatrixId by rememberSaveable { mutableStateOf("") }
     val focusManager = LocalFocusManager.current
     val visible = remember(conversations, query) {
         conversations.filterNot { row -> row.isVerificationControl && row.membership != "INVITED" }
@@ -311,6 +315,12 @@ fun ConversationListScreen(
                             ConversationRow(
                                 conversation,
                                 onClick = { onOpen(conversation.roomId) },
+                                onInviteParticipant = if (isBusy || !conversation.isEncrypted) null else {
+                                    {
+                                        conversationPendingInvite = conversation
+                                        participantMatrixId = ""
+                                    }
+                                },
                                 onLeave = if (isBusy) null else { { conversationPendingLeave = conversation } },
                             )
                         }
@@ -404,6 +414,46 @@ fun ConversationListScreen(
             },
             dismissButton = {
                 TextButton(onClick = { conversationPendingLeave = null }, enabled = !isBusy) { Text("Cancel") }
+            },
+        )
+    }
+    conversationPendingInvite?.let { conversation ->
+        val normalizedMatrixId = MatrixUserIdPolicy.normalize(participantMatrixId)
+        AlertDialog(
+            onDismissRequest = { if (!isBusy) conversationPendingInvite = null },
+            title = { Text(if (conversation.isGroup) "Invite to group" else "Add participant") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Enter a full Matrix ID. The person will appear as invited until they accept.")
+                    OutlinedTextField(
+                        value = participantMatrixId,
+                        onValueChange = { participantMatrixId = it },
+                        label = { Text("Matrix ID") },
+                        placeholder = { Text("@name:example.org") },
+                        singleLine = true,
+                        isError = participantMatrixId.isNotBlank() && normalizedMatrixId == null,
+                        supportingText = {
+                            if (participantMatrixId.isNotBlank() && normalizedMatrixId == null) {
+                                Text("Use a complete Matrix ID, such as @alex:example.org.")
+                            }
+                        },
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val roomId = conversationPendingInvite?.roomId ?: return@TextButton
+                        val matrixId = normalizedMatrixId ?: return@TextButton
+                        conversationPendingInvite = null
+                        participantMatrixId = ""
+                        onInviteParticipant(roomId, matrixId)
+                    },
+                    enabled = !isBusy && normalizedMatrixId != null,
+                ) { Text("Invite") }
+            },
+            dismissButton = {
+                TextButton(onClick = { conversationPendingInvite = null }, enabled = !isBusy) { Text("Cancel") }
             },
         )
     }
@@ -538,6 +588,7 @@ private fun ConnectionLine(status: String) {
 private fun ConversationRow(
     conversation: ConversationSummary,
     onClick: (() -> Unit)?,
+    onInviteParticipant: (() -> Unit)? = null,
     onLeave: (() -> Unit)? = null,
 ) {
     var actionsExpanded by remember(conversation.roomId) { mutableStateOf(false) }
@@ -590,7 +641,7 @@ private fun ConversationRow(
                 if (conversation.isEncrypted) Icon(Icons.Filled.Lock, contentDescription = null, modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.primary)
             }
             Text(
-                if (conversation.membership == "INVITED") "Invitation · tap to accept" else conversation.preview,
+                if (conversation.membership == "INVITED") "Invitation · choose Accept or Decline" else conversation.preview,
                 style = MaterialTheme.typography.bodyMedium,
                 color = if (conversation.membership == "INVITED") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
@@ -622,6 +673,15 @@ private fun ConversationRow(
                     Icon(Icons.Filled.MoreVert, contentDescription = null)
                 }
                 DropdownMenu(expanded = actionsExpanded, onDismissRequest = { actionsExpanded = false }) {
+                    if (onInviteParticipant != null) {
+                        DropdownMenuItem(
+                            text = { Text(if (conversation.isGroup) "Invite participant" else "Add participant") },
+                            onClick = {
+                                actionsExpanded = false
+                                onInviteParticipant()
+                            },
+                        )
+                    }
                     DropdownMenuItem(
                         text = { Text(if (conversation.isGroup) "Leave group" else "Leave conversation") },
                         onClick = {
