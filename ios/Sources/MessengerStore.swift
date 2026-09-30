@@ -4922,8 +4922,6 @@ final class MessengerStore: ObservableObject {
     }
 
     private static let deliveryAckMsgtype = "org.friendline.delivery"
-    private static let deliveryAckTextPrefix = "\u{2063}org.friendline.delivery-ack.v1:"
-    private static let maximumDeliveryAckEventIdLength = 1024
 
     private static func deliveryAckTarget(from messageType: MessageType) -> String? {
         switch messageType {
@@ -4931,23 +4929,14 @@ final class MessengerStore: ObservableObject {
             // Continue to consume acknowledgements emitted by older iOS builds.
             return msgtype == deliveryAckMsgtype ? eventId : nil
         case let .text(content):
-            let body = content.body
-            guard body.hasPrefix(deliveryAckTextPrefix) else { return nil }
-            let eventId = String(body.dropFirst(deliveryAckTextPrefix.count))
-            guard !eventId.isEmpty,
-                  eventId.utf16.count <= maximumDeliveryAckEventIdLength,
-                  eventId.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return nil }
-            return eventId
+            return DeliveryAcknowledgementMessage.targetEventId(in: content.body)
         default:
             return nil
         }
     }
 
     private static func encodedDeliveryAckBody(_ eventId: String) -> String? {
-        guard !eventId.isEmpty,
-              eventId.utf16.count <= maximumDeliveryAckEventIdLength,
-              eventId.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return nil }
-        return deliveryAckTextPrefix + eventId
+        DeliveryAcknowledgementMessage.body(for: eventId)
     }
 
     private static let maximumAttachmentBytes: UInt64 = 100 * 1024 * 1024

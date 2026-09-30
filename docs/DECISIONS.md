@@ -58,10 +58,10 @@ The decisions below are approved project direction as of 2026-09-28. Implementat
 
 **Reason:** call signaling, NAT traversal, permissions, audio routing, and reconnect behavior create a separate lifecycle/security project and should not delay reliable messaging.
 
-## ADR-008 — Windows host constraint and Apple-platform validation
+## ADR-008 — Windows host and Apple-platform validation
 
-**Status:** current fact; must be revisited when an Apple build host exists.
+**Status:** supersedes the original macOS/Xcode assumption; current access requirements are tracked in `PROJECT_ACCESS_REQUIREMENTS.md`.
 
-**Decision:** continue implementation autonomously. iOS compilation, Simulator checks, and device signing require macOS/Xcode; run all independent work on this host and request Apple-host/device access only when those validations are ready.
+**Decision:** build the iOS SwiftPM app with xtool from WSL/Linux. Use `xtool dev build` for the app build gate and `xtool dev` for signing, installation, and launch on a paired physical iPhone. Keep platform-neutral Swift tests on Linux. Do not treat those tests as a substitute for the iOS binary or device gates.
 
-**Reason:** Xcode and Swift are not installed and cannot run natively on this Windows workspace.
+**Reason:** the Xcode IDE and a Mac are not prerequisites for the xtool route, so independent iOS work can proceed on this host. Apple's Darwin SDK archive and Apple account access are still required to install the SDK and sign a development build; an iPhone is required for native behavior validation. Simulator checks are not part of the current WSL validation path.

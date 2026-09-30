@@ -68,4 +68,30 @@ final class DeliveryStatusPolicyTests: XCTestCase {
             legacyDelivered: true
         ), "Sent")
     }
+
+    func testDeliveryAcknowledgementMessageRoundTripsAndRejectsMalformedTargets() throws {
+        let eventId = "$event:example.org"
+        let body = try XCTUnwrap(DeliveryAcknowledgementMessage.body(for: eventId))
+
+        XCTAssertEqual(DeliveryAcknowledgementMessage.targetEventId(in: body), eventId)
+        XCTAssertNil(DeliveryAcknowledgementMessage.targetEventId(in: "A normal message"))
+        XCTAssertNil(DeliveryAcknowledgementMessage.targetEventId(in: "\u{2063}org.friendline.delivery-ack.v1:"))
+        XCTAssertNil(DeliveryAcknowledgementMessage.targetEventId(in: body + "\n"))
+    }
+
+    func testDeliveryAcknowledgementMessageEnforcesTheEventIdLengthBound() throws {
+        let maximumEventId = String(repeating: "a", count: 1024)
+        let oversizedEventId = maximumEventId + "a"
+
+        XCTAssertEqual(
+            DeliveryAcknowledgementMessage.targetEventId(
+                in: try XCTUnwrap(DeliveryAcknowledgementMessage.body(for: maximumEventId))
+            ),
+            maximumEventId
+        )
+        XCTAssertNil(DeliveryAcknowledgementMessage.body(for: oversizedEventId))
+        XCTAssertNil(DeliveryAcknowledgementMessage.targetEventId(
+            in: "\u{2063}org.friendline.delivery-ack.v1:" + oversizedEventId
+        ))
+    }
 }
