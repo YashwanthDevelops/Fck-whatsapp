@@ -62,6 +62,7 @@ import org.matrix.rustcomponents.sdk.Room
 import org.matrix.rustcomponents.sdk.RoomHistoryVisibility
 import org.matrix.rustcomponents.sdk.RoomMessageEventContentWithoutRelation
 import org.matrix.rustcomponents.sdk.SearchService
+import org.matrix.rustcomponents.sdk.MembershipState
 import org.matrix.rustcomponents.sdk.SearchServicePaginationStateListener
 import org.matrix.rustcomponents.sdk.SearchServiceResult
 import org.matrix.rustcomponents.sdk.SearchServiceResultsListener
@@ -3777,7 +3778,7 @@ class MatrixRepository(context: Context) {
 
         val expectedMembers = runCatching {
             val senderId = checkNotNull(ownUserId)
-            snapshotDeliveryRecipients(room.activeHumanMemberIds(), senderId)
+            snapshotJoinedDeliveryRecipients(joinedHumanDeliveryCandidates(room), senderId)
         }.getOrNull()
         val reservation = DeliverySnapshotReservation(roomId, expectedMembers)
         val installed = synchronized(deliverySnapshotReservationLock) {
@@ -4595,6 +4596,26 @@ class MatrixRepository(context: Context) {
             runCatching { observer.handle.close() }
             runCatching { observer.timeline.close() }
         }
+    private suspend fun joinedHumanDeliveryCandidates(room: Room): List<DeliveryRecipientCandidate> {
+        val iterator = room.members()
+        return try {
+            buildList {
+                while (true) {
+                    val chunk = iterator.nextChunk(64u) ?: break
+                    addAll(chunk.map { member ->
+                        DeliveryRecipientCandidate(
+                            userId = member.userId,
+                            isJoined = member.membership is MembershipState.Join,
+                            isServiceMember = member.isServiceMember,
+                        )
+                    })
+                }
+            }
+        } finally {
+            iterator.close()
+        }
+    }
+
         pendingMediaObservers.clear()
     }
 
