@@ -2331,22 +2331,28 @@ final class MessengerStore: ObservableObject {
     private func humanMembershipSnapshot(in room: Room) async throws -> (joinedRecipients: Set<String>, activeHumanMembers: Set<String>) {
         guard let userId else { throw MessengerError.messageUnavailable }
         let iterator = try await room.members()
-        var joinedRecipients = Set<String>()
-        var activeHumanMembers = Set<String>()
+        var joinedMemberIds = Set<String>()
+        var invitedMemberIds = Set<String>()
+        var serviceMemberIds = Set<String>()
         while let chunk = iterator.nextChunk(chunkSize: 64) {
-            for member in chunk where member.userId != userId && !member.isServiceMember {
+            for member in chunk {
+                if member.isServiceMember {
+                    serviceMemberIds.insert(member.userId)
+                }
                 if member.membership == .join {
-                    joinedRecipients.insert(member.userId)
-                    activeHumanMembers.insert(member.userId)
+                    joinedMemberIds.insert(member.userId)
                 } else if member.membership == .invite {
-                    // Preserve the existing peer-verification behavior for an
-                    // invited direct-room peer. Invited users are not delivery
-                    // recipients until they have joined and can decrypt events.
-                    activeHumanMembers.insert(member.userId)
+                    invitedMemberIds.insert(member.userId)
                 }
             }
         }
-        return (joinedRecipients: joinedRecipients, activeHumanMembers: activeHumanMembers)
+        let snapshot = snapshotHumanMembership(
+            joinedMemberIds: joinedMemberIds,
+            invitedMemberIds: invitedMemberIds,
+            serviceMemberIds: serviceMemberIds,
+            ownUserId: userId
+        )
+        return (joinedRecipients: snapshot.joinedRecipientIds, activeHumanMembers: snapshot.activeHumanMemberIds)
     }
 
     private func acquireRoomSendGate(_ roomId: String) async {
