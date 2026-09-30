@@ -822,6 +822,10 @@ final class MessengerStore: ObservableObject {
     @Published private(set) var pendingAttachmentForCurrentRoom = false
     @Published private(set) var pendingAttachmentIsInSendQueue = false
     @Published private(set) var isRoomTimelineReady = false
+    @Published private(set) var isLoadingOlderTimeline = false
+    @Published private(set) var hasMoreTimelineHistory = true
+    @Published private(set) var timelineHistoryError: String?
+    @Published private(set) var timelineHistoryPageRevision = 0
     @Published private(set) var verificationStep: VerificationStep = .idle
     @Published private(set) var verificationPeer = ""
     @Published private(set) var verificationDeviceId = ""
@@ -838,6 +842,37 @@ final class MessengerStore: ObservableObject {
         !pendingAttachmentIsInSendQueue || pendingAttachmentSendHandle != nil
     }
 
+    var friendAddressQrPayload: String? {
+        guard let userId else { return nil }
+        #if DEBUG
+        let allowDevelopmentHTTP = true
+        #else
+        let allowDevelopmentHTTP = false
+        #endif
+        return try? FriendAddressQrPayload.encode(
+            matrixId: userId,
+            homeserverUrl: homeserver,
+            allowDevelopmentHTTP: allowDevelopmentHTTP
+        )
+    }
+
+    func resolveFriendAddressQr(_ rawValue: String) -> String? {
+        #if DEBUG
+        let allowDevelopmentHTTP = true
+        #else
+        let allowDevelopmentHTTP = false
+        #endif
+        do {
+            let payload = try FriendAddressQrPayload.parse(rawValue, allowDevelopmentHTTP: allowDevelopmentHTTP)
+            let matrixId = try payload.resolve(forHomeserver: homeserver, allowDevelopmentHTTP: allowDevelopmentHTTP)
+            errorMessage = nil
+            return matrixId
+        } catch {
+            errorMessage = "This QR is invalid or uses a different homeserver. Enter the Matrix ID manually."
+            return nil
+        }
+    }
+
     private var client: Client?
     private var syncService: SyncService?
     private var syncObserver: TaskHandle?
@@ -845,6 +880,7 @@ final class MessengerStore: ObservableObject {
     private var sendQueueUpdatesHandle: TaskHandle?
     private var activeTimeline: Timeline?
     private var timelineObserver: TaskHandle?
+    private var timelineVisibleSlotLimit = 300
     private var deliveryAckTimelineSubscriptions: [String: DeliveryAckTimelineSubscription] = [:]
     private var deliveryAckObserverTokens: [String: UUID] = [:]
     private var readReceiptEventIdsByRoom: [String: Set<String>] = [:]
@@ -1376,6 +1412,10 @@ final class MessengerStore: ObservableObject {
         currentRoomId = roomId
         navigationTargetEventId = eventId
         isRoomTimelineReady = false
+        isLoadingOlderTimeline = false
+        hasMoreTimelineHistory = true
+        timelineHistoryError = nil
+        timelineVisibleSlotLimit = 300
         restorePendingAttachmentForCurrentRoom()
         currentRoomEncrypted = room.encryptionState() == .encrypted
         currentRoomIsGroup = false
@@ -1456,6 +1496,40 @@ final class MessengerStore: ObservableObject {
         }
     }
 
+    func loadOlderTimeline(retrying: Bool = false) {
+        guard hasMoreTimelineHistory, !isLoadingOlderTimeline,
+              retrying || timelineHistoryError == nil,
+              let timeline = activeTimeline, let roomId = currentRoomId,
+              beginClientOperation() else { return }
+
+        let generation = roomOpenGeneration
+        isLoadingOlderTimeline = true
+        timelineHistoryError = nil
+        Task {
+            defer {
+                endClientOperation()
+                if roomOpenGeneration == generation {
+                    isLoadingOlderTimeline = false
+                }
+            }
+
+            do {
+                let hitTimelineStart = try await timeline.paginateBackwards(numEvents: 50)
+                guard roomOpenGeneration == generation, currentRoomId == roomId else { return }
+                hasMoreTimelineHistory = !hitTimelineStart
+                if timelineVisibleSlotLimit <= Int.max - 50 {
+                    timelineVisibleSlotLimit += 50
+                }
+                publishVisibleTimeline()
+                timelineHistoryError = nil
+                timelineHistoryPageRevision += 1
+            } catch {
+                guard roomOpenGeneration == generation, currentRoomId == roomId else { return }
+                timelineHistoryError = "Couldn't load earlier messages. Check your connection and retry."
+            }
+        }
+    }
+
     func closeConversation() {
         let roomId = currentRoomId
         let savedDraft = draft
@@ -1490,6 +1564,10 @@ final class MessengerStore: ObservableObject {
         isBusy = false
         timelineBuffer.apply(.clear)
         messages = []
+        isLoadingOlderTimeline = false
+        hasMoreTimelineHistory = true
+        timelineHistoryError = nil
+        timelineVisibleSlotLimit = 300
         draft = ""
         replyTarget = nil
         replyTargetRoomId = nil
@@ -3826,7 +3904,19 @@ final class MessengerStore: ObservableObject {
                 timelineBuffer.apply(.reset(values.map { makeMessage($0, roomId: roomId) }))
             }
         }
-        messages = timelineBuffer.visible(limit: 300)
+        publishVisibleTimeline()
+        refreshDeliveryStates()
+        if diff.contains(where: { if case .reset = $0 { return true }; return false }) {
+            isRoomTimelineReady = true
+        }
+        reconcilePendingAttachment(in: roomId)
+        if deliveryAckLedgerDirty || !(deliveryAckLedger.pendingByRoom[roomId] ?? []).isEmpty {
+            queuePendingDeliveryAcknowledgements(in: roomId)
+        }
+    }
+
+    private func publishVisibleTimeline() {
+        messages = timelineBuffer.visible(limit: timelineVisibleSlotLimit)
         var positions = [String: Int]()
         var uniqueMessages = [ChatMessage]()
         for message in messages {
@@ -3838,14 +3928,6 @@ final class MessengerStore: ObservableObject {
             }
         }
         messages = uniqueMessages
-        refreshDeliveryStates()
-        if diff.contains(where: { if case .reset = $0 { return true }; return false }) {
-            isRoomTimelineReady = true
-        }
-        reconcilePendingAttachment(in: roomId)
-        if deliveryAckLedgerDirty || !(deliveryAckLedger.pendingByRoom[roomId] ?? []).isEmpty {
-            queuePendingDeliveryAcknowledgements(in: roomId)
-        }
     }
 
     private func observeDeliveryAcknowledgements(diff: [TimelineDiff], roomId: String) {

@@ -745,6 +745,9 @@ private struct ChatScreen: View {
     @State private var loadingAudioMessageID: String?
     @State private var editingMessage: ChatMessage?
     @State private var messagePendingRedaction: ChatMessage?
+    @State private var hasPositionedTimeline = false
+    @State private var shouldFollowLatestMessage = true
+    @State private var olderHistoryAnchorMessageId: String?
     @FocusState private var composerFocused: Bool
 
     private var visibleMessages: [ChatMessage] {
@@ -855,6 +858,33 @@ private struct ChatScreen: View {
                         ScrollViewReader { proxy in
                             ScrollView {
                                 LazyVStack(spacing: 14) {
+                                    if messenger.isLoadingOlderTimeline {
+                                        ProgressView("Loading earlier messages…")
+                                            .font(.caption)
+                                            .frame(maxWidth: .infinity)
+                                            .padding(.vertical, 8)
+                                    } else if let historyError = messenger.timelineHistoryError {
+                                        VStack(spacing: 6) {
+                                            Text(historyError)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                            Button("Retry loading earlier messages") {
+                                                if olderHistoryAnchorMessageId == nil {
+                                                    olderHistoryAnchorMessageId = visibleMessages.first?.id
+                                                }
+                                                messenger.loadOlderTimeline(retrying: true)
+                                            }
+                                            .font(.caption.weight(.semibold))
+                                        }
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 8)
+                                    } else if !messenger.hasMoreTimelineHistory {
+                                        Text("Beginning of conversation")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .frame(maxWidth: .infinity)
+                                            .padding(.vertical, 8)
+                                    }
                                     ForEach(visibleMessages) { message in
                                         MessageRow(
                                             message: message,
@@ -896,15 +926,38 @@ private struct ChatScreen: View {
                                     return message.id
                                 })
                                 messenger.markVisibleIncomingMessagesRead(visibleIds)
+
+                                if let last = visibleMessages.last, let frame = frames[last.id] {
+                                    shouldFollowLatestMessage = !frame.intersection(bounds).isNull &&
+                                        frame.maxY <= bounds.maxY + 80 && frame.maxY >= bounds.minY - 80
+                                } else {
+                                    shouldFollowLatestMessage = false
+                                }
+
+                                if hasPositionedTimeline,
+                                   messenger.navigationTargetEventId == nil,
+                                   messenger.hasMoreTimelineHistory,
+                                   !messenger.isLoadingOlderTimeline,
+                                   messenger.timelineHistoryError == nil,
+                                   let oldest = visibleMessages.first,
+                                   let frame = frames[oldest.id],
+                                   !frame.intersection(bounds).isNull,
+                                   frame.minY >= -70, frame.minY <= 50 {
+                                    olderHistoryAnchorMessageId = oldest.id
+                                    messenger.loadOlderTimeline()
+                                }
                             }
                             .onAppear {
                                 if let targetId = messenger.navigationTargetEventId,
                                    let target = visibleMessages.first(where: { $0.eventId == targetId }) {
                                     withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(target.id, anchor: .center) }
                                     messenger.completeMessageNavigation(targetId)
+                                    hasPositionedTimeline = true
                                 } else if messenger.navigationTargetEventId == nil,
                                           let last = visibleMessages.last {
                                     proxy.scrollTo(last.id, anchor: .bottom)
+                                    hasPositionedTimeline = true
+                                    shouldFollowLatestMessage = true
                                 }
                             }
                             .onChange(of: visibleMessages.count) { _ in
@@ -912,10 +965,35 @@ private struct ChatScreen: View {
                                     if let target = visibleMessages.first(where: { $0.eventId == targetId }) {
                                         withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(target.id, anchor: .center) }
                                         messenger.completeMessageNavigation(targetId)
+                                        hasPositionedTimeline = true
                                     }
-                                } else if let last = visibleMessages.last {
+                                } else if messenger.isLoadingOlderTimeline {
+                                    return
+                                } else if let anchorId = olderHistoryAnchorMessageId {
+                                    proxy.scrollTo(anchorId, anchor: .top)
+                                    olderHistoryAnchorMessageId = nil
+                                    hasPositionedTimeline = true
+                                    shouldFollowLatestMessage = false
+                                } else if !hasPositionedTimeline, let last = visibleMessages.last {
+                                    withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(last.id, anchor: .bottom) }
+                                    hasPositionedTimeline = true
+                                    shouldFollowLatestMessage = true
+                                } else if shouldFollowLatestMessage, let last = visibleMessages.last {
                                     withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(last.id, anchor: .bottom) }
                                 }
+                            }
+                            .onChange(of: messenger.timelineHistoryPageRevision) { _ in
+                                if let anchorId = olderHistoryAnchorMessageId {
+                                    proxy.scrollTo(anchorId, anchor: .top)
+                                    olderHistoryAnchorMessageId = nil
+                                    hasPositionedTimeline = true
+                                    shouldFollowLatestMessage = false
+                                }
+                            }
+                            .onChange(of: messenger.currentRoomId) { _ in
+                                hasPositionedTimeline = false
+                                shouldFollowLatestMessage = true
+                                olderHistoryAnchorMessageId = nil
                             }
                             .overlay {
                                 if visibleMessages.isEmpty {
