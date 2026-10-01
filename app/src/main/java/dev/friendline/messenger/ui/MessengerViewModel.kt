@@ -21,6 +21,7 @@ import dev.friendline.messenger.data.MessageSearchHit
 import dev.friendline.messenger.data.MatrixRepository
 import dev.friendline.messenger.data.MatrixAttachmentOpenFailure
 import dev.friendline.messenger.data.MatrixRoomCreateFailure
+import dev.friendline.messenger.data.HomeserverFailurePolicy
 import dev.friendline.messenger.data.MatrixUserIdPolicy
 import dev.friendline.messenger.data.FriendAddressQrPayload
 import dev.friendline.messenger.data.PendingVoiceNoteStillQueuedException
@@ -368,7 +369,9 @@ class MessengerViewModel(context: Context) : ViewModel() {
                 .onFailure { error ->
                     val safeMessage = when (error) {
                         is IllegalArgumentException -> error.message ?: "Check the homeserver address."
-                        else -> if (debugFailureDetails) {
+                        else -> if (HomeserverFailurePolicy.targetsLoopback(error)) {
+                            "This app tried to reach localhost, which points to this phone. Set Homeserver address to your laptop's Wi-Fi address (for example http://192.168.1.6:8008) and sign in again."
+                        } else if (debugFailureDetails) {
                             "Sign-in failed (${error.javaClass.simpleName}): ${error.message.orEmpty().take(220)}"
                         } else {
                             "Couldn't sign in. Check the homeserver, Matrix ID, and password, then try again."
@@ -412,7 +415,9 @@ class MessengerViewModel(context: Context) : ViewModel() {
                     openConversation(roomId)
                 }
                 .onFailure { failure ->
-                    val errorMessage = if (debugFailureDetails) {
+                    val errorMessage = if (HomeserverFailurePolicy.targetsLoopback(failure)) {
+                        "This signed-in session is still contacting localhost, which points to this phone. Go back, open Server and privacy settings, enter your laptop's Wi-Fi address (for example http://192.168.1.6:8008), tap Reconnect to homeserver, wait for Connected, then retry."
+                    } else if (debugFailureDetails) {
                         val rootCause = generateSequence(failure) { it.cause }.last()
                         val stage = (failure as? MatrixRoomCreateFailure)?.stage
                             ?.let { " during $it" }

@@ -606,6 +606,9 @@ private fun VerificationInvitationRow(
 @Composable
 private fun ConnectionLine(status: String, homeserver: String) {
     val connected = status.equals("Connected", ignoreCase = true)
+    val isLoopback = runCatching {
+        Uri.parse(homeserver).host?.lowercase() in setOf("localhost", "127.0.0.1", "::1")
+    }.getOrDefault(false)
     val color = if (connected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
     val target = runCatching {
         Uri.parse(homeserver).let { uri ->
@@ -619,6 +622,8 @@ private fun ConnectionLine(status: String, homeserver: String) {
         modifier = Modifier.semantics(mergeDescendants = true) {
             contentDescription = if (connected) {
                 "Connected to $target. Message sync is active."
+            } else if (isLoopback) {
+                "$status. The saved homeserver is localhost, which points to this phone. Open Server and privacy settings to reconnect to the laptop address."
             } else {
                 "$status to $target. Message sync may be delayed. Check Server and privacy settings."
             }
@@ -628,7 +633,11 @@ private fun ConnectionLine(status: String, homeserver: String) {
     ) {
         Box(Modifier.size(8.dp).clip(CircleShape).background(color))
         Text(
-            if (connected) "Connected · message sync" else "$status · $target · messages may be delayed",
+            when {
+                connected -> "Connected · message sync"
+                isLoopback -> "$status · localhost is this phone · update Server and privacy settings"
+                else -> "$status · $target · messages may be delayed"
+            },
             style = MaterialTheme.typography.labelMedium,
             color = if (connected) MaterialTheme.colorScheme.onSurfaceVariant else color,
         )
