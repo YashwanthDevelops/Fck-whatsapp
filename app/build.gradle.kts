@@ -81,6 +81,10 @@ android {
             dimension = "lane"
             applicationIdSuffix = ".outboxdiag"
         }
+        create("phoneTest") {
+            dimension = "lane"
+            applicationIdSuffix = ".phonetest"
+        }
     }
 
     signingConfigs {
