@@ -141,6 +141,11 @@ fun LoginScreen(
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next),
         )
+        Text(
+            "On a phone, use the laptop's current Wi-Fi address here (for example, http://192.168.1.6:8008), not localhost. Matrix IDs ending in :localhost can stay as they are.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Spacer(Modifier.height(12.dp))
         OutlinedTextField(
             value = username,
