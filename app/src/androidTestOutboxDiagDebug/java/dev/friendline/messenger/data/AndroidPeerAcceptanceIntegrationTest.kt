@@ -166,7 +166,7 @@ class AndroidPeerAcceptanceIntegrationTest {
                     "state=complete category=${failureCategory(failure)} fingerprint=$fingerprint " +
                     "classChain=${safeClassChain(failure)}$identityFields",
             )
-            if (step == "verificationRequest") {
+            if (step == "verificationRequest" || step.startsWith("verificationSeed")) {
                 val verificationStages = "${sender?.verificationStageForDiagnostic() ?: "none"}|" +
                     "${recipient?.verificationStageForDiagnostic() ?: "none"}"
                 println("OUTBOX_DIAG_VERIFY_STAGE sender=${verificationStages.substringBefore('|')} recipient=${verificationStages.substringAfter('|')}")
@@ -1769,6 +1769,8 @@ class AndroidPeerAcceptanceIntegrationTest {
         } finally {
             onIdentityState("recipient", recipient.ownVerificationIdentityStateForDiagnostic())
         }
+        onVerificationStep("verificationSeedDivergentRoutes")
+        seedDivergentVerificationRoutes(sender, recipient, roomId, onVerificationStep)
         onVerificationStep("verificationRequest")
         var controlInviteSeen = false
         var controlRoomHiddenAfterJoin = false
@@ -1932,6 +1934,46 @@ class AndroidPeerAcceptanceIntegrationTest {
         check(peerIdentitiesConverged) {
             "The peers completed SAS, but their cross-signing trust did not converge in both directions"
         }
+    }
+
+    private suspend fun seedDivergentVerificationRoutes(
+        sender: MatrixRepository,
+        recipient: MatrixRepository,
+        encryptedRoomId: String,
+        onVerificationStep: (String) -> Unit,
+    ) {
+        onVerificationStep("verificationSeedCreateSenderRoom")
+        val senderCreatedRoomId = sender.createVerificationControlRoomForDiagnostic(encryptedRoomId)
+        onVerificationStep("verificationSeedWaitRecipientInvite")
+        await("recipient invitation to the sender's verification channel") {
+            recipient.refreshConversations()
+            recipient.conversations.value.any {
+                it.roomId == senderCreatedRoomId && it.isVerificationControl && it.membership == "INVITED"
+            }
+        }
+        onVerificationStep("verificationSeedJoinRecipientRoom")
+        recipient.joinVerificationControlRoom(senderCreatedRoomId)
+
+        onVerificationStep("verificationSeedCreateRecipientRoom")
+        val recipientCreatedRoomId = recipient.createVerificationControlRoomForDiagnostic(encryptedRoomId)
+        onVerificationStep("verificationSeedWaitSenderInvite")
+        await("sender invitation to the recipient's verification channel") {
+            sender.refreshConversations()
+            sender.conversations.value.any {
+                it.roomId == recipientCreatedRoomId && it.isVerificationControl && it.membership == "INVITED"
+            }
+        }
+        onVerificationStep("verificationSeedJoinSenderRoom")
+        sender.joinVerificationControlRoom(recipientCreatedRoomId)
+
+        onVerificationStep("verificationSeedCheckRoutes")
+        sender.setVerificationControlRoomRouteForDiagnostic(encryptedRoomId, senderCreatedRoomId)
+        check(senderCreatedRoomId != recipientCreatedRoomId) {
+            "The diagnostic did not create two distinct verification channels"
+        }
+        check(sender.verificationControlRoomRouteForDiagnostic(encryptedRoomId) == senderCreatedRoomId)
+        check(recipient.verificationControlRoomRouteForDiagnostic(encryptedRoomId) == recipientCreatedRoomId)
+        println("OUTBOX_DIAG_VERIFY_CONTROL seededDivergentRoutes=true")
     }
 
     private suspend fun verifyRapidTextBurst(

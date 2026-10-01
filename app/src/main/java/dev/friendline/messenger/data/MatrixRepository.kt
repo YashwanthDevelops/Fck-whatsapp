@@ -240,8 +240,10 @@ class MatrixRepository(context: Context) {
     private val peerVerificationRequestMutex = Mutex()
     private val lifecycleMutex = Mutex()
     private val syncRecoveryLock = Any()
+    private val sendQueueGateRetryLock = Any()
     private var pushTokenObserver: Job? = null
-    @Volatile private var sendQueuesEnabled: Boolean? = null
+    private val sendQueueGateState = SendQueueGateState()
+    private var sendQueueGateRetryJob: Job? = null
     @Volatile private var logoutInProgress = false
     @Volatile private var syncServiceRunning = false
     @Volatile private var appInForeground = true
@@ -1449,21 +1451,124 @@ class MatrixRepository(context: Context) {
         refreshConversations()
     }
 
+    /** Creates a second routed verification channel for isolated acceptance coverage. */
+    internal suspend fun createVerificationControlRoomForDiagnostic(encryptedRoomId: String): String =
+        withContext(Dispatchers.IO) {
+            check(BuildConfig.DEBUG) { "Verification diagnostics are unavailable in release builds" }
+            val matrixClient = requireClient()
+            val room = requireRoom(encryptedRoomId)
+            val peerUserId = try {
+                check(room.encryptionState().name == "ENCRYPTED")
+                room.activeHumanMemberIds().singleOrNull { it != ownUserId }
+                    ?: throw IllegalStateException("The diagnostic room must have one peer")
+            } finally {
+                room.close()
+            }
+            val controlRoomId = createVerificationControlRoom(matrixClient, peerUserId)
+            check(awaitVerificationControlRoomReady(matrixClient, peerUserId, controlRoomId)) {
+                "The diagnostic verification channel did not finish syncing"
+            }
+            selectVerificationControlRoom(matrixClient, peerUserId, controlRoomId)
+            refreshConversations()
+            controlRoomId
+        }
+
+    internal suspend fun verificationControlRoomRouteForDiagnostic(encryptedRoomId: String): String? =
+        withContext(Dispatchers.IO) {
+            check(BuildConfig.DEBUG) { "Verification diagnostics are unavailable in release builds" }
+            val room = requireRoom(encryptedRoomId)
+            val peerUserId = try {
+                room.activeHumanMemberIds().firstOrNull { it != ownUserId }
+            } finally {
+                room.close()
+            } ?: return@withContext null
+            val route = JSONObject(requireClient().accountData("m.direct") ?: "{}")
+                .optJSONArray(peerUserId)
+            route?.optString(0)?.takeIf(String::isNotBlank)
+        }
+
+    internal suspend fun setVerificationControlRoomRouteForDiagnostic(
+        encryptedRoomId: String,
+        controlRoomId: String,
+    ) = withContext(Dispatchers.IO) {
+        check(BuildConfig.DEBUG) { "Verification diagnostics are unavailable in release builds" }
+        val matrixClient = requireClient()
+        val encryptedRoom = requireRoom(encryptedRoomId)
+        val peerUserId = try {
+            encryptedRoom.activeHumanMemberIds().firstOrNull { it != ownUserId }
+        } finally {
+            encryptedRoom.close()
+        } ?: throw IllegalStateException("The diagnostic conversation does not have a peer")
+        val controlRoom = matrixClient.getRoom(controlRoomId)
+            ?: throw IllegalStateException("The diagnostic verification channel is unavailable")
+        val controlRoomInfo = controlRoom.roomInfo()
+        try {
+            check(controlRoomInfo.topic == VERIFICATION_CONTROL_ROOM_TOPIC)
+            check(controlRoomInfo.membership == org.matrix.rustcomponents.sdk.Membership.JOINED)
+            check(peerUserId in controlRoom.activeHumanMemberIds())
+        } finally {
+            controlRoomInfo.destroy()
+            controlRoom.close()
+        }
+        val mapping = JSONObject(matrixClient.accountData("m.direct") ?: "{}")
+        mapping.put(peerUserId, JSONArray().put(controlRoomId))
+        matrixClient.setAccountData("m.direct", mapping.toString())
+        val mappingSynced = withTimeoutOrNull(VERIFICATION_ROOM_ROUTE_SYNC_TIMEOUT_MS) {
+            while (true) {
+                val route = JSONObject(matrixClient.accountData("m.direct") ?: "{}")
+                    .optJSONArray(peerUserId)
+                if (route != null && route.length() == 1 && route.optString(0) == controlRoomId) {
+                    return@withTimeoutOrNull true
+                }
+                delay(VERIFICATION_ROOM_ROUTE_SYNC_POLL_MS)
+            }
+            @Suppress("UNREACHABLE_CODE")
+            false
+        } == true
+        check(mappingSynced) { "The diagnostic verification route did not sync to m.direct" }
+    }
+
     private suspend fun ensureVerificationControlRoom(matrixClient: Client, peerUserId: String): String {
-        val existing = withVerificationStage("control-room-search") {
-            matrixClient.rooms().firstOrNull { candidate ->
-                if (candidate.encryptionState().name == "ENCRYPTED") return@firstOrNull false
-                val info = candidate.roomInfo()
+        val existingRoomIds = withVerificationStage("control-room-search") {
+            val roomIds = mutableListOf<String>()
+            matrixClient.rooms().forEach { candidate ->
                 try {
-                    info.topic == VERIFICATION_CONTROL_ROOM_TOPIC &&
-                        info.membership == org.matrix.rustcomponents.sdk.Membership.JOINED &&
-                        peerUserId in candidate.activeHumanMemberIds()
+                    if (candidate.encryptionState().name != "ENCRYPTED") {
+                        val info = candidate.roomInfo()
+                        try {
+                            if (info.topic == VERIFICATION_CONTROL_ROOM_TOPIC &&
+                                info.membership == org.matrix.rustcomponents.sdk.Membership.JOINED &&
+                                peerUserId in candidate.activeHumanMemberIds()
+                            ) {
+                                roomIds += candidate.id()
+                            }
+                        } finally {
+                            info.destroy()
+                        }
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // A partially-synced or unreadable room cannot route verification safely.
                 } finally {
-                    info.destroy()
+                    candidate.close()
                 }
             }
+            roomIds.distinct()
         }
-        val roomId = existing?.id() ?: withVerificationStage("control-room-create-request") {
+        // Reusing one shared channel is safe. Multiple older channels can leave each
+        // account's m.direct entry pointing at a different room, so request a fresh,
+        // explicit invitation and let both clients select that same route.
+        val roomId = VerificationControlRoomReusePolicy.uniqueReusableRoomId(existingRoomIds)
+            ?: createVerificationControlRoom(matrixClient, peerUserId)
+        check(awaitVerificationControlRoomReady(matrixClient, peerUserId, roomId)) {
+            "The Matrix verification channel did not finish syncing its private protocol marker"
+        }
+        return roomId
+    }
+
+    private suspend fun createVerificationControlRoom(matrixClient: Client, peerUserId: String): String =
+        withVerificationStage("control-room-create-request") {
             matrixClient.createRoom(
                 CreateRoomParameters(
                     name = VERIFICATION_CONTROL_ROOM_NAME,
@@ -1477,7 +1582,12 @@ class MatrixRepository(context: Context) {
                 ),
             )
         }
-        val stateReady = withVerificationStage("control-room-topic-state") {
+
+    private suspend fun awaitVerificationControlRoomReady(
+        matrixClient: Client,
+        peerUserId: String,
+        roomId: String,
+    ): Boolean = withVerificationStage("control-room-topic-state") {
             withTimeoutOrNull(VERIFICATION_CONTROL_ROOM_STATE_TIMEOUT_MS) {
                 while (true) {
                     val room = matrixClient.getRoom(roomId)
@@ -1512,11 +1622,6 @@ class MatrixRepository(context: Context) {
                 @Suppress("UNREACHABLE_CODE")
                 false
             } == true
-        }
-        check(stateReady) {
-            "The Matrix verification channel did not finish syncing its private protocol marker"
-        }
-        return roomId
     }
 
     private suspend fun selectVerificationControlRoom(
@@ -2027,6 +2132,13 @@ class MatrixRepository(context: Context) {
                         }
                     }
                     sendQueued = true
+                    if (BuildConfig.DEBUG) {
+                        android.util.Log.i(
+                            "FriendlineSendQueue",
+                            "text enqueue accepted queuesEnabled=${sendQueueGateState.appliedState == true} " +
+                                "syncRunning=$syncServiceRunning connection=${_connection.value}",
+                        )
+                    }
                     runCatching { sendHandle.destroy() }
                     runCatching { room.typingNotice(false) }
                 } finally {
@@ -2564,7 +2676,7 @@ class MatrixRepository(context: Context) {
             "Retry is disabled because this conversation is not encrypted"
         }
         withSendQueueGate {
-            check(sendQueuesEnabled == true && syncServiceRunning && _connection.value == "Connected") {
+            check(sendQueueGateState.appliedState == true && syncServiceRunning && _connection.value == "Connected") {
                 "Reconnect before retrying this message"
             }
             room.enableSendQueue(true)
@@ -2720,7 +2832,7 @@ class MatrixRepository(context: Context) {
             val matrixClient = client
             val service = syncService
             val syncServiceWasRunning = syncServiceRunning
-            val sendQueuesWereEnabled = sendQueuesEnabled
+            val sendQueuesWereEnabled = sendQueueGateState.appliedState
             var stopAttempted = false
             try {
                 val pushWasEnabled = _pushNotificationsEnabled.value
@@ -2766,8 +2878,7 @@ class MatrixRepository(context: Context) {
                 if (matrixClient != null) {
                     sendQueueMutex.lock()
                     try {
-                        sendQueuesEnabled = false
-                        matrixClient.enableAllSendQueues(false)
+                        sendQueueGateState.apply(false) { matrixClient.enableAllSendQueues(it) }
                     } finally {
                         sendQueueMutex.unlock()
                     }
@@ -2802,8 +2913,7 @@ class MatrixRepository(context: Context) {
                         syncServiceRunning = syncServiceWasRunning
                         val restoreQueues = syncServiceWasRunning && (sendQueuesWereEnabled ?: true)
                         if (matrixClient != null) {
-                            matrixClient.enableAllSendQueues(restoreQueues)
-                            sendQueuesEnabled = restoreQueues
+                            sendQueueGateState.apply(restoreQueues) { matrixClient.enableAllSendQueues(it) }
                         }
                     }.onFailure(error::addSuppressed)
                 }
@@ -2924,9 +3034,17 @@ class MatrixRepository(context: Context) {
                 if (!syncServiceStoppedForBackground) {
                     runCatching {
                         sendQueueMutex.withLock {
-                            sendQueuesEnabled = false
-                            activeClient.enableAllSendQueues(false)
+                            sendQueueGateState.apply(false) { activeClient.enableAllSendQueues(it) }
                         }
+                    }.onFailure { error ->
+                        sendQueueGateState.markUnknown()
+                        if (BuildConfig.DEBUG) {
+                            android.util.Log.e(
+                                "FriendlineSendQueue",
+                                "queue gate disable failed error=${error.javaClass.simpleName}",
+                            )
+                        }
+                        refreshSendQueueGate(activeClient)
                     }
                     runCatching { service?.stop() }
                     syncServiceRunning = false
@@ -3135,16 +3253,25 @@ class MatrixRepository(context: Context) {
             stage = "disable-send-queues"
             // The send-queue subscription below respawns persisted tasks immediately. Keep it
             // disabled until durable attachment paths have been restored into private cache.
-            matrixClient.enableAllSendQueues(false)
+            // This Client owns a fresh native queue even if the previous session had a
+            // successfully applied gate state.
+            sendQueueGateState.markUnknown()
+            sendQueueGateState.apply(false) { matrixClient.enableAllSendQueues(it) }
             stage = "restore-pending-media"
             restorePendingMediaSources()
-            sendQueuesEnabled = null
             sendQueueStatusHandle?.cancel()
             sendQueueStatusHandle?.close()
             // This subscription respawns send tasks persisted before process death.
             stage = "subscribe-send-queue-status"
             sendQueueStatusHandle = matrixClient.subscribeToSendQueueStatus(object : SendQueueRoomErrorListener {
-                override fun onError(roomId: String, error: org.matrix.rustcomponents.sdk.ClientException) = Unit
+                override fun onError(roomId: String, error: org.matrix.rustcomponents.sdk.ClientException) {
+                    if (BuildConfig.DEBUG) {
+                        android.util.Log.e(
+                            "FriendlineSendQueue",
+                            "room send queue reported error type=${error.javaClass.simpleName}",
+                        )
+                    }
+                }
             })
             stage = "subscribe-send-queue-updates"
             loadDeliveryAckJournal()
@@ -4069,6 +4196,7 @@ class MatrixRepository(context: Context) {
                     .computeIfAbsent(roomId) { ConcurrentHashMap() }
                     .computeIfAbsent(kind) { AtomicInteger() }
                     .incrementAndGet()
+                android.util.Log.i("FriendlineSendQueue", "room queue update kind=$kind")
             }
         }
         when (update) {
@@ -4729,7 +4857,7 @@ class MatrixRepository(context: Context) {
     }
 
     internal fun sendPipelineDiagnosticSnapshot(roomId: String): String = listOf(
-        sendQueuesEnabled == true,
+        sendQueueGateState.appliedState == true,
         syncServiceRunning,
         sendQueueStatusHandle != null,
         sendQueueUpdatesHandle != null,
@@ -5239,28 +5367,63 @@ class MatrixRepository(context: Context) {
         // While logout is draining a registered native media send, keep its existing
         // queue worker alive so join() can observe a terminal result. The logout flag still
         // rejects new application sends at withSendQueueGate().
-        val queuesShouldRun = appInForeground && !clientPausedForBackground &&
-            !syncServiceStoppedForBackground && syncServiceRunning &&
-            (!logoutInProgress || activeAttachmentSends.isNotEmpty())
-        if (sendQueuesEnabled == queuesShouldRun) return
-        sendQueuesEnabled = queuesShouldRun
-        callbackScope.launch {
-            sendQueueMutex.lock()
-            try {
-                if (sendQueuesEnabled == queuesShouldRun && client === matrixClient &&
-                    (!queuesShouldRun || (appInForeground && !clientPausedForBackground &&
-                        !syncServiceStoppedForBackground && syncServiceRunning &&
-                        (!logoutInProgress || activeAttachmentSends.isNotEmpty())))
-                ) {
-                    matrixClient.enableAllSendQueues(queuesShouldRun)
+        if (client !== matrixClient || logoutInProgress || !sendQueueGateState.needsApply(sendQueuesShouldRun())) return
+        synchronized(sendQueueGateRetryLock) {
+            if (sendQueueGateRetryJob?.isActive == true) return
+            lateinit var retryJob: Job
+            retryJob = callbackScope.launch(start = CoroutineStart.LAZY) {
+                var attempt = 0
+                try {
+                    while (client === matrixClient && !logoutInProgress) {
+                        val targetBeforeLock = sendQueuesShouldRun()
+                        if (!sendQueueGateState.needsApply(targetBeforeLock)) return@launch
+                        try {
+                            sendQueueMutex.withLock {
+                                if (client !== matrixClient || logoutInProgress) return@withLock
+                                val target = sendQueuesShouldRun()
+                                if (sendQueueGateState.needsApply(target)) {
+                                    sendQueueGateState.apply(target) {
+                                        matrixClient.enableAllSendQueues(it)
+                                    }
+                                    if (BuildConfig.DEBUG) {
+                                        android.util.Log.i(
+                                            "FriendlineSendQueue",
+                                            "queue gate applied enabled=$target",
+                                        )
+                                    }
+                                }
+                            }
+                            attempt = 0
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Throwable) {
+                            sendQueueGateState.markUnknown()
+                            if (BuildConfig.DEBUG) {
+                                android.util.Log.e(
+                                    "FriendlineSendQueue",
+                                    "queue gate apply failed error=${error.javaClass.simpleName}",
+                                )
+                            }
+                            delay(SendQueueGateRetryPolicy.delayMillis(attempt++))
+                        }
+                    }
+                } finally {
+                    val retryNeeded = synchronized(sendQueueGateRetryLock) {
+                        if (sendQueueGateRetryJob === retryJob) sendQueueGateRetryJob = null
+                        client === matrixClient && !logoutInProgress &&
+                            sendQueueGateState.needsApply(sendQueuesShouldRun())
+                    }
+                    if (retryNeeded) refreshSendQueueGate(matrixClient)
                 }
-            } catch (_: Exception) {
-                // A later sync-state transition or logout recovery retries this update.
-            } finally {
-                sendQueueMutex.unlock()
             }
+            sendQueueGateRetryJob = retryJob
+            retryJob.start()
         }
     }
+
+    private fun sendQueuesShouldRun(): Boolean = appInForeground && !clientPausedForBackground &&
+        !syncServiceStoppedForBackground && syncServiceRunning &&
+        (!logoutInProgress || activeAttachmentSends.isNotEmpty())
 
     private fun requireClient(): Client {
         check(!logoutInProgress) { "Secure sign-out is in progress" }
@@ -5474,11 +5637,8 @@ class MatrixRepository(context: Context) {
         // discovered before any archive without an SDK echo is considered for replay.
         val readiness = ensurePendingMediaObserversForKnownRooms()
         val readyRooms = readiness.readyRoomIds
-        sendQueueMutex.withLock {
-            if (client === activeClient && syncServiceRunning && !logoutInProgress && sendQueuesEnabled != true) {
-                activeClient.enableAllSendQueues(true)
-                sendQueuesEnabled = true
-            }
+        if (client === activeClient && syncServiceRunning && !logoutInProgress) {
+            refreshSendQueueGate(activeClient)
         }
         if (logoutInProgress || client !== activeClient || !syncServiceRunning) return@recovery false
 
@@ -5819,7 +5979,7 @@ class MatrixRepository(context: Context) {
         var returnedToPending = false
         try {
             withSendQueueGate {
-                check(sendQueuesEnabled == true && syncServiceRunning && _connection.value == "Connected") {
+                check(sendQueueGateState.appliedState == true && syncServiceRunning && _connection.value == "Connected") {
                     "Reconnect before retrying this voice message"
                 }
                 handle.tryResend()
