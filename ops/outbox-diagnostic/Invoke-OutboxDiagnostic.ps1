@@ -579,8 +579,9 @@ function Invoke-DiagnosticInstrumentation {
         $resultStatus = [regex]::Match($safeOutput, "outbox_diag_result=([A-Za-z0-9_=|-]+)")
         if ($resultStatus.Success) {
             $resultParts = $resultStatus.Groups[1].Value -split '\|'
-            $formattedResult = if ($resultParts.Count -eq 3) {
-                "OUTBOX_DIAG_RESULT stage=$($resultParts[0]) $($resultParts[1]) $($resultParts[2])"
+            $formattedResult = if ($resultParts.Count -ge 2) {
+                $statusDetails = $resultParts[1..($resultParts.Count - 1)] -join " "
+                "OUTBOX_DIAG_RESULT stage=$($resultParts[0]) $statusDetails"
             } else {
                 "OUTBOX_DIAG_RESULT invalid-result-status"
             }
