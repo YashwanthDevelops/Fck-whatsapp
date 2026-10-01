@@ -14,15 +14,15 @@ Native Android and iOS clients · Matrix identity and sync · Self-hosted Synaps
 </div>
 
 > [!WARNING]
-> Friendline is an active prototype, not ready for everyday use. Recent Android changes still need a fresh peer-acceptance run. iOS builds, Android↔iOS interoperability, real push delivery, live calls, and hosted deployment are not yet verified. See [testing status](docs/TESTING.md).
+> Friendline is an active prototype, not ready for everyday use. Current-source Android peer acceptance passes on an API 37 emulator. Physical-device testing, the iOS app build, Android↔iOS interoperability, real push delivery, live calls, and hosted deployment are not yet verified. See [testing status](docs/TESTING.md).
 
 ## At a glance
 
-| Android unit tests | Signed Android outputs | Earlier Android peer run | Cross-platform acceptance |
+| Android unit tests | Android peer acceptance | Current debug APK | Cross-platform acceptance |
 | :---: | :---: | :---: | :---: |
-| **44 passed** | **4 APKs + 1 AAB** | **3 clients · API 37** | **Pending** |
+| **73 passed** | **3 clients · API 37 · passed** | `app/build/outputs/apk/standard/debug/app-standard-debug.apk` | **Pending** |
 
-Build and test results are recorded in the [testing log](docs/TESTING.md). The three-client run predates the latest changes; it is not current-source acceptance.
+Build and test results are recorded in the [testing log](docs/TESTING.md). The peer run used three independent Android SDK clients on one emulator; it does not establish physical-device or Android↔iOS interoperability.
 
 ## What’s here
 

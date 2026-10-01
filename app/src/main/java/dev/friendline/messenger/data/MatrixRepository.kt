@@ -2906,6 +2906,14 @@ class MatrixRepository(context: Context) {
         callbackScope.launch { withLifecycleLock { reconcileAppLifecycleLocked() } }
     }
 
+    internal fun lifecycleDiagnosticSnapshot(): LifecycleDiagnosticSnapshot = LifecycleDiagnosticSnapshot(
+        appInForeground = appInForeground,
+        clientPausedForBackground = clientPausedForBackground,
+        syncServiceStoppedForBackground = syncServiceStoppedForBackground,
+        syncServiceRunning = syncServiceRunning,
+        connection = _connection.value,
+    )
+
     private suspend fun reconcileAppLifecycleLocked() {
         while (!logoutInProgress) {
             val activeClient = client ?: return
@@ -6429,5 +6437,13 @@ class MatrixRepository(context: Context) {
         val timeline: Timeline,
         val handle: TaskHandle,
         val listener: TimelineListener,
+    )
+
+    internal data class LifecycleDiagnosticSnapshot(
+        val appInForeground: Boolean,
+        val clientPausedForBackground: Boolean,
+        val syncServiceStoppedForBackground: Boolean,
+        val syncServiceRunning: Boolean,
+        val connection: String,
     )
 }

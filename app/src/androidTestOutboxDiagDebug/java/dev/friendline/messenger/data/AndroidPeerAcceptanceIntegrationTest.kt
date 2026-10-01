@@ -12,6 +12,7 @@ import androidx.core.content.FileProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import android.util.Log
+import dev.friendline.messenger.ui.PeerVerificationActionPolicy
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -354,11 +355,27 @@ class AndroidPeerAcceptanceIntegrationTest {
         recipient.openConversation(roomId)
         reportProgress(instrumentation, "core", "verifyDiagnosticRoom", "complete")
 
+        onStep("repeatDirectConversationCreation")
+        reportProgress(instrumentation, "core", "repeatDirectConversationCreation", "start")
+        verifyDirectConversationReuse(sender, recipient, recipientId, roomId)
+        reportProgress(instrumentation, "core", "repeatDirectConversationCreation", "complete")
+        println("OUTBOX_DIAG_DIRECT_ROOM_REUSE attempts=3 returnedSameRoom=true noDuplicateRows=true")
+
         onStep("rapidTextBurst")
+        reportProgress(instrumentation, "core", "rapidTextBurst", "start")
         verifyRapidTextBurst(sender, recipient, roomId, marker)
+        reportProgress(instrumentation, "core", "rapidTextBurst", "complete")
+
+        onStep("backgroundForegroundRecovery")
+        reportProgress(instrumentation, "core", "backgroundForegroundRecovery", "start")
+        verifyAppLifecycleRecovery(sender, recipient, roomId, marker)
+        reportProgress(instrumentation, "core", "backgroundForegroundRecovery", "complete")
+        println("OUTBOX_DIAG_LIFECYCLE backgroundPaused=true foregroundConnected=true sendReceiveAfterResume=true")
 
         onStep("encryptedJpegRoundTrip")
+        reportProgress(instrumentation, "core", "encryptedJpegRoundTrip", "start")
         verifyEncryptedJpegRoundTrip(sender, recipient, roomId, marker, instrumentation)
+        reportProgress(instrumentation, "core", "encryptedJpegRoundTrip", "complete")
 
         onStep("editAndRedactEncryptedMessage")
         verifyMessageEditingAndRedaction(roomId, marker, sender, recipient, onStep)
@@ -954,6 +971,12 @@ class AndroidPeerAcceptanceIntegrationTest {
                 message?.deliveryState == "Delivered to all 2"
         }) { "The group message did not become delivered after every member acknowledged it" }
         println("OUTBOX_DIAG_GROUP_DELIVERY expected=2 acknowledged=2 delivered=true")
+
+        onStep("verificationStateRestore")
+        reportProgress(instrumentation, "core", "verificationStateRestore", "start")
+        verifyPeerTrustStateRestore(sender, senderId, recipientId, roomId)
+        reportProgress(instrumentation, "core", "verificationStateRestore", "complete")
+        println("OUTBOX_DIAG_VERIFICATION_RESTORE sameSession=true trustVerified=true verifyActionHidden=true")
 
         stateFile.parentFile?.mkdirs()
         stateFile.writeText(JSONObject().put("roomId", roomId).toString())
@@ -1921,13 +1944,30 @@ class AndroidPeerAcceptanceIntegrationTest {
         bodies.forEach { body ->
             check(sender.sendText(roomId, body)) { "The rapid encrypted text send was not accepted by the SDK queue" }
         }
-        await("rapid text burst reaches both clients exactly once") {
+        val reachedBothClients = awaitCondition("rapid text burst reaches both clients exactly once") {
             val senderRows = sender.messages.value.filter { it.isOwn && it.body in bodies }
             val recipientRows = recipient.messages.value.filter { !it.isOwn && it.body in bodies }
             senderRows.size == bodies.size && recipientRows.size == bodies.size &&
                 senderRows.all { it.eventId != null } && recipientRows.all { it.eventId != null } &&
                 senderRows.map { it.body } == bodies && recipientRows.map { it.body } == bodies &&
                 senderRows.mapNotNull(ChatMessage::eventId) == recipientRows.mapNotNull(ChatMessage::eventId)
+        }
+        if (!reachedBothClients) {
+            val senderRows = sender.messages.value.filter { it.isOwn && it.body in bodies }
+            val recipientRows = recipient.messages.value.filter { !it.isOwn && it.body in bodies }
+            fun sequence(rows: List<ChatMessage>) = rows.mapNotNull { row ->
+                bodies.indexOf(row.body).takeIf { it >= 0 }?.plus(1)
+            }.joinToString(",")
+            println(
+                "OUTBOX_DIAG_RAPID_BURST_FAILURE senderSequence=${sequence(senderRows)} " +
+                    "senderEventIds=${senderRows.count { it.eventId != null }} " +
+                    "senderStates=${senderRows.map { safeToken(it.deliveryState) }.distinct().sorted().joinToString(",")}" +
+                    " senderConnection=${safeToken(sender.connection.value)} " +
+                    "recipientSequence=${sequence(recipientRows)} " +
+                    "recipientEventIds=${recipientRows.count { it.eventId != null }} " +
+                    "recipientConnection=${safeToken(recipient.connection.value)}",
+            )
+            throw IllegalStateException("The rapid encrypted text burst did not reach both clients exactly once")
         }
         delay(1_500)
         val senderRows = sender.messages.value.filter { it.isOwn && it.body in bodies }
@@ -1939,6 +1979,101 @@ class AndroidPeerAcceptanceIntegrationTest {
             senderRows.mapNotNull(ChatMessage::eventId),
             recipientRows.mapNotNull(ChatMessage::eventId),
         )
+    }
+
+    private suspend fun verifyAppLifecycleRecovery(
+        sender: MatrixRepository,
+        recipient: MatrixRepository,
+        roomId: String,
+        marker: String,
+    ) {
+        sender.onAppBackgrounded()
+        await("sender sync and client pause in background") {
+            val snapshot = sender.lifecycleDiagnosticSnapshot()
+            !snapshot.appInForeground && snapshot.clientPausedForBackground &&
+                snapshot.syncServiceStoppedForBackground && !snapshot.syncServiceRunning &&
+                snapshot.connection == "Offline"
+        }
+
+        val offlineMessageBody = "lifecycle-offline-$marker"
+        assertTrue("The peer's message must queue while the sender is backgrounded", recipient.sendText(roomId, offlineMessageBody))
+        val peerMessage = awaitMessage(recipient, "peer's backgrounded-sender message") {
+            it.body == offlineMessageBody && it.isOwn && it.eventId != null
+        }
+        check(sender.messages.value.none { it.body == offlineMessageBody }) {
+            "The backgrounded sender unexpectedly synced the peer message before resume"
+        }
+
+        sender.onAppForegrounded()
+        await("sender sync returns to Connected") {
+            val snapshot = sender.lifecycleDiagnosticSnapshot()
+            snapshot.appInForeground && !snapshot.clientPausedForBackground &&
+                !snapshot.syncServiceStoppedForBackground && snapshot.syncServiceRunning &&
+                snapshot.connection == "Connected"
+        }
+        val receivedAfterResume = awaitMessage(sender, "peer's message after sender resumes") {
+            it.body == offlineMessageBody && !it.isOwn && it.eventId == peerMessage.eventId
+        }
+        check(receivedAfterResume.eventId != null)
+
+        val resumedMessageBody = "lifecycle-resumed-$marker"
+        assertTrue("The foregrounded sender must be able to send again", sender.sendText(roomId, resumedMessageBody))
+        val senderMessage = awaitMessage(sender, "sender's post-resume message") {
+            it.body == resumedMessageBody && it.isOwn && it.eventId != null
+        }
+        val peerReceivedAfterResume = awaitMessage(recipient, "peer receives sender's post-resume message") {
+            it.body == resumedMessageBody && !it.isOwn && it.eventId == senderMessage.eventId
+        }
+        check(peerReceivedAfterResume.eventId != null)
+    }
+
+    private suspend fun verifyDirectConversationReuse(
+        sender: MatrixRepository,
+        recipient: MatrixRepository,
+        recipientId: String,
+        roomId: String,
+    ) {
+        val repeatedRoomIds = coroutineScope {
+            (1..3).map {
+                async {
+                    sender.createEncryptedConversation(
+                        invitedUserIds = listOf(recipientId),
+                        name = "Repeated direct-room probe",
+                    )
+                }
+            }.map { it.await() }
+        }
+        check(repeatedRoomIds.all { it == roomId }) {
+            "Repeated direct conversation requests did not reuse the existing encrypted room"
+        }
+        sender.refreshConversations()
+        recipient.refreshConversations()
+        check(sender.conversations.value.count { it.roomId == roomId } == 1 &&
+            recipient.conversations.value.count { it.roomId == roomId } == 1
+        ) { "Repeated direct conversation requests produced duplicate conversation rows" }
+    }
+
+    private suspend fun verifyPeerTrustStateRestore(
+        sender: MatrixRepository,
+        senderId: String,
+        recipientId: String,
+        roomId: String,
+    ) {
+        check(sender.isPeerVerified(roomId)) { "The verified peer trust was not available before store restore" }
+        sender.close()
+        assertEquals("The repository must restore the same account session", senderId, sender.restoreSession())
+        awaitConnected(sender)
+        sender.openConversation(roomId)
+        await("verified contact state is restored for the conversation UI") {
+            sender.peerTrust.value == PeerTrustStatus.VERIFIED
+        }
+        check(!PeerVerificationActionPolicy.shouldShowVerifyAction(
+            isEncrypted = true,
+            isGroup = false,
+            currentPeerUserId = recipientId,
+            peerTrust = sender.peerTrust.value,
+            verification = sender.verification.value,
+        )) { "The Verify action remained visible after restored peer trust became verified" }
     }
 
     private suspend fun verifyEncryptedJpegRoundTrip(
