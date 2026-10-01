@@ -20,7 +20,7 @@ Native Android and iOS clients · Matrix identity and sync · Self-hosted Synaps
 
 | Android unit tests | Android peer acceptance | Current debug APK | Cross-platform acceptance |
 | :---: | :---: | :---: | :---: |
-| **73 passed** | **3 clients · API 37 · passed** | `app/build/outputs/apk/standard/debug/app-standard-debug.apk` | **Pending** |
+| **84 passed** | **3 clients · API 37 · passed** | `app/build/outputs/apk/phoneTest/debug/app-phoneTest-arm64-v8a-debug.apk` | **Pending** |
 
 Build and test results are recorded in the [testing log](docs/TESTING.md). The peer run used three independent Android SDK clients on one emulator; it does not establish physical-device or Android↔iOS interoperability.
 
