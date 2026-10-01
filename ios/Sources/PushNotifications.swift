@@ -1,4 +1,6 @@
 import Foundation
+import Combine
+import MessengerCore
 import UIKit
 import UserNotifications
 
@@ -301,6 +303,28 @@ private enum PushHTTP {
 }
 
 @MainActor
+final class PushNotificationRouteStore: ObservableObject {
+    static let shared = PushNotificationRouteStore()
+
+    @Published private(set) var pendingRoute: PushNotificationRoute?
+    @Published private(set) var revision = 0
+
+    private init() {}
+
+    func receive(userInfo: [AnyHashable: Any]) {
+        pendingRoute = PushNotificationRoutePolicy.parse(
+            roomId: userInfo["room_id"] as? String,
+            eventId: userInfo["event_id"] as? String
+        )
+        revision &+= 1
+    }
+
+    func clear(_ route: PushNotificationRoute) {
+        if pendingRoute == route { pendingRoute = nil }
+    }
+}
+
+@MainActor
 final class PrivateMessengerAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     func application(
         _ application: UIApplication,
@@ -333,7 +357,10 @@ final class PrivateMessengerAppDelegate: NSObject, UIApplicationDelegate, UNUser
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        // Ignore push payload fields; opening the app triggers normal Matrix synchronization.
+        // Only strict opaque room/event identifiers are used to open the local conversation.
+        PushNotificationRouteStore.shared.receive(
+            userInfo: response.notification.request.content.userInfo
+        )
         completionHandler()
     }
 }

@@ -34,6 +34,7 @@ data class ChatMessage(
     val hasBeenRead: Boolean = false,
     val attachment: ChatAttachment? = null,
     val deliveryMemberDetails: List<DeliveryMemberStatus> = emptyList(),
+    internal val isOptimisticTextEcho: Boolean = false,
 )
 
 data class DeliveryMemberStatus(

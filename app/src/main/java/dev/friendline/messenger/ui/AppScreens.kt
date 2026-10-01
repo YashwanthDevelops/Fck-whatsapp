@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.graphics.Bitmap
+import android.net.Uri
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -176,7 +177,7 @@ fun LoginScreen(
         }
         Spacer(Modifier.height(14.dp))
         Text(
-            "Conversations are encrypted on your device. This server address is used only to connect your account.",
+            "For phones, use the laptop's Wi-Fi address, such as http://192.168.1.6:8008. Do not use localhost as this address; :localhost in a Matrix ID is only the server name.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -187,6 +188,7 @@ fun LoginScreen(
 @Composable
 fun ConversationListScreen(
     userId: String?,
+    homeserver: String,
     connection: String,
     conversations: List<ConversationSummary>,
     readReceiptsEnabled: Boolean,
@@ -208,9 +210,11 @@ fun ConversationListScreen(
     onClearError: () -> Unit,
     isBusy: Boolean = false,
     onJoinVerification: ((String) -> Unit)? = null,
+    onReconnectToHomeserver: (String) -> Unit,
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var showPrivacySettings by rememberSaveable { mutableStateOf(false) }
+    var editedHomeserver by rememberSaveable { mutableStateOf(homeserver) }
     var conversationPendingLeave by remember { mutableStateOf<ConversationSummary?>(null) }
     var conversationPendingInvite by remember { mutableStateOf<ConversationSummary?>(null) }
     var participantMatrixId by rememberSaveable { mutableStateOf("") }
@@ -233,8 +237,11 @@ fun ConversationListScreen(
                 },
                 actions = {
                     IconButton(
-                        onClick = { showPrivacySettings = true },
-                        modifier = Modifier.semantics { contentDescription = "Privacy settings" },
+                        onClick = {
+                            editedHomeserver = homeserver
+                            showPrivacySettings = true
+                        },
+                        modifier = Modifier.semantics { contentDescription = "Server and privacy settings" },
                     ) {
                         Icon(Icons.Filled.Settings, contentDescription = null)
                     }
@@ -254,7 +261,7 @@ fun ConversationListScreen(
                 .padding(padding)
                 .padding(horizontal = 20.dp),
         ) {
-            ConnectionLine(connection)
+            ConnectionLine(connection, homeserver)
             Spacer(Modifier.height(18.dp))
             OutlinedTextField(
                 value = query,
@@ -333,9 +340,41 @@ fun ConversationListScreen(
     if (showPrivacySettings) {
         AlertDialog(
             onDismissRequest = { showPrivacySettings = false },
-            title = { Text("Privacy") },
+            title = { Text("Server and privacy settings") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text("Homeserver address", style = MaterialTheme.typography.titleSmall)
+                    OutlinedTextField(
+                        value = editedHomeserver,
+                        onValueChange = { editedHomeserver = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Homeserver address") },
+                        placeholder = { Text("http://192.168.1.6:8008") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Done),
+                        enabled = !isBusy,
+                    )
+                    Text(
+                        "For phones on your home Wi-Fi, use the laptop's current private LAN address. Reconnecting keeps this phone's encrypted message store and device keys.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    TextButton(
+                        onClick = { onReconnectToHomeserver(editedHomeserver) },
+                        enabled = !isBusy && editedHomeserver.isNotBlank(),
+                    ) {
+                        if (isBusy) {
+                            CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Reconnecting…")
+                        } else {
+                            Text("Reconnect to homeserver")
+                        }
+                    }
+                    HorizontalDivider()
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -565,19 +604,31 @@ private fun VerificationInvitationRow(
 }
 
 @Composable
-private fun ConnectionLine(status: String) {
+private fun ConnectionLine(status: String, homeserver: String) {
     val connected = status.equals("Connected", ignoreCase = true)
     val color = if (connected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+    val target = runCatching {
+        Uri.parse(homeserver).let { uri ->
+            buildString {
+                append(uri.host ?: homeserver)
+                if (uri.port >= 0) append(":${uri.port}")
+            }
+        }
+    }.getOrDefault(homeserver)
     Row(
         modifier = Modifier.semantics(mergeDescendants = true) {
-            contentDescription = if (connected) "Connected. Message sync is active." else "$status. Message sync may be delayed."
+            contentDescription = if (connected) {
+                "Connected to $target. Message sync is active."
+            } else {
+                "$status to $target. Message sync may be delayed. Check Server and privacy settings."
+            }
         },
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Box(Modifier.size(8.dp).clip(CircleShape).background(color))
         Text(
-            if (connected) "Connected · message sync" else "$status · messages may be delayed",
+            if (connected) "Connected · message sync" else "$status · $target · messages may be delayed",
             style = MaterialTheme.typography.labelMedium,
             color = if (connected) MaterialTheme.colorScheme.onSurfaceVariant else color,
         )

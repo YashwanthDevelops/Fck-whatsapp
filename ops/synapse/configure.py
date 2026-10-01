@@ -1,6 +1,7 @@
 """Apply local-only Matrix settings to a Synapse-generated homeserver.yaml."""
 
 from pathlib import Path
+import os
 
 import yaml
 
@@ -23,7 +24,10 @@ config["database"] = {
         "cp_max": 10,
     },
 }
-config["public_baseurl"] = "http://localhost:8008/"
+public_baseurl = os.environ.get("SYNAPSE_PUBLIC_BASEURL", "http://localhost:8008/").strip()
+if not public_baseurl.endswith("/"):
+    public_baseurl += "/"
+config["public_baseurl"] = public_baseurl
 config["enable_registration"] = False
 config["enable_registration_without_verification"] = False
 config.pop("registration_shared_secret", None)

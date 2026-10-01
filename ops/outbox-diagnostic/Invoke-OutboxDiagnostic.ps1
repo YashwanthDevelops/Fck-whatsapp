@@ -283,6 +283,9 @@ function Invoke-DiagnosticInstrumentation {
     $logOutput = @(& $adb -s $Device logcat -d -t 5000 2>$null)
     $allowListedLogLines = @($logOutput | Where-Object {
         $_ -match "OUTBOX_DIAG_EDIT_ECHO pipeline=" -or
+        $_ -match "OUTBOX_DIAG_ATTACHMENT_COUNTS sender=\d{1,3} recipient=\d{1,3}" -or
+        $_ -match "OUTBOX_DIAG_ATTACHMENT_MATRIX senderExpected=\d{1,3} senderSibling=\d{1,3} senderExpectedRemote=\d{1,3} senderSiblingRemote=\d{1,3} recipientExpected=\d{1,3} recipientSibling=\d{1,3} recipientFetchExpected=(true|false) recipientFetchSibling=(true|false)" -or
+        $_ -match "OUTBOX_DIAG_ATTACHMENT_PEER connected=(true|false) peerMessages=\d{1,3} peerAttachments=\d{1,3} expectedNameMatches=\d{1,3} siblingNameMatches=\d{1,3} attachmentKinds=([A-Z_,=0-9]+|none) peerUtd=\d{1,3} utdCauses=([A-Z_,=0-9]+|none) timelineCategories=([A-Z_,=0-9]+|none)" -or
         $_ -match "OUTBOX_DIAG_EDIT_SUBMIT result=(failed reason=(empty_body_guard|unchanged_body_guard|ownership_or_editability_guard|encryption_guard|content_creation_unavailable|sdk_or_internal_failure) failureClass=[A-Za-z]+|accepted)" -or
         $_ -match "OUTBOX_DIAG_VOICE_PROJECTION pipeline=(true|false)\|(true|false)\|(true|false)\|(true|false)\|(Connected|Disconnected|Syncing|Reconnecting)\|\d{1,3}\|\d{1,3}\|\d{1,3}\|\d{1,3} categories=([A-Z_,=0-9]+|none)" -or
         $_ -match "FriendlineAckSnapshot: (reserve|bind) media=(true|false) snapshotKnown=(true|false) recipientCount=\d{1,3}( allowMedia=(true|false))?" -or
@@ -291,6 +294,27 @@ function Invoke-DiagnosticInstrumentation {
     })
     if ($allowListedLogLines.Count -gt 0) {
         $safeOutput += [Environment]::NewLine + [string]::Join([Environment]::NewLine, [string[]] $allowListedLogLines)
+    }
+    $attachmentCountMatch = [regex]::Match(
+        $safeOutput,
+        "OUTBOX_DIAG_ATTACHMENT_COUNTS sender=(\d{1,3}) recipient=(\d{1,3})"
+    )
+    if ($attachmentCountMatch.Success) {
+        Write-Output "OUTBOX_DIAG_ATTACHMENT_COUNTS sender=$($attachmentCountMatch.Groups[1].Value) recipient=$($attachmentCountMatch.Groups[2].Value)"
+    }
+    $attachmentMatrixMatch = [regex]::Match(
+        $safeOutput,
+        "OUTBOX_DIAG_ATTACHMENT_MATRIX senderExpected=(\d{1,3}) senderSibling=(\d{1,3}) senderExpectedRemote=(\d{1,3}) senderSiblingRemote=(\d{1,3}) recipientExpected=(\d{1,3}) recipientSibling=(\d{1,3}) recipientFetchExpected=(true|false) recipientFetchSibling=(true|false)"
+    )
+    if ($attachmentMatrixMatch.Success) {
+        Write-Output "OUTBOX_DIAG_ATTACHMENT_MATRIX senderExpected=$($attachmentMatrixMatch.Groups[1].Value) senderSibling=$($attachmentMatrixMatch.Groups[2].Value) senderExpectedRemote=$($attachmentMatrixMatch.Groups[3].Value) senderSiblingRemote=$($attachmentMatrixMatch.Groups[4].Value) recipientExpected=$($attachmentMatrixMatch.Groups[5].Value) recipientSibling=$($attachmentMatrixMatch.Groups[6].Value) recipientFetchExpected=$($attachmentMatrixMatch.Groups[7].Value) recipientFetchSibling=$($attachmentMatrixMatch.Groups[8].Value)"
+    }
+    $attachmentPeerMatch = [regex]::Match(
+        $safeOutput,
+        "OUTBOX_DIAG_ATTACHMENT_PEER connected=(true|false) peerMessages=(\d{1,3}) peerAttachments=(\d{1,3}) expectedNameMatches=(\d{1,3}) siblingNameMatches=(\d{1,3}) attachmentKinds=([A-Z_,=0-9]+|none) peerUtd=(\d{1,3}) utdCauses=([A-Z_,=0-9]+|none) timelineCategories=([A-Z_,=0-9]+|none)"
+    )
+    if ($attachmentPeerMatch.Success) {
+        Write-Output "OUTBOX_DIAG_ATTACHMENT_PEER connected=$($attachmentPeerMatch.Groups[1].Value) peerMessages=$($attachmentPeerMatch.Groups[2].Value) peerAttachments=$($attachmentPeerMatch.Groups[3].Value) expectedNameMatches=$($attachmentPeerMatch.Groups[4].Value) siblingNameMatches=$($attachmentPeerMatch.Groups[5].Value) attachmentKinds=$($attachmentPeerMatch.Groups[6].Value) peerUtd=$($attachmentPeerMatch.Groups[7].Value) utdCauses=$($attachmentPeerMatch.Groups[8].Value) timelineCategories=$($attachmentPeerMatch.Groups[9].Value)"
     }
     $verificationObservation = [regex]::Match(
         $safeOutput,
@@ -577,7 +601,7 @@ function Invoke-DiagnosticInstrumentation {
         } else {
             "test-method-not-reached"
         }
-        $progressPattern = "OUTBOX_DIAG_PROGRESS stage=$([regex]::Escape($Stage)) step=(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|createGroupConversation|verifyGroupPeer|awaitGroupDeliveryPartial|awaitGroupDeliveryComplete|sendGroupMessage|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|editProbeSend|editProbeAwaitSenderEcho|editProbeAwaitPeerEcho|editProbeEdit|awaitEditedSenderProjection|awaitEditedPeerProjection|awaitRedactionSenderProjection|awaitRedactionPeerProjection|awaitEditHistory|awaitReplyEcho|awaitReplyRelation|sendReplyTarget|awaitReplyTarget|sendReply|sendSearchMarker|awaitSearchMarker|executeLocalSearch|awaitLocalSearch|localStoreMarkerScan|voiceNoteRoundTrip|voiceNotePermission|voiceRecorderPrepare|voiceRecorderStart|voiceRecorderStop|voiceUpload|voicePeerDecrypt|voiceDeliveredAck|unverifiedDeviceKeyExclusion|unverifiedAddedDeviceLogin|unverifiedAddedDeviceRoomSync|unverifiedAddedDeviceOpenRoom|unverifiedAddedDeviceTrust|unverifiedProbeSend|unverifiedProbePeerDecrypt|unverifiedProbeUtdProjection|editAndRedactEncryptedMessage|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|verificationPeerTrust|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|awaitBackgroundDelivery|awaitOfflineDeliveryAck|awaitOfflineBacklog|sendReadReceipt|awaitReadReceipt|awaitTyping|verifyExactlyOnce) state=(start|complete)"
+        $progressPattern = "OUTBOX_DIAG_PROGRESS stage=$([regex]::Escape($Stage)) step=(repository-construction|versionsProbe|minimalClientBuilder|minimalSdkLogin|repositoryLogin|awaitConnected|createEncryptedConversation|createGroupConversation|verifyGroupPeer|awaitGroupDeliveryPartial|awaitGroupDeliveryComplete|sendGroupMessage|awaitRoomReady|openConversation|persistDiagnosticRoom|verifyDiagnosticRoom|verifyPeers|editProbeSend|editProbeAwaitSenderEcho|editProbeAwaitPeerEcho|editProbeEdit|awaitEditedSenderProjection|awaitEditedPeerProjection|awaitRedactionSenderProjection|awaitRedactionPeerProjection|awaitEditHistory|awaitReplyEcho|awaitReplyRelation|sendReplyTarget|awaitReplyTarget|sendReply|sendReaction|awaitReaction|sendSearchMarker|awaitSearchMarker|executeLocalSearch|awaitLocalSearch|localStoreMarkerScan|voiceNoteRoundTrip|voiceNotePermission|voiceRecorderPrepare|voiceRecorderStart|voiceRecorderStop|voiceUpload|voicePeerDecrypt|voiceDeliveredAck|unverifiedDeviceKeyExclusion|unverifiedAddedDeviceLogin|unverifiedAddedDeviceRoomSync|unverifiedAddedDeviceOpenRoom|unverifiedAddedDeviceTrust|unverifiedProbeSend|unverifiedProbePeerDecrypt|unverifiedProbeUtdProjection|editAndRedactEncryptedMessage|verificationPeerCheck|verificationPrepareSender|verificationPrepareRecipient|verificationRequest|verificationIncomingRequest|verificationAccept|verificationSafetyCode|verificationApprove|verificationComplete|verificationPeerTrust|persistPreEnqueueArchive|restoreSession|sendText|awaitLocalEcho|selectLocalEcho|assertOfflineEcho|awaitDelivery|awaitBackgroundDelivery|awaitOfflineDeliveryAck|awaitOfflineBacklog|sendReadReceipt|awaitReadReceipt|awaitTyping|verifyExactlyOnce) state=(start|complete)"
         $progressMatches = [regex]::Matches($safeOutput, $progressPattern)
         $progressEvents = @(
             foreach ($progressMatch in $progressMatches) {
@@ -692,6 +716,13 @@ function Invoke-DiagnosticInstrumentation {
         $reconnectState = [regex]::Match($safeOutput, $reconnectStateStatusPattern)
         if ($reconnectState.Success) {
             Write-Output "OUTBOX_DIAG_RECONNECT_STATE connection=$($reconnectState.Groups[1].Value) matchingMessages=$($reconnectState.Groups[2].Value) states=$($reconnectState.Groups[3].Value) eventIds=$($reconnectState.Groups[4].Value)"
+        }
+        $reactionProjection = [regex]::Match(
+            $safeOutput,
+            "outbox_diag_reaction_projection=(true|false)\|(true|false)\|(true|false)\|(true|false)\|(true|false)\|(true|false)"
+        )
+        if ($reactionProjection.Success) {
+            Write-Output "OUTBOX_DIAG_REACTION_PROJECTION observed=$($reactionProjection.Groups[1].Value) senderTarget=$($reactionProjection.Groups[2].Value) senderReceived=$($reactionProjection.Groups[3].Value) recipientOwns=$($reactionProjection.Groups[4].Value) senderConnected=$($reactionProjection.Groups[5].Value) recipientConnected=$($reactionProjection.Groups[6].Value)"
         }
         $testException = [regex]::Match(
             $safeOutput,

@@ -69,6 +69,7 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("boolean", "PUSH_ENABLED", effectivePushEnabled.toString())
         buildConfigField("String", "PUSH_MATRIX_DOMAIN", buildConfigString(pushMatrixDomain))
+        manifestPlaceholders["allowCleartextForPrivateDevelopment"] = "false"
     }
 
     flavorDimensions += "lane"
@@ -105,12 +106,14 @@ android {
         debug {
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
+            manifestPlaceholders["allowCleartextForPrivateDevelopment"] = "true"
             if (localDebugKeystore != null) {
                 signingConfig = signingConfigs.getByName("localDebug")
             }
         }
         release {
             isMinifyEnabled = true
+            manifestPlaceholders["allowCleartextForPrivateDevelopment"] = "false"
             if (privateReleaseSigningConfigured) {
                 signingConfig = signingConfigs.getByName("privateRelease")
             }

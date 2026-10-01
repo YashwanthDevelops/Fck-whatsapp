@@ -16,6 +16,7 @@ class DeliveryStatusTest {
             timestampMillis = 10L,
             isOwn = true,
             deliveryState = "Sending",
+            isOptimisticTextEcho = true,
         )
 
         val promoted = promoteAcceptedLocalMessage(
@@ -30,6 +31,9 @@ class DeliveryStatusTest {
         assertEquals(true, promoted?.isRemote)
         assertEquals("Sent", promoted?.deliveryState)
         assertEquals("hello", promoted?.body)
+        assertEquals(true, promoted?.canReply)
+        assertEquals(true, promoted?.canEdit)
+        assertEquals(true, promoted?.canRedact)
         assertNull(promoteAcceptedLocalMessage(localEcho, "other-txn", "\$other:example.test", "Sent"))
         assertNull(promoteAcceptedLocalMessage(localEcho.copy(isOwn = false), "txn-1", "\$event:example.test", "Sent"))
     }

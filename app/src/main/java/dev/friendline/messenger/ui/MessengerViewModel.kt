@@ -19,6 +19,8 @@ import dev.friendline.messenger.data.ConversationSummary
 import dev.friendline.messenger.data.DeviceVerificationUiState
 import dev.friendline.messenger.data.MessageSearchHit
 import dev.friendline.messenger.data.MatrixRepository
+import dev.friendline.messenger.data.MatrixAttachmentOpenFailure
+import dev.friendline.messenger.data.MatrixRoomCreateFailure
 import dev.friendline.messenger.data.MatrixUserIdPolicy
 import dev.friendline.messenger.data.FriendAddressQrPayload
 import dev.friendline.messenger.data.PendingVoiceNoteStillQueuedException
@@ -32,6 +34,8 @@ import dev.friendline.messenger.calls.OutgoingCallKeyMaterial
 import io.livekit.android.room.track.VideoTrack
 import io.livekit.android.renderer.TextureViewRenderer
 import dev.friendline.messenger.push.PushRegistrationStatus
+import dev.friendline.messenger.push.PushNotificationRoute
+import dev.friendline.messenger.push.PushNotificationRoutePolicy
 import dev.friendline.messenger.BuildConfig
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
@@ -56,6 +60,14 @@ data class AudioPlaybackUiState(
     val durationMillis: Int = 0,
 )
 
+private data class TextSendSubmission(
+    val roomId: String,
+    val body: String,
+    val replyToEventId: String?,
+    val draftRevision: Long,
+    val replyTargetId: String?,
+)
+
 private const val MAX_VOICE_NOTE_DURATION_MILLIS = 5 * 60 * 1000
 private const val MIN_VOICE_NOTE_DURATION_MILLIS = 500
 
@@ -67,6 +79,8 @@ data class MessengerUiState(
     val userId: String? = null,
     val isBusy: Boolean = false,
     val isSendingAttachment: Boolean = false,
+    val openingAttachmentMessageId: String? = null,
+    val failedAttachmentMessageId: String? = null,
     val isRecordingVoiceNote: Boolean = false,
     val voiceRecordingStartedAtMillis: Long? = null,
     val voiceNoteFilePath: String? = null,
@@ -90,6 +104,7 @@ data class MessengerUiState(
     val pushRegistrationStatus: PushRegistrationStatus = PushRegistrationStatus.NOT_ENABLED,
     val verification: DeviceVerificationUiState? = null,
     val peerTrust: PeerTrustStatus = PeerTrustStatus.UNKNOWN,
+    val currentPeerUserId: String? = null,
     val currentRoomId: String? = null,
     val currentRoomTitle: String = "",
     val currentRoomEncrypted: Boolean = false,
@@ -120,8 +135,13 @@ class MessengerViewModel(context: Context) : ViewModel() {
     private var searchJob: Job? = null
     private var attachmentSendJob: Job? = null
     private var lastTypingSentAt = 0L
+    private val composerDraftRevisions = ComposerDraftRevisionLedger()
+    private val textSendQueue by lazy(LazyThreadSafetyMode.NONE) {
+        OrderedSubmissionQueue(viewModelScope, ::processTextSubmission)
+    }
     private var restored = false
     @Volatile private var logoutRequested = false
+    private var pendingNotificationRoute: PushNotificationRoute? = null
     private var voiceRecorder: MediaRecorder? = null
     private var voiceRecordingFile: File? = null
     private var voiceRecordingStartedAtElapsedMillis: Long? = null
@@ -137,7 +157,10 @@ class MessengerViewModel(context: Context) : ViewModel() {
 
     init {
         viewModelScope.launch {
-            repository.conversations.collect { rows -> _state.update { it.copy(conversations = rows) } }
+            repository.conversations.collect { rows ->
+                _state.update { it.copy(conversations = rows) }
+                openPendingNotificationRoom(rows)
+            }
         }
         viewModelScope.launch {
             repository.messages.collect { rows -> _state.update { it.copy(messages = rows) } }
@@ -152,10 +175,18 @@ class MessengerViewModel(context: Context) : ViewModel() {
             repository.connection.collect { value -> _state.update { it.copy(connection = value) } }
         }
         viewModelScope.launch {
+            repository.homeserver.collect { value ->
+                if (value.isNotBlank()) _state.update { it.copy(homeserver = value) }
+            }
+        }
+        viewModelScope.launch {
             repository.verification.collect { value -> _state.update { it.copy(verification = value) } }
         }
         viewModelScope.launch {
             repository.peerTrust.collect { value -> _state.update { it.copy(peerTrust = value) } }
+        }
+        viewModelScope.launch {
+            repository.currentPeerUserId.collect { value -> _state.update { it.copy(currentPeerUserId = value) } }
         }
         viewModelScope.launch {
             repository.searchResults.collect { value -> _state.update { it.copy(searchResults = value) } }
@@ -246,6 +277,51 @@ class MessengerViewModel(context: Context) : ViewModel() {
     fun showNewConversation(show: Boolean) = _state.update { it.copy(showNewConversation = show, error = null) }
     fun clearError() = _state.update { it.copy(error = null) }
 
+    fun openNotificationRoom(roomId: String?, eventId: String? = null) {
+        val route = PushNotificationRoutePolicy.parse(
+            buildMap {
+                if (roomId != null) put("room_id", roomId)
+                if (eventId != null) put("event_id", eventId)
+            },
+        ) ?: return
+        pendingNotificationRoute = route
+        openPendingNotificationRoom(repository.conversations.value)
+    }
+
+    private fun openPendingNotificationRoom(rows: List<ConversationSummary>) {
+        val route = pendingNotificationRoute ?: return
+        if (_state.value.userId == null) return
+        val room = rows.firstOrNull { it.roomId == route.roomId } ?: return
+        if (room.membership != "JOINED" || !room.isEncrypted || room.isVerificationControl) return
+        pendingNotificationRoute = null
+        openConversation(route.roomId, focusEventId = route.eventId)
+    }
+
+    fun reconnectToHomeserver(value: String) {
+        if (logoutRequested) return
+        _state.update { it.copy(homeserver = value, isBusy = true, error = null) }
+        viewModelScope.launch {
+            runCatching { repository.reconnectToHomeserver(value) }
+                .onSuccess {
+                    _state.update { it.copy(isBusy = false, error = null) }
+                    beginRoomRefresh()
+                }
+                .onFailure { failure ->
+                    val detail = failure.message?.takeIf(String::isNotBlank)?.take(180)
+                    _state.update {
+                        it.copy(
+                            isBusy = false,
+                            error = if (debugFailureDetails && detail != null) {
+                                "Couldn't reconnect to that homeserver: $detail"
+                            } else {
+                                "Couldn't reconnect to that homeserver. Check its address and connection, then retry."
+                            },
+                        )
+                    }
+                }
+        }
+    }
+
     fun setPushNotificationsEnabled(enabled: Boolean) {
         if (logoutRequested) return
         viewModelScope.launch {
@@ -322,6 +398,11 @@ class MessengerViewModel(context: Context) : ViewModel() {
             _state.update { it.copy(error = "Enter exactly one Matrix ID for a one-to-one conversation.") }
             return
         }
+        val signedInUserId = _state.value.userId
+        if (signedInUserId != null && invitees.any { it.equals(signedInUserId, ignoreCase = true) }) {
+            _state.update { it.copy(error = "That is your own Matrix ID. Invite the other phone's Matrix ID instead.") }
+            return
+        }
         viewModelScope.launch {
             _state.update { it.copy(isBusy = true, error = null) }
             runCatching { repository.createEncryptedConversation(invitees, name, isGroup) }
@@ -330,8 +411,21 @@ class MessengerViewModel(context: Context) : ViewModel() {
                     beginRoomRefresh()
                     openConversation(roomId)
                 }
-                .onFailure {
-                    _state.update { it.copy(isBusy = false, error = "Couldn't create the encrypted conversation. Check the invited Matrix IDs and try again.") }
+                .onFailure { failure ->
+                    val errorMessage = if (debugFailureDetails) {
+                        val rootCause = generateSequence(failure) { it.cause }.last()
+                        val stage = (failure as? MatrixRoomCreateFailure)?.stage
+                            ?.let { " during $it" }
+                            .orEmpty()
+                        val detail = rootCause.message
+                            ?.takeIf(String::isNotBlank)
+                            ?.take(180)
+                            ?: rootCause.javaClass.simpleName
+                        "Conversation setup failed$stage: $detail"
+                    } else {
+                        "Couldn't create the encrypted conversation. Check the invited Matrix IDs and try again."
+                    }
+                    _state.update { it.copy(isBusy = false, error = errorMessage) }
                 }
         }
     }
@@ -378,10 +472,12 @@ class MessengerViewModel(context: Context) : ViewModel() {
                 repository.openConversation(roomId, focusEventId)
             }
                 .onSuccess {
+                    val loadedDraft = repository.composerDraft.value
+                    nextComposerDraftRevision(roomId)
                     _state.update {
                         it.copy(
                             isBusy = false,
-                            composerDraft = repository.composerDraft.value,
+                            composerDraft = loadedDraft,
                             navigationTargetEventId = focusEventId,
                         )
                     }
@@ -661,11 +757,14 @@ class MessengerViewModel(context: Context) : ViewModel() {
         val snapshot = _state.value
         val roomId = snapshot.currentRoomId
         val currentDraft = snapshot.composerDraft
+        val draftRevision = roomId?.let(::nextComposerDraftRevision)
         if (!snapshot.isSendingVoiceNote) discardVoiceNote()
         stopAudioPlayback()
         draftJob?.cancel()
         viewModelScope.launch {
-            if (roomId != null) runCatching { repository.saveComposerDraft(roomId, currentDraft) }
+            if (roomId != null && draftRevision != null) {
+                runCatching { repository.saveComposerDraft(roomId, currentDraft, draftRevision) }
+            }
             repository.closeConversation()
             _state.update {
                 it.copy(
@@ -695,6 +794,7 @@ class MessengerViewModel(context: Context) : ViewModel() {
         if (logoutRequested) return
         _state.update { it.copy(composerDraft = body) }
         val roomId = _state.value.currentRoomId ?: return
+        val revision = nextComposerDraftRevision(roomId)
         typingStopJob?.cancel()
         if (body.isBlank()) {
             viewModelScope.launch { runCatching { repository.sendTypingNotice(roomId, false) } }
@@ -712,7 +812,7 @@ class MessengerViewModel(context: Context) : ViewModel() {
         draftJob?.cancel()
         draftJob = viewModelScope.launch {
             delay(400)
-            runCatching { repository.saveComposerDraft(roomId, body) }
+            runCatching { repository.saveComposerDraft(roomId, body, revision) }
         }
     }
 
@@ -795,7 +895,16 @@ class MessengerViewModel(context: Context) : ViewModel() {
     }
 
     fun verifyConversationPeer() {
-        val roomId = _state.value.currentRoomId ?: return
+        val snapshot = _state.value
+        val roomId = snapshot.currentRoomId ?: return
+        if (!PeerVerificationActionPolicy.shouldShowVerifyAction(
+                isEncrypted = snapshot.currentRoomEncrypted,
+                isGroup = snapshot.currentRoomIsGroup,
+                currentPeerUserId = snapshot.currentPeerUserId,
+                peerTrust = snapshot.peerTrust,
+                verification = snapshot.verification,
+            )
+        ) return
         viewModelScope.launch {
             runCatching { repository.requestPeerVerification(roomId) }
                 .onFailure { error ->
@@ -862,47 +971,61 @@ class MessengerViewModel(context: Context) : ViewModel() {
         draftJob?.cancel()
         typingStopJob?.cancel()
         val submittedReply = _state.value.replyTarget
+        val draftRevision = nextComposerDraftRevision(roomId)
         _state.update { it.copy(composerDraft = "", error = null) }
-        val replyTo = submittedReply?.eventId
-        viewModelScope.launch {
-            try {
-                val draftClearFailed = repository.sendText(roomId, body, replyTo)
-                _state.update {
-                    if (it.currentRoomId == roomId) {
-                        it.copy(
-                            replyTarget = if (it.replyTarget?.id == submittedReply?.id) null else it.replyTarget,
-                            error = if (draftClearFailed) {
-                                "Message sent, but the saved draft could not be cleared. Check the conversation before sending it again."
-                            } else {
-                                it.error
-                            },
-                        )
-                    } else {
-                        it
-                    }
-                }
-            } catch (cancelled: CancellationException) {
-                _state.update {
-                    if (it.currentRoomId == roomId) {
-                        it.copy(composerDraft = it.composerDraft.ifBlank { body })
-                    } else {
-                        it
-                    }
-                }
-                throw cancelled
-            } catch (error: Throwable) {
-                _state.update {
-                    if (it.currentRoomId == roomId) {
-                        it.copy(
-                            composerDraft = it.composerDraft.ifBlank { body },
-                            error = error.message ?: "Couldn't send this message.",
-                        )
-                    } else {
-                        it
-                    }
+        textSendQueue.enqueue(
+            TextSendSubmission(
+                roomId = roomId,
+                body = body,
+                replyToEventId = submittedReply?.eventId,
+                draftRevision = draftRevision,
+                replyTargetId = submittedReply?.id,
+            ),
+        )
+    }
+
+    private suspend fun processTextSubmission(submission: TextSendSubmission) {
+        try {
+            check(repository.sendText(submission.roomId, submission.body, submission.replyToEventId)) {
+                "The message was not accepted by the encrypted send queue."
+            }
+            val draftClearFailed = runCatching {
+                repository.saveComposerDraft(submission.roomId, "", submission.draftRevision)
+            }.isFailure
+            _state.update {
+                if (it.currentRoomId == submission.roomId) {
+                    it.copy(
+                        replyTarget = if (it.replyTarget?.id == submission.replyTargetId) null else it.replyTarget,
+                        error = if (draftClearFailed) {
+                            "Message sent, but the saved draft could not be cleared. Check the conversation before sending it again."
+                        } else {
+                            it.error
+                        },
+                    )
+                } else {
+                    it
                 }
             }
+        } catch (cancelled: CancellationException) {
+            restoreFailedTextDraftIfUnchanged(submission.roomId, submission.body, submission.draftRevision)
+            throw cancelled
+        } catch (error: Throwable) {
+            _state.update { it.copy(error = error.message ?: "Couldn't send this message.") }
+            restoreFailedTextDraftIfUnchanged(submission.roomId, submission.body, submission.draftRevision)
         }
+    }
+
+    private fun nextComposerDraftRevision(roomId: String): Long {
+        val revision = composerDraftRevisions.advance(roomId)
+        repository.noteComposerDraftRevision(roomId, revision)
+        return revision
+    }
+
+    private fun restoreFailedTextDraftIfUnchanged(roomId: String, body: String, submittedRevision: Long) {
+        if (_state.value.currentRoomId != roomId || !composerDraftRevisions.isCurrent(roomId, submittedRevision) ||
+            _state.value.composerDraft.isNotBlank()
+        ) return
+        updateComposerDraft(body)
     }
 
     fun sendAttachment(contentUri: String) {
@@ -1237,6 +1360,7 @@ class MessengerViewModel(context: Context) : ViewModel() {
     }
 
     fun onAppStopped() {
+        repository.onAppBackgrounded()
         if (!_state.value.isSendingVoiceNote) discardVoiceNote()
         stopAudioPlayback()
     }
@@ -1247,8 +1371,16 @@ class MessengerViewModel(context: Context) : ViewModel() {
 
     fun openAttachment(message: ChatMessage) {
         val attachment = message.attachment ?: return
+        if (_state.value.openingAttachmentMessageId != null) return
+        _state.update {
+            it.copy(
+                openingAttachmentMessageId = message.id,
+                failedAttachmentMessageId = null,
+                error = null,
+            )
+        }
         viewModelScope.launch {
-            runCatching {
+            try {
                 val file = repository.loadAttachmentForViewing(message)
                 val contentUri = FileProvider.getUriForFile(
                     appContext,
@@ -1260,15 +1392,29 @@ class MessengerViewModel(context: Context) : ViewModel() {
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 appContext.startActivity(Intent.createChooser(intent, "Open attachment"))
-            }.onFailure {
+            } catch (failure: CancellationException) {
+                throw failure
+            } catch (failure: Exception) {
+                val repositoryFailure = failure as? MatrixAttachmentOpenFailure
+                val rootCause = generateSequence<Throwable>(failure) { it.cause }.last()
+                val details = if (debugFailureDetails) {
+                    "Attachment opening failed during ${repositoryFailure?.stage ?: "share-decrypted-file-with-viewer"} (${rootCause.javaClass.simpleName})."
+                } else {
+                    "Couldn't open this encrypted attachment. Check the connection and try again."
+                }
                 _state.update { state ->
-                    state.copy(error = "Couldn't open this encrypted attachment. Check the connection and try again.")
+                    state.copy(failedAttachmentMessageId = message.id, error = details)
+                }
+            } finally {
+                _state.update { state ->
+                    if (state.openingAttachmentMessageId == message.id) state.copy(openingAttachmentMessageId = null) else state
                 }
             }
         }
     }
 
     fun onReturnedToAppFromExternalViewer() {
+        repository.onAppForegrounded()
         repository.cleanupExternalViewerFiles()
         refreshPushNotifications()
     }
@@ -1297,6 +1443,7 @@ class MessengerViewModel(context: Context) : ViewModel() {
                 .onSuccess {
                     refreshJob?.cancel()
                     typingStopJob?.cancel()
+                    pendingNotificationRoute = null
                     logoutRequested = false
                     _state.value = MessengerUiState(homeserver = _state.value.homeserver)
                     restored = false

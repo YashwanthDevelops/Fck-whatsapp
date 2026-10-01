@@ -23,6 +23,7 @@ services:
       SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
       SYNAPSE_SERVER_NAME: ${SYNAPSE_SERVER_NAME:-localhost}
       SYNAPSE_REPORT_STATS: ${SYNAPSE_REPORT_STATS:-no}
+      SYNAPSE_PUBLIC_BASEURL: ${SYNAPSE_PUBLIC_BASEURL:-http://localhost:8008/}
     ports:
       - "${SYNAPSE_BIND_ADDRESS:-127.0.0.1}:${SYNAPSE_HTTP_PORT:-8008}:8008"
     volumes:

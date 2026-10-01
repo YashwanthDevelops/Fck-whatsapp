@@ -54,6 +54,8 @@ fun MessengerApp(viewModel: MessengerViewModel) {
             onToggleCallMicrophone = viewModel::toggleCallMicrophone,
             onToggleCallCamera = viewModel::toggleCallCamera,
             peerTrust = state.peerTrust,
+            currentPeerUserId = state.currentPeerUserId,
+            verification = state.verification,
             connection = state.connection,
             messages = state.messages,
             typingUsers = state.typingUsers,
@@ -65,6 +67,8 @@ fun MessengerApp(viewModel: MessengerViewModel) {
             navigationTargetEventId = state.navigationTargetEventId,
             error = state.error,
             isSendingAttachment = state.isSendingAttachment,
+            openingAttachmentMessageId = state.openingAttachmentMessageId,
+            failedAttachmentMessageId = state.failedAttachmentMessageId,
             isRecordingVoiceNote = state.isRecordingVoiceNote,
             voiceRecordingStartedAtMillis = state.voiceRecordingStartedAtMillis,
             voiceNoteFilePath = state.voiceNoteFilePath,
@@ -109,6 +113,7 @@ fun MessengerApp(viewModel: MessengerViewModel) {
         )
         state.userId != null -> ConversationListScreen(
             userId = state.userId,
+            homeserver = state.homeserver,
             connection = state.connection,
             conversations = state.conversations,
             isBusy = state.isBusy,
@@ -139,6 +144,7 @@ fun MessengerApp(viewModel: MessengerViewModel) {
             },
             onClearError = viewModel::clearError,
             onJoinVerification = viewModel::joinVerificationChannel,
+            onReconnectToHomeserver = viewModel::reconnectToHomeserver,
         )
         else -> LoginScreen(
             homeserver = state.homeserver,

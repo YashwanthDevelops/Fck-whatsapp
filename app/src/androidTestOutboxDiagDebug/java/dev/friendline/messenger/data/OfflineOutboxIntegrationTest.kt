@@ -4,8 +4,10 @@ import android.app.Instrumentation
 import android.os.Bundle
 import android.util.JsonReader
 import android.util.JsonToken
+import androidx.lifecycle.ViewModelStore
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.friendline.messenger.ui.MessengerViewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -37,6 +39,7 @@ class OfflineOutboxIntegrationTest {
     fun encryptedMessageOutboxSurvivesOfflineRestartAndReconnects() {
         var instrumentation: Instrumentation? = null
         var repository: MatrixRepository? = null
+        var viewModelStore: ViewModelStore? = null
         var minimalClient: Client? = null
         var failureStage = "test-method-entry"
         var failureStep = "test-method-entry"
@@ -69,13 +72,17 @@ class OfflineOutboxIntegrationTest {
                 failureStep = "repository-construction"
                 failureState = "start"
                 reportProgress(activeInstrumentation, failureStage, failureStep, failureState)
-                val activeRepository = MatrixRepository(context)
-                repository = activeRepository
+                val activeRepository = if (stage == "seed-offline") {
+                    null
+                } else {
+                    MatrixRepository(context).also { repository = it }
+                }
                 failureState = "complete"
                 reportProgress(activeInstrumentation, failureStage, failureStep, failureState)
 
                 when (stage) {
                     "prepare" -> {
+                        val activeRepository = checkNotNull(activeRepository)
                         val homeserverUrl = checkNotNull(args.getString("homeserver_url"))
                         val username = checkNotNull(args.getString("username"))
                         val password = checkNotNull(args.getString("password"))
@@ -351,22 +358,36 @@ class OfflineOutboxIntegrationTest {
                         failureStep = "restoreSession"
                         failureState = "start"
                         reportProgress(activeInstrumentation, stage, failureStep, failureState)
-                        checkNotNull(activeRepository.restoreSession()) {
-                            "The isolated diagnostic account has no saved session"
+                        val store = ViewModelStore().also { viewModelStore = it }
+                        val viewModel = MessengerViewModel(context)
+                        store.put("offline-outbox-regression", viewModel)
+                        viewModel.restoreSessionIfPresent()
+                        val restored = withTimeoutOrNull(60_000) {
+                            while (viewModel.state.value.userId == null) delay(100)
+                            true
                         }
+                        check(restored == true) { "The view model did not restore the isolated diagnostic account" }
                         failureState = "complete"
                         reportProgress(activeInstrumentation, stage, failureStep, failureState)
                         val roomId = stateFile.readText().trim()
                         failureStep = "openConversation"
                         failureState = "start"
                         reportProgress(activeInstrumentation, stage, failureStep, failureState)
-                        activeRepository.openConversation(roomId)
+                        viewModel.openConversation(roomId)
+                        val opened = withTimeoutOrNull(45_000) {
+                            while (viewModel.state.value.currentRoomId != roomId ||
+                                !viewModel.state.value.currentRoomEncrypted || viewModel.state.value.isBusy
+                            ) delay(100)
+                            true
+                        }
+                        check(opened == true) { "The view model did not open the encrypted diagnostic room" }
                         failureState = "complete"
                         reportProgress(activeInstrumentation, stage, failureStep, failureState)
                         failureStep = "sendText"
                         failureState = "start"
                         reportProgress(activeInstrumentation, stage, failureStep, failureState)
-                        activeRepository.sendText(roomId, marker)
+                        val markers = (1..3).map { "$marker-$it" }
+                        markers.forEach(viewModel::sendText)
                         failureState = "complete"
                         reportProgress(activeInstrumentation, stage, failureStep, failureState)
 
@@ -374,38 +395,47 @@ class OfflineOutboxIntegrationTest {
                         failureState = "start"
                         reportProgress(activeInstrumentation, stage, failureStep, failureState)
                         val echoAppeared = withTimeoutOrNull(20_000) {
-                            while (activeRepository.messages.value.none { it.body == marker && it.isOwn }) {
+                            while (markers.any { body ->
+                                    viewModel.state.value.messages.none { it.body == body && it.isOwn }
+                                }
+                            ) {
                                 delay(100)
                             }
                             true
                         }
-                        check(echoAppeared == true) { "The offline send did not create a local echo" }
+                        check(echoAppeared == true) { "The view-model outbox did not create all local echoes" }
                         failureState = "complete"
                         reportProgress(activeInstrumentation, stage, failureStep, failureState)
                         failureStep = "selectLocalEcho"
                         failureState = "start"
                         reportProgress(activeInstrumentation, stage, failureStep, failureState)
-                        val echo = activeRepository.messages.value.single { it.body == marker && it.isOwn }
+                        val queuedMessages = viewModel.state.value.messages
+                        val localEchoes = markers.map { body ->
+                            queuedMessages.single { it.body == body && it.isOwn }
+                        }
                         failureState = "complete"
                         reportProgress(activeInstrumentation, stage, failureStep, failureState)
                         failureStep = "assertOfflineEcho"
                         failureState = "start"
                         reportProgress(activeInstrumentation, stage, failureStep, failureState)
-                        assertTrue(
-                            "The isolated offline message should remain queued",
-                            echo.deliveryState == "Queued" || echo.deliveryState == "Sending",
-                        )
-                        assertTrue("An offline local echo must not have a server event ID", echo.eventId == null)
+                        assertEquals("Each submitted message must have one local echo", 3, localEchoes.size)
+                        assertTrue("The view-model queue must preserve tap order", localEchoes.zipWithNext().all {
+                            pair -> queuedMessages.indexOf(pair.first) < queuedMessages.indexOf(pair.second)
+                        })
+                        assertTrue("Offline local echoes must not have server event IDs", localEchoes.all {
+                            it.eventId == null && it.deliveryState in setOf("Queued", "Sending")
+                        })
                         failureState = "complete"
                         reportProgress(activeInstrumentation, stage, failureStep, failureState)
-                        reportSafeStatus(activeInstrumentation, "outbox_diag_result", "seed-offline|echoCount=1|serverEvent=false")
+                        reportSafeStatus(activeInstrumentation, "outbox_diag_result", "seed-offline|echoCount=3|ordered=true|serverEvent=false")
                         println(
-                            "OUTBOX_DIAG_RESULT stage=seed-offline echoCount=1 " +
-                                "delivery=${echo.deliveryState} serverEvent=false connection=${activeRepository.connection.value}",
+                            "OUTBOX_DIAG_RESULT stage=seed-offline echoCount=3 ordered=true " +
+                                "serverEvent=false connection=${viewModel.state.value.connection}",
                         )
                     }
 
                     "resume" -> {
+                        val activeRepository = checkNotNull(activeRepository)
                         check(stateFile.isFile) { "The isolated offline seed stage has not completed" }
                         failureStep = "restoreSession"
                         failureState = "start"
@@ -432,11 +462,13 @@ class OfflineOutboxIntegrationTest {
                         failureStep = "awaitDelivery"
                         failureState = "start"
                         reportProgress(activeInstrumentation, stage, failureStep, failureState)
+                        val markers = (1..3).map { "$marker-$it" }
                         val delivered = withTimeoutOrNull(60_000) {
-                            while (
-                                activeRepository.messages.value.none {
-                                    it.body == marker && it.isOwn && it.eventId != null &&
-                                        it.deliveryState in setOf("Sent", "Delivered")
+                            while (markers.any { body ->
+                                    activeRepository.messages.value.none {
+                                        it.body == body && it.isOwn && it.eventId != null &&
+                                            it.deliveryState in setOf("Sent", "Delivered")
+                                    }
                                 }
                             ) {
                                 delay(250)
@@ -452,16 +484,19 @@ class OfflineOutboxIntegrationTest {
                         failureState = "start"
                         reportProgress(activeInstrumentation, stage, failureStep, failureState)
                         delay(1_500)
-                        val markerMessages = activeRepository.messages.value.filter { it.body == marker && it.isOwn }
-                        val serverEventCount = markerMessages.mapNotNull { it.eventId }.distinct().size
-                        val markerCount = markerMessages.size
-                        assertEquals("The restarted outbox should create exactly one event", 1, markerCount)
-                        assertEquals("The restarted outbox should have exactly one server event ID", 1, serverEventCount)
+                        val markerMessages = activeRepository.messages.value.filter { it.body in markers && it.isOwn }
+                        val messagesByMarker = markers.map { body -> markerMessages.single { it.body == body } }
+                        val serverEventCount = messagesByMarker.mapNotNull { it.eventId }.distinct().size
+                        assertEquals("The restarted outbox should create one event per submission", 3, markerMessages.size)
+                        assertEquals("Each restarted submission should have one server event ID", 3, serverEventCount)
+                        assertTrue("The restarted SDK queue must preserve tap order", messagesByMarker.zipWithNext().all {
+                            pair -> markerMessages.indexOf(pair.first) < markerMessages.indexOf(pair.second)
+                        })
                         stateFile.delete()
                         failureState = "complete"
                         reportProgress(activeInstrumentation, stage, failureStep, failureState)
-                        reportSafeStatus(activeInstrumentation, "outbox_diag_result", "resume|sentCount=1|connection=Connected")
-                        println("OUTBOX_DIAG_RESULT stage=resume sentCount=1 connection=Connected visibleMessages=$markerCount serverEventIds=$serverEventCount")
+                        reportSafeStatus(activeInstrumentation, "outbox_diag_result", "resume|sentCount=3|ordered=true|connection=Connected")
+                        println("OUTBOX_DIAG_RESULT stage=resume sentCount=3 ordered=true connection=Connected visibleMessages=${markerMessages.size} serverEventIds=$serverEventCount")
                     }
 
                     else -> error("Unsupported isolated diagnostic stage")
@@ -538,6 +573,7 @@ class OfflineOutboxIntegrationTest {
             )
             throw failure
         } finally {
+            viewModelStore?.clear()
             minimalClient?.close()
             repository?.let { activeRepository ->
                 try {

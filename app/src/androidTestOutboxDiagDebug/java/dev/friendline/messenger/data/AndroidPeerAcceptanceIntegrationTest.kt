@@ -355,8 +355,9 @@ class AndroidPeerAcceptanceIntegrationTest {
         verifyMessageEditingAndRedaction(roomId, marker, sender, recipient, onStep)
 
         val backgroundRoomId = sender.createEncryptedConversation(
-            invitedUserIds = listOf(recipientId),
+            invitedUserIds = listOf(recipientId, groupPeerId),
             name = "Private peer background receipt check",
+            isGroup = true,
         )
         await("background-room invitation") {
             recipient.refreshConversations()
@@ -687,9 +688,40 @@ class AndroidPeerAcceptanceIntegrationTest {
         val reactionTarget = awaitMessage(recipient, "reaction target") {
             it.body == replyTargetBody && !it.isOwn && it.eventId != null
         }
+        onStep("sendReaction")
         recipient.toggleReaction(roomId, reactionTarget, "👍")
-        awaitMessage(sender, "encrypted reaction") {
-            it.body == replyTargetBody && it.reactions.any { reaction -> reaction.key == "👍" && reaction.count == 1 }
+        onStep("awaitReaction")
+        val reactionObserved = awaitCondition("encrypted reaction") {
+            sender.messages.value.any {
+                it.body == replyTargetBody && it.reactions.any { reaction -> reaction.key == "👍" && reaction.count == 1 }
+            }
+        }
+        val senderReactionTarget = sender.messages.value.firstOrNull { it.eventId == reactionTarget.eventId }
+        val recipientReactionTarget = recipient.messages.value.firstOrNull { it.eventId == reactionTarget.eventId }
+        val senderReaction = senderReactionTarget?.reactions?.firstOrNull { it.key == "👍" }
+        val recipientReaction = recipientReactionTarget?.reactions?.firstOrNull { it.key == "👍" }
+        InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+            putString(
+                "outbox_diag_reaction_projection",
+                listOf(
+                    reactionObserved,
+                    senderReactionTarget != null,
+                    senderReaction?.count == 1,
+                    recipientReaction?.count == 1,
+                    sender.connection.value == "Connected",
+                    recipient.connection.value == "Connected",
+                ).joinToString("|") { it.toString() },
+            )
+        })
+        println(
+            "OUTBOX_DIAG_REACTION_PROJECTION observed=$reactionObserved " +
+                "senderTarget=${senderReactionTarget != null} senderCount=${senderReaction?.count ?: 0} " +
+                "recipientCount=${recipientReaction?.count ?: 0} " +
+                "senderConnected=${sender.connection.value == "Connected"} " +
+                "recipientConnected=${recipient.connection.value == "Connected"}",
+        )
+        check(reactionObserved) {
+            "The encrypted reaction did not reach the sender's projected timeline"
         }
 
         val searchMarker = "search-$marker"
@@ -1183,7 +1215,17 @@ class AndroidPeerAcceptanceIntegrationTest {
             it.body == originalBody && !it.isOwn && it.isRemote && it.eventId == ownMessage.eventId
         }
         reportProgress(InstrumentationRegistry.getInstrumentation(), "core", "editProbeAwaitPeerEcho", "complete")
-        assertTrue("Only an acknowledged own remote text message should expose Edit", ownMessage.canEdit)
+        val ownRows = sender.messages.value.filter { it.body == originalBody && it.isOwn }
+        val rowCapabilities = ownRows.joinToString(",") {
+            "remote=${it.isRemote}:event=${it.eventId != null}:edit=${it.canEdit}:" +
+                "redact=${it.canRedact}:textFallback=${it.isOptimisticTextEcho}"
+        }.ifBlank { "none" }
+        assertTrue(
+            "Only an acknowledged own remote text message should expose Edit " +
+                "(selected remote=${ownMessage.isRemote} event=${ownMessage.eventId != null} " +
+                "redact=${ownMessage.canRedact} fallback=${ownMessage.isOptimisticTextEcho}; rows=$rowCapabilities)",
+            ownMessage.canEdit,
+        )
         assertTrue("Only an acknowledged own remote message should expose Remove", ownMessage.canRedact)
         assertFalse("A peer message must not expose Edit", peerMessage.canEdit)
         assertFalse("A peer message must not expose Remove", peerMessage.canRedact)
@@ -1270,7 +1312,7 @@ class AndroidPeerAcceptanceIntegrationTest {
             it.eventId == ownMessage.eventId && it.body == "Message removed" && it.isOwn
         }
         onStep("awaitRedactionPeerProjection")
-        awaitMessage(recipient, "redaction syncs to recipient timeline") {
+        awaitMessage(recipient, "redaction syncs to recipient timeline", timeoutMillis = 90_000) {
             it.eventId == ownMessage.eventId && it.body == "Message removed" && !it.isOwn
         }
         println("OUTBOX_DIAG_MESSAGE_MUTATION edit=true redact=true peerActionsRejected=true")
@@ -1647,8 +1689,8 @@ class AndroidPeerAcceptanceIntegrationTest {
         reportProgress(instrumentation, "attachment-resume", "verifyExactlyOnce", "start")
         assertNotNull(deliveredAttachment.attachment)
         assertNotNull(recoveredPreEnqueueAttachment.attachment)
-        assertExactlyOneAttachmentAfterQuietWindow(sender, recipient, fileName)
-        assertExactlyOneAttachmentAfterQuietWindow(sender, recipient, preEnqueueFileName)
+        assertExactlyOneAttachmentAfterQuietWindow(sender, recipient, roomId, fileName)
+        assertExactlyOneAttachmentAfterQuietWindow(sender, recipient, roomId, preEnqueueFileName)
         verifyDecryptedAttachment(recipient, fileName, expectedSize, expectedHash)
         verifyDecryptedAttachment(recipient, preEnqueueFileName, preEnqueueSize, preEnqueueHash)
         assertNoPlaintextAttachmentCache(
@@ -1856,10 +1898,13 @@ class AndroidPeerAcceptanceIntegrationTest {
     private suspend fun assertExactlyOneAttachmentAfterQuietWindow(
         sender: MatrixRepository,
         recipient: MatrixRepository,
+        roomId: String,
         fileName: String,
     ) {
         var stableSinceMillis: Long? = null
-        check(awaitCondition("settled attachment event counts", 20_000) {
+        var senderEventCount = 0
+        var recipientEventCount = 0
+        val settled = awaitCondition("settled attachment event counts", 20_000) {
             val senderEvents = sender.messages.value
                 .filter { it.isOwn && it.attachment?.fileName == fileName }
                 .mapNotNull(ChatMessage::eventId)
@@ -1868,6 +1913,8 @@ class AndroidPeerAcceptanceIntegrationTest {
                 .filter { !it.isOwn && it.attachment?.fileName == fileName }
                 .mapNotNull(ChatMessage::eventId)
                 .toSet()
+            senderEventCount = senderEvents.size
+            recipientEventCount = recipientEvents.size
             assertTrue("The sender observed duplicate attachment events", senderEvents.size <= 1)
             assertTrue("The recipient observed duplicate attachment events", recipientEvents.size <= 1)
             if (senderEvents.size == 1 && recipientEvents.size == 1) {
@@ -1878,7 +1925,73 @@ class AndroidPeerAcceptanceIntegrationTest {
                 stableSinceMillis = null
                 false
             }
-        }) { "The attachment event count did not settle at one for both peers" }
+        }
+        if (!settled) {
+            val siblingFileName = when {
+                fileName.startsWith("upload-") -> "pre-enqueue-${fileName.removePrefix("upload-")}"
+                fileName.startsWith("pre-enqueue-") -> "upload-${fileName.removePrefix("pre-enqueue-")}"
+                else -> ""
+            }
+            val senderAttachments = sender.messages.value
+                .filter(ChatMessage::isOwn)
+                .mapNotNull { message -> message.attachment?.let { message to it } }
+            val senderExpected = senderAttachments.filter { (_, attachment) -> attachment.fileName == fileName }
+            val senderSibling = senderAttachments.filter { (_, attachment) -> attachment.fileName == siblingFileName }
+            val recipientCanFetchSenderExpected = senderExpected.mapNotNull { it.first.eventId }
+                .any { eventId -> recipient.canFetchEventForDiagnostic(roomId, eventId) }
+            val recipientCanFetchSenderSibling = senderSibling.mapNotNull { it.first.eventId }
+                .any { eventId -> recipient.canFetchEventForDiagnostic(roomId, eventId) }
+            val peerUtdCount = recipient.messages.value.count {
+                !it.isOwn && it.body == "Unable to decrypt this message"
+            }
+            val peerMessageCount = recipient.messages.value.count { !it.isOwn }
+            val peerAttachments = recipient.messages.value
+                .filterNot(ChatMessage::isOwn)
+                .mapNotNull(ChatMessage::attachment)
+            val peerExpectedAttachmentCount = peerAttachments.count { it.fileName == fileName }
+            val peerSiblingAttachmentCount = peerAttachments.count { it.fileName == siblingFileName }
+            val peerAttachmentKinds = peerAttachments
+                .groupingBy { it.kind.name }
+                .eachCount()
+                .toSortedMap()
+                .entries
+                .joinToString(",") { (kind, count) -> "$kind=${count.coerceAtMost(999)}" }
+                .ifBlank { "none" }
+            val peerUtdCauses = recipient.utdCauseCountsForDiagnostic()
+                .toSortedMap()
+                .entries
+                .joinToString(",") { (cause, count) -> "$cause=${count.coerceAtMost(999)}" }
+                .ifBlank { "none" }
+            val peerTimelineCategories = recipient.timelineCategoriesForDiagnostic(roomId)
+                .toSortedMap()
+                .entries
+                .joinToString(",") { (category, count) -> "$category=${count.coerceAtMost(999)}" }
+                .ifBlank { "none" }
+            println(
+                "OUTBOX_DIAG_ATTACHMENT_COUNTS sender=$senderEventCount recipient=$recipientEventCount",
+            )
+            println(
+                "OUTBOX_DIAG_ATTACHMENT_MATRIX senderExpected=${senderExpected.mapNotNull { it.first.eventId }.toSet().size} " +
+                    "senderSibling=${senderSibling.mapNotNull { it.first.eventId }.toSet().size} " +
+                    "senderExpectedRemote=${senderExpected.count { it.first.isRemote }} " +
+                    "senderSiblingRemote=${senderSibling.count { it.first.isRemote }} " +
+                    "recipientExpected=$peerExpectedAttachmentCount recipientSibling=$peerSiblingAttachmentCount " +
+                    "recipientFetchExpected=$recipientCanFetchSenderExpected " +
+                    "recipientFetchSibling=$recipientCanFetchSenderSibling",
+            )
+            println(
+                "OUTBOX_DIAG_ATTACHMENT_PEER connected=${recipient.connection.value == "Connected"} " +
+                    "peerMessages=$peerMessageCount peerAttachments=${peerAttachments.size} " +
+                    "expectedNameMatches=$peerExpectedAttachmentCount siblingNameMatches=$peerSiblingAttachmentCount " +
+                    "attachmentKinds=$peerAttachmentKinds " +
+                    "peerUtd=$peerUtdCount utdCauses=$peerUtdCauses " +
+                    "timelineCategories=$peerTimelineCategories",
+            )
+        }
+        check(settled) {
+            "The attachment event count did not settle at one for both peers " +
+                "(sender=$senderEventCount, recipient=$recipientEventCount)"
+        }
     }
 
     private suspend fun verifyDecryptedAttachment(
@@ -1890,14 +2003,55 @@ class AndroidPeerAcceptanceIntegrationTest {
         val recipientAttachment = awaitMessage(recipient, "recipient decrypted attachment") {
             !it.isOwn && it.attachment?.fileName == fileName && it.eventId != null
         }
+        val attachment = checkNotNull(recipientAttachment.attachment)
+        val failedDownload = try {
+            recipient.loadAttachmentForViewing(
+                recipientAttachment.copy(
+                    attachment = attachment.copy(sourceJson = sourceWithUnavailableMxcUri(attachment.sourceJson)),
+                ),
+            )
+            null
+        } catch (failure: Exception) {
+            failure
+        }
+        check(failedDownload is MatrixAttachmentOpenFailure && failedDownload.stage == "download-and-decrypt") {
+            "The unavailable peer media fixture did not fail during download and decryption"
+        }
         val decrypted = recipient.loadAttachmentForViewing(checkNotNull(recipientAttachment))
+        val appContext = InstrumentationRegistry.getInstrumentation().targetContext
+        val viewerFile = File(
+            appContext.cacheDir,
+            "private-messenger/media/peer-acceptance-viewer/$fileName",
+        )
         try {
             val actualBytes = decrypted.readBytes()
             assertEquals(expectedSize, actualBytes.size)
             assertEquals(expectedHash, sha256(actualBytes))
+            viewerFile.parentFile?.mkdirs()
+            decrypted.copyTo(viewerFile, overwrite = true)
+            val contentUri = FileProvider.getUriForFile(
+                appContext,
+                "${appContext.packageName}.files",
+                viewerFile,
+            )
+            assertEquals("content", contentUri.scheme)
+            val viewerBytes = appContext.contentResolver
+                .openInputStream(contentUri)?.use { it.readBytes() }
+            assertTrue("The Android viewer URI returned different encrypted-media plaintext", viewerBytes?.contentEquals(actualBytes) == true)
         } finally {
-            recipient.deleteTemporaryMediaFile(decrypted)
+            recipient.cleanupExternalViewerFiles()
+            viewerFile.parentFile?.deleteRecursively()
         }
+        assertFalse("The decrypted peer attachment was not removed after viewer cleanup", decrypted.exists())
+    }
+
+    private fun sourceWithUnavailableMxcUri(sourceJson: String): String {
+        val originalUri = Regex("""mxc://[^"\\,}]+""").find(sourceJson)?.value
+            ?: error("The peer attachment MediaSource JSON did not contain an MXC URI")
+        val finalSlash = originalUri.lastIndexOf('/')
+        check(finalSlash > "mxc://".length) { "The peer attachment MXC URI was malformed" }
+        val unreachableUri = originalUri.substring(0, finalSlash + 1) + "missing-${System.nanoTime()}"
+        return sourceJson.replaceFirst(originalUri, unreachableUri)
     }
 
     private suspend fun loginFresh(

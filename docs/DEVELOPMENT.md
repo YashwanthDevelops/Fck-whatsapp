@@ -34,7 +34,10 @@ The official Matrix Swift package declares an unstable API. Treat upgrades as sm
 ## First run
 
 1. Install Android Studio and an Android SDK, plus a JDK supported by the selected Android Gradle Plugin.
-2. Copy `.env.example` to `.env`, then generate and configure the local homeserver:
+2. Copy `.env.example` to `.env`. For physical phones, set both
+   `SYNAPSE_BIND_ADDRESS` and `SYNAPSE_PUBLIC_BASEURL` to the laptop's current
+   private LAN address (for example, `192.168.1.6`; the public URL is
+   `http://192.168.1.6:8008/`), then generate and configure the local homeserver:
 
    ```sh
    cp .env.example .env
@@ -49,7 +52,7 @@ The official Matrix Swift package declares an unstable API. Treat upgrades as sm
    docker compose -f ops/synapse/compose.yaml exec synapse register_new_matrix_user http://localhost:8008 -c /data/homeserver.yaml
    ```
 
-4. Launch debug builds against the same development homeserver. Debug builds accept HTTP only for localhost, the Android emulator host (`http://10.0.2.2:8008`), IPv6 loopback, or a numeric RFC1918 private IPv4 address. Release builds require HTTPS. For a physical phone, use the development host's private LAN address and local firewall rules.
+4. Launch debug builds against the same development homeserver. Debug builds accept HTTP only for localhost, the Android emulator host (`http://10.0.2.2:8008`), IPv6 loopback, or a numeric RFC1918 private IPv4 address; the Android debug manifest permits cleartext so this local development route can work. Release builds keep cleartext disabled and require HTTPS. For physical phones, use the laptop's private LAN URL, and make sure Synapse advertises that same URL through `SYNAPSE_PUBLIC_BASEURL`.
 5. Complete device verification between the test accounts before treating a conversation as trusted.
 
 ### iOS through WSL and xtool
@@ -62,7 +65,9 @@ Follow [ios/README.md](../ios/README.md) to install the pinned tool versions, ob
 
 ## Current workspace and platform constraints
 
-The local Synapse/PostgreSQL Compose configuration and data are present, but Docker Desktop currently returns HTTP 500 for the Linux engine and the local homeserver is not reachable; do not rely on a live development backend until Docker recovers. Android SDK packages and JDK 17 are present under ignored `.tools/` directories. Standard debug tests, the diagnostic APK/instrumentation build, and signed release APK/AAB builds pass through the Windows Gradle wrapper with the Java temp-directory workaround above; the current standard debug Kotlin compile passes as well. An API 37 emulator has passed prior encrypted offline-send, force-stop, restart, and reconnect outbox gates; current-source smoke launch also succeeds. Android Studio is not configured here. WSL now has Swift 6.4.0 and xtool 1.20.1. SwiftPM wrote the lockfile and downloaded the pinned Matrix XCFramework archive with a matching checksum, but the resolver did not finish extracting it; no Darwin Swift SDK is installed because obtaining the Xcode 27 archive requires an Apple ID. There is also no iPhone or Apple ID available in this session. The Xcode IDE and Mac are not required for the xtool build route, but the authenticated SDK archive and physical device are required to close iOS build, install, and interoperability gates.
+The local Synapse/PostgreSQL Compose service is currently reachable at `http://192.168.1.6:8008`; verify the laptop's Wi-Fi address before each phone setup because DHCP can change it. On a phone, `localhost` points back to that phone. A Matrix ID ending in `:localhost` is the local server's identity and may remain unchanged; use the laptop's LAN URL in the app's homeserver field. For an existing session, **Settings → Server and privacy settings → Reconnect to homeserver** updates its server URL while preserving the encrypted local store and device keys. A browser response from `/_matrix/client/versions` confirms network reachability but does not retarget a session already saved in the app.
+
+Android SDK packages and JDK 17 are present under ignored `.tools/` directories. The standard debug unit suite, APK assembly, and Android test-source compilation pass through the Windows Gradle wrapper with the Java temporary-directory workaround above. An API 37 emulator is available; no physical Android phone is attached to this session, so actual two-phone acceptance remains outstanding. The isolated peer-acceptance harness uses fresh test accounts and a loopback-only Synapse on port 8009; it does not use the user's homeserver or credentials. On this host the current iOS app cannot be built: Swift/xtool and the Darwin SDK are not available, and no iPhone or Apple signing credentials are attached. The actual-device Android↔iOS interoperability gate must be completed on a host with those Apple build and device prerequisites.
 
 The user approved autonomous implementation through the complete product scope on 2026-09-28. Continue implementation after Phase 0 without another approval stop. The source under `app/` and `ios/` remains in progress and must pass platform, security, and interoperability acceptance before release claims.
 

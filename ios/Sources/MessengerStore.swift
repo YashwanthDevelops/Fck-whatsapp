@@ -42,6 +42,14 @@ struct ChatMessage: Identifiable, Equatable {
     let attachment: ChatAttachment?
 }
 
+private struct PendingTextSend {
+    let roomId: String
+    let body: String
+    let replyEventId: String?
+    let replyTargetId: String?
+    let draftRevision: UInt64
+}
+
 enum AttachmentKind: Equatable {
     case image
     case video
@@ -801,15 +809,20 @@ final class MessengerStore: ObservableObject {
     @Published private(set) var timelineHistoryPageRevision = 0
     @Published private(set) var verificationStep: VerificationStep = .idle
     @Published private(set) var verificationPeer = ""
+    @Published private(set) var verificationPeerUserId: String? = nil
     @Published private(set) var verificationDeviceId = ""
     @Published private(set) var verificationEmojis: [VerificationSasEmoji] = []
     @Published private(set) var verificationDecimals: [UInt16] = []
     @Published private(set) var verificationIsBusy = false
+    @Published private(set) var ownIdentityVerified = false
     @Published private(set) var isWaitingForVerificationChannelPeer = false
     @Published private(set) var isBusy = false
     @Published private(set) var isSigningOut = false
     @Published private(set) var invitationActionsInProgress = Set<String>()
+    private var directConversationCreationsInProgress = Set<String>()
     @Published var errorMessage: String?
+    private var pendingNotificationRoute: PushNotificationRoute?
+    private var notificationRouteInProgressId: String?
 
     var canDiscardPendingAttachment: Bool {
         !pendingAttachmentIsInSendQueue || pendingAttachmentSendHandle != nil
@@ -827,6 +840,35 @@ final class MessengerStore: ObservableObject {
             homeserverUrl: homeserver,
             allowDevelopmentHTTP: allowDevelopmentHTTP
         )
+    }
+
+    var peerVerificationCompleteForCurrentConversation: Bool {
+        currentPeerTrust == .verified ||
+            (currentPeerUserId != nil && verificationPeerUserId == currentPeerUserId && verificationStep == .verified)
+    }
+
+    var shouldOfferPeerVerification: Bool {
+        PeerVerificationActionPolicy.shouldShowVerifyAction(
+            isEncrypted: currentRoomEncrypted,
+            isOneToOne: currentPeerUserId != nil && !currentRoomIsGroup,
+            currentPeerUserId: currentPeerUserId,
+            peerIsVerified: currentPeerTrust == .verified,
+            flowState: peerVerificationFlowState,
+            flowPeerUserId: verificationPeerUserId
+        )
+    }
+
+    private var peerVerificationFlowState: PeerVerificationFlowState {
+        switch verificationStep {
+        case .idle: .idle
+        case .incomingRequest: .incomingRequest
+        case .waitingForPeer: .waitingForPeer
+        case .comparingSas: .comparingSas
+        case .confirming: .confirming
+        case .verified: .verified
+        case .failed: .failed
+        case .cancelled: .cancelled
+        }
     }
 
     func resolveFriendAddressQr(_ rawValue: String) -> String? {
@@ -861,11 +903,17 @@ final class MessengerStore: ObservableObject {
     private var refreshTask: Task<Void, Never>?
     private var verificationPeerPrewarmScheduled = Set<String>()
     private var draftTask: Task<Void, Never>?
+    private var draftPersistenceTails: [String: Task<Bool, Never>] = [:]
+    private var composerDraftRevisions = ComposerDraftRevisionLedger()
+    private var queuedTextMessages = OrderedSubmissionBuffer<PendingTextSend>()
+    private var textSendWorker: Task<Void, Never>?
     private var roomOpenGeneration = UUID()
     private var replyTargetRoomId: String?
     private var typingStopTask: Task<Void, Never>?
     private var phaseTransitionTask: Task<Void, Never>?
     private var foregroundResumeRetryTask: Task<Void, Never>?
+    private var syncRecoveryTask: Task<Void, Never>?
+    private var syncRecoveryId: UUID?
     private var pushRegistrationTask: Task<Void, Never>?
     private var pushRegistrationGeneration = UUID()
     private var searchDebounceTask: Task<Void, Never>?
@@ -1126,6 +1174,7 @@ final class MessengerStore: ObservableObject {
                 if let freshClient { try? await freshClient.logout() }
                 client = nil
                 userId = nil
+                ownIdentityVerified = false
                 var cleanupFailed = false
                 do {
                     try vault.clearFreshSignInArtifacts()
@@ -1191,9 +1240,23 @@ final class MessengerStore: ObservableObject {
             errorMessage = "Do not include your own Matrix ID in the invitees."
             return
         }
+        let directPeerUserId = isGroup ? nil : ids[0]
+        if let directPeerUserId {
+            guard directConversationCreationsInProgress.insert(directPeerUserId).inserted else { return }
+        }
+        defer {
+            if let directPeerUserId { directConversationCreationsInProgress.remove(directPeerUserId) }
+        }
         isBusy = true
         errorMessage = nil
         do {
+            if let directPeerUserId,
+               let existingRoomId = try await existingDirectConversationRoom(for: directPeerUserId, on: client) {
+                await refreshConversations()
+                await openConversation(existingRoomId)
+                isBusy = false
+                return
+            }
             let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
             let request = CreateRoomParameters(
                 name: trimmedName.isEmpty ? nil : trimmedName,
@@ -1213,6 +1276,31 @@ final class MessengerStore: ObservableObject {
             isBusy = false
             errorMessage = "Couldn't create the encrypted conversation. Check the invited Matrix IDs and try again."
         }
+    }
+
+    private func existingDirectConversationRoom(for peerUserId: String, on client: Client) async throws -> String? {
+        guard let ownUserId = userId else { throw MessengerError.messageUnavailable }
+        var candidates: [DirectConversationCandidate] = []
+        for room in client.rooms() {
+            let info = try await room.roomInfo()
+            guard info.membership == .joined,
+                  info.encryptionState == .encrypted,
+                  info.topic != Self.verificationControlRoomTopic,
+                  info.joinedMembersCount + info.invitedMembersCount <= 2 else { continue }
+            let membership = try await humanMembershipSnapshot(in: room)
+            candidates.append(DirectConversationCandidate(
+                roomId: room.id(),
+                isEncrypted: true,
+                ownMembership: .joined,
+                isVerificationControlRoom: info.topic == Self.verificationControlRoomTopic,
+                activeHumanMemberIds: membership.activeHumanMembers
+            ))
+        }
+        return DirectConversationReusePolicy.reusableRoomId(
+            candidates: candidates,
+            ownUserId: ownUserId,
+            peerUserId: peerUserId
+        )
     }
 
     func acceptRoomInvitation(_ roomId: String) async {
@@ -1404,6 +1492,31 @@ final class MessengerStore: ObservableObject {
         }
     }
 
+    func receiveNotificationRoute(_ route: PushNotificationRoute) {
+        guard pendingNotificationRoute != route,
+              notificationRouteInProgressId != route.id else { return }
+        pendingNotificationRoute = route
+        Task { await consumePendingNotificationRoute() }
+    }
+
+    private func consumePendingNotificationRoute() async {
+        guard let route = pendingNotificationRoute,
+              notificationRouteInProgressId != route.id,
+              !isSigningOut, userId != nil, client != nil,
+              let conversation = conversations.first(where: { $0.id == route.roomId }),
+              !conversation.isInvitation, !conversation.isVerificationControl,
+              conversation.isEncrypted else { return }
+        if currentRoomId == route.roomId && navigationTargetEventId == route.eventId {
+            pendingNotificationRoute = nil
+            return
+        }
+
+        pendingNotificationRoute = nil
+        notificationRouteInProgressId = route.id
+        defer { notificationRouteInProgressId = nil }
+        await openConversation(route.roomId, focusing: route.eventId)
+    }
+
     func openConversation(_ roomId: String, focusing eventId: String? = nil) async {
         guard beginClientOperation() else { return }
         defer { endClientOperation() }
@@ -1434,6 +1547,7 @@ final class MessengerStore: ObservableObject {
         isBusy = true
         if let previousRoomId = currentRoomId {
             let previousDraft = draft
+            let previousDraftRevision = composerDraftRevisions.current(for: previousRoomId)
             let previousDraftTask = draftTask
             draftTask?.cancel()
             draftTask = nil
@@ -1442,7 +1556,7 @@ final class MessengerStore: ObservableObject {
             if let previousDraftTask { await previousDraftTask.value }
             guard roomOpenGeneration == generation, !isSigningOut else { return }
             await setTyping(false, roomId: previousRoomId)
-            await persistDraft(roomId: previousRoomId, text: previousDraft)
+            await persistDraft(roomId: previousRoomId, text: previousDraft, revision: previousDraftRevision)
             guard roomOpenGeneration == generation, !isSigningOut else { return }
             if previousRoomId != roomId, replyTargetRoomId == previousRoomId {
                 replyTarget = nil
@@ -1529,6 +1643,7 @@ final class MessengerStore: ObservableObject {
             typingObserver = room.subscribeToTypingNotifications(listener: typing)
             guard roomOpenGeneration == generation, !isSigningOut else { return }
             draft = try await room.loadComposerDraft(threadRoot: nil)?.plainText ?? ""
+            _ = composerDraftRevisions.advance(for: roomId)
             guard roomOpenGeneration == generation, !isSigningOut else { return }
             isBusy = false
         } catch {
@@ -1580,6 +1695,7 @@ final class MessengerStore: ObservableObject {
     func closeConversation() {
         let roomId = currentRoomId
         let savedDraft = draft
+        let savedDraftRevision = roomId.map { composerDraftRevisions.current(for: $0) }
         let previousDraftTask = draftTask
         draftTask?.cancel()
         draftTask = nil
@@ -1589,7 +1705,9 @@ final class MessengerStore: ObservableObject {
         Task {
             if let previousDraftTask { await previousDraftTask.value }
             await setTyping(false, roomId: roomId)
-            await persistDraft(roomId: roomId, text: savedDraft)
+            if let roomId, let savedDraftRevision {
+                await persistDraft(roomId: roomId, text: savedDraft, revision: savedDraftRevision)
+            }
         }
         timelineObserver?.cancel()
         typingObserver?.cancel()
@@ -2001,6 +2119,7 @@ final class MessengerStore: ObservableObject {
             errorMessage = "Open an encrypted one-to-one conversation to verify its other member."
             return
         }
+        if peerVerificationCompleteForCurrentConversation { return }
         guard let sourceRoom = client.rooms().first(where: { $0.id() == sourceRoomId }) else {
             errorMessage = "The encrypted conversation is no longer available. Sync and try again."
             return
@@ -2008,6 +2127,7 @@ final class MessengerStore: ObservableObject {
         resetVerificationPresentation()
         verificationWasInitiatedHere = true
         verificationPeer = currentRoomTitle
+        verificationPeerUserId = peerUserId
         verificationDeviceId = ""
         verificationStep = .waitingForPeer
         verificationIsBusy = true
@@ -2019,6 +2139,12 @@ final class MessengerStore: ObservableObject {
                   sourceInfo.encryptionState == .encrypted,
                   members.activeHumanMembers == Set([peerUserId]) else {
                 throw MessengerError.messageUnavailable
+            }
+            await refreshCurrentPeerTrust(fallbackToServer: true)
+            if currentPeerTrust == .verified {
+                verificationWasInitiatedHere = false
+                verificationStep = .verified
+                return
             }
 
             let controlRoomId = try await ensureVerificationControlRoom(for: peerUserId, on: client)
@@ -2101,6 +2227,7 @@ final class MessengerStore: ObservableObject {
     }
 
     private func configureVerification(_ client: Client) async {
+        await refreshOwnIdentityTrust(using: client)
         do {
             let controller = try await client.getSessionVerificationController()
             let delegate = MessengerVerificationDelegate { [weak self] event in
@@ -2126,6 +2253,7 @@ final class MessengerStore: ObservableObject {
             incomingVerificationFlowId = flowId
             verificationWasInitiatedHere = false
             verificationPeer = senderId
+            verificationPeerUserId = senderId
             verificationDeviceId = deviceId
             if let displayName, !displayName.isEmpty { verificationPeer += " · \(displayName)" }
             verificationStep = .incomingRequest
@@ -2160,6 +2288,11 @@ final class MessengerStore: ObservableObject {
             verificationStep = .verified
             verificationEmojis = []
             verificationDecimals = []
+            if verificationPeerUserId != nil && verificationPeerUserId == currentPeerUserId {
+                currentPeerTrust = .verified
+            } else if verificationPeerUserId == nil {
+                ownIdentityVerified = true
+            }
             Task { await refreshCurrentPeerTrust() }
         }
     }
@@ -2168,6 +2301,7 @@ final class MessengerStore: ObservableObject {
         incomingVerificationSenderId = nil
         incomingVerificationFlowId = nil
         verificationPeer = ""
+        verificationPeerUserId = nil
         verificationDeviceId = ""
         verificationEmojis = []
         verificationDecimals = []
@@ -2528,6 +2662,22 @@ final class MessengerStore: ObservableObject {
         }
     }
 
+    private func refreshOwnIdentityTrust(using activeClient: Client? = nil) async {
+        guard let currentClient = activeClient ?? client, let currentUserId = userId else {
+            ownIdentityVerified = false
+            return
+        }
+        do {
+            let identity = try await currentClient.encryption().userIdentity(
+                userId: currentUserId,
+                fallbackToServer: true
+            )
+            ownIdentityVerified = identity?.isVerified() == true
+        } catch {
+            ownIdentityVerified = false
+        }
+    }
+
     func searchMessagesDebounced(_ query: String) {
         guard !isSigningOut else { return }
         searchDebounceTask?.cancel()
@@ -2663,10 +2813,12 @@ final class MessengerStore: ObservableObject {
         searchLoading = false
     }
 
-    func updateDraft(_ value: String) {
-        guard !isSigningOut else { return }
+    @discardableResult
+    func updateDraft(_ value: String, persist: Bool = true) -> UInt64? {
+        guard !isSigningOut else { return nil }
         draft = value
         let roomId = currentRoomId
+        let revision = roomId.map { composerDraftRevisions.advance(for: $0) }
         typingStopTask?.cancel()
         if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             Task { await setTyping(false, roomId: roomId) }
@@ -2683,14 +2835,16 @@ final class MessengerStore: ObservableObject {
         }
         draftTask?.cancel()
         draftTask = nil
-        guard let roomId else { return }
+        guard let roomId, let revision else { return nil }
+        guard persist else { return revision }
         let savedText = value
         draftTask = Task { [weak self] in
             do { try await Task.sleep(for: .milliseconds(350)) }
             catch { return }
             guard !Task.isCancelled else { return }
-            await self?.persistDraft(roomId: roomId, text: savedText)
+            await self?.persistDraft(roomId: roomId, text: savedText, revision: revision)
         }
+        return revision
     }
 
     func setReplyTarget(_ message: ChatMessage?) {
@@ -2770,61 +2924,108 @@ final class MessengerStore: ObservableObject {
         }
     }
 
-    func sendMessage(_ text: String) async {
-        guard beginClientOperation() else { return }
-        defer { endClientOperation() }
+    func sendMessage(_ text: String) {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty, let roomId = currentRoomId,
-              let client,
-              let room = client.rooms().first(where: { $0.id() == roomId }),
-              let timeline = activeTimeline else { return }
+              let room = client?.rooms().first(where: { $0.id() == roomId }) else { return }
         guard room.encryptionState() == .encrypted else {
             errorMessage = "Sending is disabled because this conversation is not encrypted."
             return
         }
         errorMessage = nil
-        let replyEventId = replyTargetRoomId == roomId ? replyTarget?.eventId : nil
+        let submittedReply = replyTargetRoomId == roomId ? replyTarget : nil
+        guard let draftRevision = updateDraft("", persist: false) else { return }
+        draftTask?.cancel()
+        draftTask = nil
+        queuedTextMessages.enqueue(
+            PendingTextSend(
+                roomId: roomId,
+                body: body,
+                replyEventId: submittedReply?.eventId,
+                replyTargetId: submittedReply?.id,
+                draftRevision: draftRevision
+            )
+        )
+        guard textSendWorker == nil else { return }
+        textSendWorker = Task { @MainActor [weak self] in
+            await self?.drainTextSendQueue()
+        }
+    }
+
+    private func drainTextSendQueue() async {
+        while let submission = queuedTextMessages.dequeue() {
+            await performTextSend(submission)
+        }
+        textSendWorker = nil
+    }
+
+    private func performTextSend(_ submission: PendingTextSend) async {
+        guard beginClientOperation() else { return }
+        defer { endClientOperation() }
+        guard let client,
+              let room = client.rooms().first(where: { $0.id() == submission.roomId }) else { return }
+        guard room.encryptionState() == .encrypted else {
+            errorMessage = "Sending is disabled because this conversation is not encrypted."
+            return
+        }
+        let timeline: Timeline
+        let ownsTimeline: Bool
+        if currentRoomId == submission.roomId, let activeTimeline {
+            timeline = activeTimeline
+            ownsTimeline = false
+        } else {
+            do {
+                timeline = try await room.timeline()
+                ownsTimeline = true
+            } catch {
+                restoreFailedTextDraftIfUnchanged(submission)
+                errorMessage = "Couldn't prepare this encrypted message. The text was kept in the composer."
+                return
+            }
+        }
+        defer { if ownsTimeline { timeline.close() } }
+
         do {
-            let text = TextMessageContent(body: body, formatted: nil)
+            let text = TextMessageContent(body: submission.body, formatted: nil)
             guard let content = timeline.createMessageContent(msgType: .text(content: text)) else {
                 throw MessengerError.messageUnavailable
             }
             try await withTrackedRoomQueueWrite(
-                roomId: roomId,
+                roomId: submission.roomId,
                 room: room,
                 capturesDeliverySnapshot: true
             ) {
-                if let replyEventId {
+                if let replyEventId = submission.replyEventId {
                     try await timeline.sendReply(msg: content, eventId: replyEventId)
                 } else {
                     _ = try await timeline.send(msg: content)
                 }
             }
         } catch {
-            if currentRoomId == roomId { draft = body }
-            errorMessage = "Couldn't send this message. It is still in the composer; try again."
+            restoreFailedTextDraftIfUnchanged(submission)
+            errorMessage = "Couldn't send this message. The current draft was kept; retry the failed message if it appears in the conversation."
             return
         }
 
-        // The SDK send call has already accepted the event into its local send
-        // queue. A later draft-store failure must not make the UI claim that
-        // sending failed or restore the text as if it were unsent.
-        await setTyping(false, roomId: roomId)
-        var draftClearFailed = false
-        do { try await room.clearComposerDraft(threadRoot: nil) }
-        catch { draftClearFailed = true }
-        if currentRoomId == roomId {
-            if let replyEventId, replyTargetRoomId == roomId, replyTarget?.eventId == replyEventId {
+        let draftClearFailed = !(await persistDraft(
+            roomId: submission.roomId,
+            text: "",
+            revision: submission.draftRevision
+        ))
+
+        await setTyping(false, roomId: submission.roomId)
+        if currentRoomId == submission.roomId {
+            if let replyEventId = submission.replyEventId,
+               replyTargetRoomId == submission.roomId, replyTarget?.eventId == replyEventId {
                 replyTarget = nil
                 replyTargetRoomId = nil
             }
-            draft = ""
         }
         if draftClearFailed {
             errorMessage = "Message sent, but the saved draft could not be cleared. Check the conversation before sending it again."
         }
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        await refreshConversations()
+        Task { await refreshConversations() }
     }
 
     func sendAttachment(fileURL: URL, forRoomId expectedRoomId: String, audioDuration: TimeInterval? = nil) async {
@@ -3133,6 +3334,7 @@ final class MessengerStore: ObservableObject {
         if isBackground {
             requestedClientSceneState = .background
             sendQueuesEnabled = false
+            cancelSyncRecovery()
         } else if isActive {
             requestedClientSceneState = .foreground
             refreshPushNotificationsIfNeeded()
@@ -3275,6 +3477,59 @@ final class MessengerStore: ObservableObject {
         }
     }
 
+    private func cancelSyncRecovery() {
+        syncRecoveryTask?.cancel()
+        syncRecoveryTask = nil
+        syncRecoveryId = nil
+    }
+
+    private func scheduleSyncRecovery(client: Client, service: SyncService, generation: UUID) {
+        guard syncRecoveryTask == nil, generation == syncGeneration, !isSigningOut,
+              requestedClientSceneState != .background,
+              !clientPausedForBackground, !syncServiceStoppedForBackground else { return }
+        let recoveryId = UUID()
+        syncRecoveryId = recoveryId
+        syncRecoveryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.syncRecoveryId == recoveryId {
+                    self.syncRecoveryTask = nil
+                    self.syncRecoveryId = nil
+                }
+            }
+
+            var attempt = 0
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(
+                        for: .seconds(SyncRecoveryRetryPolicy.delaySeconds(forAttempt: attempt))
+                    )
+                } catch {
+                    return
+                }
+                if let transition = self.phaseTransitionTask { await transition.value }
+                guard !Task.isCancelled, self.syncGeneration == generation, !self.isSigningOut,
+                      self.client === client, self.syncService === service,
+                      self.requestedClientSceneState != .background,
+                      !self.clientPausedForBackground, !self.syncServiceStoppedForBackground else { return }
+
+                await service.start()
+                if self.requestedClientSceneState == .background {
+                    if let transition = self.phaseTransitionTask { await transition.value }
+                    guard self.syncGeneration == generation, !self.isSigningOut,
+                          self.requestedClientSceneState == .background else { return }
+                    // If the background transition finished while start() was suspended,
+                    // reconcile once more so this late start cannot keep syncing in background.
+                    self.syncServiceStoppedForBackground = false
+                    self.scheduleClientSceneTransition()
+                    if let transition = self.phaseTransitionTask { await transition.value }
+                    return
+                }
+                attempt += 1
+            }
+        }
+    }
+
     func loadAttachmentForViewing(_ attachment: ChatAttachment) async -> URL? {
         guard beginClientOperation() else { return nil }
         defer { endClientOperation() }
@@ -3362,6 +3617,7 @@ final class MessengerStore: ObservableObject {
         searchDebounceTask?.cancel()
         foregroundResumeRetryTask?.cancel()
         if let foregroundResumeRetryTask { await foregroundResumeRetryTask.value }
+        cancelSyncRecovery()
 
         // Keep the SDK queue and sync worker live until in-flight native sends
         // drain; isSigningOut already blocks new app-owned sends.
@@ -3490,6 +3746,7 @@ final class MessengerStore: ObservableObject {
         clientPausedForBackground = false
         activeTimeline = nil
         client = nil
+        ownIdentityVerified = false
         currentRoomId = nil
         pendingDeliverySnapshotReservationsByRoom.removeAll()
         boundDeliverySnapshotReservationIds.removeAll()
@@ -3509,6 +3766,8 @@ final class MessengerStore: ObservableObject {
         currentRoomIsGroup = false
         isRoomTimelineReady = false
         userId = nil
+        pendingNotificationRoute = nil
+        notificationRouteInProgressId = nil
         conversations = []
         timelineBuffer.apply(.clear)
         messages = []
@@ -3648,6 +3907,8 @@ final class MessengerStore: ObservableObject {
     }
 
     private func beginSync(_ client: Client) async {
+        cancelSyncRecovery()
+        clientPausedForBackground = false
         let generation = UUID()
         syncGeneration = generation
         syncServiceReadyForSceneTransitions = false
@@ -3688,6 +3949,7 @@ final class MessengerStore: ObservableObject {
                     guard let self, self.syncGeneration == generation, !self.isSigningOut else { return }
                     switch state {
                     case .running:
+                        self.cancelSyncRecovery()
                         guard self.requestedClientSceneState != .background,
                               !self.clientPausedForBackground,
                               !self.syncServiceStoppedForBackground else {
@@ -3702,10 +3964,15 @@ final class MessengerStore: ObservableObject {
                             self.retryFailedDeliveryAcknowledgements(in: roomId)
                         }
                     case .offline, .error, .terminated:
-                        self.connection = self.clientPausedForBackground ? "Offline" : "Reconnecting"
+                        self.connection = self.requestedClientSceneState == .background ||
+                            self.clientPausedForBackground || self.syncServiceStoppedForBackground
+                            ? "Offline" : "Reconnecting"
                         self.enqueueSendQueueTransition(enable: false, client: client, generation: generation)
+                        self.scheduleSyncRecovery(client: client, service: service, generation: generation)
                     case .idle:
-                        self.connection = self.clientPausedForBackground ? "Offline" : "Syncing"
+                        self.connection = self.requestedClientSceneState == .background ||
+                            self.clientPausedForBackground || self.syncServiceStoppedForBackground
+                            ? "Offline" : "Syncing"
                         self.enqueueSendQueueTransition(enable: false, client: client, generation: generation)
                     }
                 }
@@ -3837,6 +4104,7 @@ final class MessengerStore: ObservableObject {
         conversations = rows.sorted { $0.timestamp > $1.timestamp }
         await synchronizeDeliveryAcknowledgementObservers(for: joinedEncryptedRooms)
         if currentRoomId != nil { await refreshCurrentPeerTrust() }
+        await consumePendingNotificationRoute()
     }
 
     private func synchronizeDeliveryAcknowledgementObservers(for rooms: [String: Room]) async {
@@ -3917,20 +4185,42 @@ final class MessengerStore: ObservableObject {
         for roomId in roomIds { stopDeliveryAcknowledgementObserver(in: roomId) }
     }
 
-    private func persistDraft(roomId: String? = nil, text: String? = nil) async {
-        guard beginClientOperation() else { return }
+    @discardableResult
+    private func persistDraft(roomId: String, text: String, revision: UInt64) async -> Bool {
+        let previous = draftPersistenceTails[roomId]
+        let write = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self else { return false }
+            // A newer edit owns the draft now; skipping this older write is successful.
+            guard self.composerDraftRevisions.isCurrent(revision, for: roomId) else { return true }
+            return await self.writePersistedDraft(roomId: roomId, text: text)
+        }
+        draftPersistenceTails[roomId] = write
+        return await write.value
+    }
+
+    private func writePersistedDraft(roomId: String, text: String) async -> Bool {
+        guard beginClientOperation() else { return false }
         defer { endClientOperation() }
-        guard let roomId = roomId ?? currentRoomId, let client,
-              let room = client.rooms().first(where: { $0.id() == roomId }) else { return }
-        let body = text ?? draft
+        guard let client, let room = client.rooms().first(where: { $0.id() == roomId }) else { return false }
         do {
-            if body.isEmpty {
+            if text.isEmpty {
                 try await room.clearComposerDraft(threadRoot: nil)
             } else {
-                let value = ComposerDraft(plainText: body, htmlText: nil, draftType: .newMessage, attachments: [])
+                let value = ComposerDraft(plainText: text, htmlText: nil, draftType: .newMessage, attachments: [])
                 try await room.saveComposerDraft(draft: value, threadRoot: nil)
             }
-        } catch { }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func restoreFailedTextDraftIfUnchanged(_ submission: PendingTextSend) {
+        guard currentRoomId == submission.roomId,
+              draft.isEmpty,
+              composerDraftRevisions.isCurrent(submission.draftRevision, for: submission.roomId) else { return }
+        _ = updateDraft(submission.body)
     }
 
     private func apply(diff: [TimelineDiff], roomId: String) {

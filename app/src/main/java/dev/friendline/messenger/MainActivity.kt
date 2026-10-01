@@ -9,6 +9,7 @@ import dev.friendline.messenger.ui.MessengerApp
 import dev.friendline.messenger.ui.MessengerViewModel
 import dev.friendline.messenger.ui.MessengerViewModelFactory
 import dev.friendline.messenger.ui.theme.MessengerTheme
+import dev.friendline.messenger.push.PushNotificationRoutePolicy
 
 class MainActivity : ComponentActivity() {
     private lateinit var messengerViewModel: MessengerViewModel
@@ -20,6 +21,7 @@ class MainActivity : ComponentActivity() {
             this,
             MessengerViewModelFactory(applicationContext),
         )[MessengerViewModel::class.java]
+        handleNotificationRoute(intent)
 
         setContent {
             MessengerTheme {
@@ -33,6 +35,21 @@ class MainActivity : ComponentActivity() {
         if (::messengerViewModel.isInitialized) {
             messengerViewModel.onReturnedToAppFromExternalViewer()
         }
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleNotificationRoute(intent)
+    }
+
+    private fun handleNotificationRoute(intent: android.content.Intent?) {
+        messengerViewModel.openNotificationRoom(
+            intent?.getStringExtra(PushNotificationRoutePolicy.EXTRA_ROOM_ID),
+            intent?.getStringExtra(PushNotificationRoutePolicy.EXTRA_EVENT_ID),
+        )
+        intent?.removeExtra(PushNotificationRoutePolicy.EXTRA_ROOM_ID)
+        intent?.removeExtra(PushNotificationRoutePolicy.EXTRA_EVENT_ID)
     }
 
     override fun onStop() {

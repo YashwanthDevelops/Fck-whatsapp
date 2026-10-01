@@ -149,6 +149,9 @@ internal class MatrixRoomCreateFailure(val stage: String, cause: Throwable) :
 internal class MatrixConversationOpenFailure(val stage: String, cause: Throwable) :
     IllegalStateException("Conversation setup failed during $stage", cause)
 
+internal class MatrixAttachmentOpenFailure(val stage: String, cause: Throwable) :
+    IllegalStateException("Encrypted attachment failed during $stage", cause)
+
 internal class PendingVoiceNoteStillQueuedException :
     IllegalStateException("This voice message is already queued and cannot be sent again yet")
 
@@ -181,7 +184,11 @@ class MatrixRepository(context: Context) {
     // the full timeline, so applying them to the filtered UI list can leave stale local echoes.
     private val timelineMessages = mutableListOf<ChatMessage?>()
     private val _composerDraft = MutableStateFlow("")
+    private val composerDraftRevisionLock = Any()
+    private val latestComposerDraftRevisions = mutableMapOf<String, Long>()
+    private val composerDraftWriteMutexes = ConcurrentHashMap<String, Mutex>()
     private val _connection = MutableStateFlow("Offline")
+    private val _homeserver = MutableStateFlow("")
     private val _typingUsers = MutableStateFlow<List<String>>(emptyList())
     private val _callSignals = MutableSharedFlow<MessengerCallSignal>(extraBufferCapacity = 32)
     private val callInviteReplayLock = Any()
@@ -189,6 +196,7 @@ class MatrixRepository(context: Context) {
     private val verificationCallbackCounts = ConcurrentHashMap<String, AtomicInteger>()
     private val _verification = MutableStateFlow<DeviceVerificationUiState?>(null)
     private val _peerTrust = MutableStateFlow(PeerTrustStatus.UNKNOWN)
+    private val _currentPeerUserId = MutableStateFlow<String?>(null)
     private val _searchResults = MutableStateFlow<List<MessageSearchHit>>(emptyList())
     private val _searchHasMore = MutableStateFlow(false)
     private val _searchLoading = MutableStateFlow(false)
@@ -207,10 +215,12 @@ class MatrixRepository(context: Context) {
     val messages = _messages.asStateFlow()
     val composerDraft = _composerDraft.asStateFlow()
     val connection = _connection.asStateFlow()
+    val homeserver = _homeserver.asStateFlow()
     val typingUsers = _typingUsers.asStateFlow()
     val callSignals = _callSignals.asSharedFlow()
     val verification = _verification.asStateFlow()
     val peerTrust = _peerTrust.asStateFlow()
+    val currentPeerUserId = _currentPeerUserId.asStateFlow()
     val searchResults = _searchResults.asStateFlow()
     val searchHasMore = _searchHasMore.asStateFlow()
     val searchLoading = _searchLoading.asStateFlow()
@@ -225,11 +235,18 @@ class MatrixRepository(context: Context) {
     private val mediaDataEnqueueMutex = Mutex()
     private val mediaDataRecoveryMutex = Mutex()
     private val verificationControllerMutex = Mutex()
+    private val directConversationCreationMutex = Mutex()
+    private val peerVerificationRequestMutex = Mutex()
     private val lifecycleMutex = Mutex()
+    private val syncRecoveryLock = Any()
     private var pushTokenObserver: Job? = null
     @Volatile private var sendQueuesEnabled: Boolean? = null
     @Volatile private var logoutInProgress = false
     @Volatile private var syncServiceRunning = false
+    @Volatile private var appInForeground = true
+    @Volatile private var clientPausedForBackground = false
+    @Volatile private var syncServiceStoppedForBackground = false
+    @Volatile private var syncRecoveryJob: Job? = null
     private val deliveryAckLock = Any()
     private val deliveryAckJournal = LinkedHashMap<String, DeliveryAckRecord>()
     private val pendingDeliverySnapshotsByTransaction = LinkedHashMap<String, PendingDeliverySnapshot>()
@@ -327,6 +344,7 @@ class MatrixRepository(context: Context) {
             matrixClient.encryption().waitForE2eeInitializationTasks()
             client = matrixClient
             ownUserId = session.userId
+            _homeserver.value = matrixClient.homeserver()
             startSync(matrixClient)
             schedulePushRegistration()
             session.userId
@@ -350,9 +368,10 @@ class MatrixRepository(context: Context) {
                     stage = "e2ee-initialization"
                     matrixClient.encryption().waitForE2eeInitializationTasks()
                     stage = "session-save"
-                    vault.saveSession(matrixClient.session())
+                    vault.saveSession(matrixClient.session().copy(homeserverUrl = normalizedUrl))
                     client = matrixClient
                     ownUserId = matrixClient.userId()
+                    _homeserver.value = matrixClient.homeserver()
                     stage = "sync-start"
                     startSync(matrixClient)
                     schedulePushRegistration()
@@ -364,12 +383,40 @@ class MatrixRepository(context: Context) {
             }
         }
 
+    /** Repoint an existing session without deleting its encryption store or device keys. */
+    suspend fun reconnectToHomeserver(homeserverUrl: String) = withContext(Dispatchers.IO) {
+        val normalizedUrl = validateHomeserverUrl(homeserverUrl)
+        val savedSession = synchronized(vault) { vault.loadSession() }
+            ?: throw IllegalStateException("Sign in before changing the homeserver address.")
+
+        awaitActiveAttachmentSends()
+        close()
+        withLifecycleLock {
+            val updatedSession = savedSession.copy(homeserverUrl = normalizedUrl)
+            val matrixClient = buildClient(normalizedUrl)
+            try {
+                matrixClient.restoreSession(updatedSession)
+                matrixClient.encryption().waitForE2eeInitializationTasks()
+                vault.saveSession(updatedSession)
+                client = matrixClient
+                ownUserId = updatedSession.userId
+                _homeserver.value = matrixClient.homeserver()
+                startSync(matrixClient)
+                schedulePushRegistration()
+            } catch (failure: Exception) {
+                matrixClient.close()
+                throw failure
+            }
+        }
+    }
+
     suspend fun createEncryptedConversation(
         invitedUserIds: List<String>,
         name: String?,
         isGroup: Boolean = invitedUserIds.map(String::trim).filter(String::isNotEmpty).distinct().size > 1,
     ): String =
         withContext(Dispatchers.IO) {
+            directConversationCreationMutex.withLock {
             val invitees = invitedUserIds.map(String::trim).filter(String::isNotEmpty).distinct()
             require(if (isGroup) invitees.size >= 2 else invitees.size == 1) {
                 if (isGroup) "A group needs at least two invitees." else "A one-to-one conversation needs one invitee."
@@ -384,6 +431,17 @@ class MatrixRepository(context: Context) {
             val roomName = name?.trim()?.takeIf(String::isNotEmpty)
             var stage = "build-parameters"
             try {
+                val matrixClient = requireClient()
+                if (!isGroup) {
+                    stage = "existing-direct-room-search"
+                    val peerUserId = invitees.single()
+                    findExistingDirectConversationRoom(matrixClient, accountUserId ?: matrixClient.userId(), peerUserId)
+                        ?.let { existingRoomId ->
+                            stage = "refresh-conversations"
+                            refreshConversations()
+                            return@withLock existingRoomId
+                        }
+                }
                 val parameters = CreateRoomParameters(
                     name = roomName,
                     isEncrypted = true,
@@ -394,7 +452,6 @@ class MatrixRepository(context: Context) {
                     joinRuleOverride = org.matrix.rustcomponents.sdk.JoinRule.Invite,
                 )
                 stage = "homeserver-create-room"
-                val matrixClient = requireClient()
                 val roomId = matrixClient.createRoom(parameters)
                 stage = "verify-room-encryption"
                 val isEncrypted = awaitEncryptedRoom(matrixClient, roomId)
@@ -408,7 +465,44 @@ class MatrixRepository(context: Context) {
                 if (failure is CancellationException) throw failure
                 throw MatrixRoomCreateFailure(stage, failure)
             }
+            }
         }
+
+    private suspend fun findExistingDirectConversationRoom(
+        matrixClient: Client,
+        accountUserId: String,
+        peerUserId: String,
+    ): String? {
+        val candidates = mutableListOf<DirectConversationCandidate>()
+        for (room in matrixClient.rooms()) {
+            try {
+                if (room.encryptionState().name != "ENCRYPTED") continue
+                val info = room.roomInfo()
+                try {
+                    val participantCount = info.joinedMembersCount + info.invitedMembersCount
+                    if (info.membership != org.matrix.rustcomponents.sdk.Membership.JOINED ||
+                        info.topic == VERIFICATION_CONTROL_ROOM_TOPIC || participantCount > 2uL
+                    ) continue
+                    candidates += DirectConversationCandidate(
+                        roomId = room.id(),
+                        isEncrypted = true,
+                        ownMembership = info.membership.name,
+                        isVerificationControlRoom = info.topic == VERIFICATION_CONTROL_ROOM_TOPIC,
+                        activeHumanMemberIds = room.activeHumanMemberIds().toSet(),
+                    )
+                } finally {
+                    info.destroy()
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // A partially-synced or unreadable room cannot be a safe reuse candidate.
+            } finally {
+                room.close()
+            }
+        }
+        return DirectConversationReusePolicy.findReusableRoomId(candidates, accountUserId, peerUserId)
+    }
 
     private suspend fun awaitEncryptedRoom(matrixClient: Client, roomId: String): Boolean? =
         withTimeoutOrNull(ROOM_CREATE_ENCRYPTION_TIMEOUT_MS) {
@@ -998,18 +1092,31 @@ class MatrixRepository(context: Context) {
     }
 
     suspend fun requestPeerVerification(roomId: String) = withContext(Dispatchers.IO) {
+        if (!peerVerificationRequestMutex.tryLock()) return@withContext
+        try {
         val room = requireRoom(roomId)
+        check(activeRoomId == roomId) { "Open this conversation before verifying its other member" }
         check(room.encryptionState().name == "ENCRYPTED") {
             "Device verification is available for encrypted conversations"
         }
+        refreshPeerTrust(room)
         val expectedMembers = room.activeHumanMemberIds().filterNot { it == ownUserId }.toSet()
         expectedDeliveryMemberIdsByRoom[room.id()] = expectedMembers
         if (expectedMembers.size != 1) {
+            _currentPeerUserId.value = null
             _peerTrust.value = PeerTrustStatus.UNKNOWN
             return@withContext
         }
         val peerUserId = expectedMembers.firstOrNull()
             ?: throw IllegalStateException("No other conversation member is available to verify")
+        if (_peerTrust.value == PeerTrustStatus.VERIFIED) {
+            _verification.value = DeviceVerificationUiState(
+                peerUserId = peerUserId,
+                status = DeviceVerificationStatus.VERIFIED,
+            )
+            return@withContext
+        }
+        if (_verification.value?.status in ACTIVE_VERIFICATION_STATUSES) return@withContext
         val controller = getVerificationController()
         _verification.value = DeviceVerificationUiState(
             peerUserId = peerUserId,
@@ -1050,6 +1157,9 @@ class MatrixRepository(context: Context) {
                 error = verificationErrorMessage(error),
             )
             throw error
+        }
+        } finally {
+            peerVerificationRequestMutex.unlock()
         }
     }
 
@@ -1163,6 +1273,30 @@ class MatrixRepository(context: Context) {
                 throw cancelled
             } catch (_: Exception) {
                 "0|0|0|0"
+            } finally {
+                connection.disconnect()
+            }
+        }
+
+    /** Check whether a peer account can fetch one known event without exposing its content. */
+    internal suspend fun canFetchEventForDiagnostic(roomId: String, eventId: String): Boolean =
+        withContext(Dispatchers.IO) {
+            check(BuildConfig.DEBUG) { "Encryption diagnostics are unavailable in release builds" }
+            val session = requireClient().session()
+            val url = URL(
+                "${session.homeserverUrl.trimEnd('/')}/_matrix/client/v3/rooms/${Uri.encode(roomId)}/event/${Uri.encode(eventId)}",
+            )
+            val connection = url.openConnection() as HttpURLConnection
+            try {
+                connection.connectTimeout = 5_000
+                connection.readTimeout = 10_000
+                connection.requestMethod = "GET"
+                connection.setRequestProperty("Authorization", "Bearer ${session.accessToken}")
+                connection.responseCode in 200..299
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                false
             } finally {
                 connection.disconnect()
             }
@@ -1545,16 +1679,19 @@ class MatrixRepository(context: Context) {
     private suspend fun refreshPeerTrust(room: Room) {
         if (room.encryptionState().name != "ENCRYPTED") {
             expectedDeliveryMemberIdsByRoom.remove(room.id())
+            _currentPeerUserId.value = null
             _peerTrust.value = PeerTrustStatus.UNKNOWN
             return
         }
         val expectedMembers = room.activeHumanMemberIds().filterNot { it == ownUserId }.toSet()
         expectedDeliveryMemberIdsByRoom[room.id()] = expectedMembers
         if (expectedMembers.size != 1) {
+            _currentPeerUserId.value = null
             _peerTrust.value = PeerTrustStatus.UNKNOWN
             return
         }
         val peerUserId = expectedMembers.single()
+        _currentPeerUserId.value = peerUserId
         val identity = runCatching { requireClient().encryption().userIdentity(peerUserId, true) }.getOrNull()
         if (identity == null) {
             _peerTrust.value = PeerTrustStatus.UNVERIFIED
@@ -1744,6 +1881,14 @@ class MatrixRepository(context: Context) {
                     if (!logoutInProgress && isReset) reconcilePendingDeliveryAcksAfterReset(room, roomId, observedAckTargets.toSet())
                 }
             })
+            // The live sync timeline can start after the last server event when a client
+            // was offline during reconnect. Backfill one recent page after subscribing so
+            // those already-accepted events are visible when the conversation opens.
+            callbackScope.launch {
+                if (activeRoomId == roomId && activeTimeline === timeline && !logoutInProgress) {
+                    runCatching { timeline.paginateBackwards(50u.toUShort()) }
+                }
+            }
             stage = "subscribe-typing"
             typingListenerHandle = room.subscribeToTypingNotifications(object : TypingNotificationsListener {
                 override fun call(typingUserIds: List<String>) {
@@ -1777,26 +1922,50 @@ class MatrixRepository(context: Context) {
         }
     }
 
-    suspend fun saveComposerDraft(roomId: String, body: String) = withContext(Dispatchers.IO) {
-        val room = requireClient().rooms().firstOrNull { it.id() == roomId } ?: return@withContext
-        if (body.isBlank()) {
-            room.clearComposerDraft(null)
-            _composerDraft.value = ""
-        } else {
-            val draft = ComposerDraft(
-                plainText = body,
-                htmlText = null,
-                draftType = ComposerDraftType.NewMessage,
-                attachments = emptyList(),
-            )
+    /**
+     * Called synchronously as the user edits/submits so an older delayed draft write cannot
+     * overwrite a newer composer value after it reaches the SDK store.
+     */
+    fun noteComposerDraftRevision(roomId: String, revision: Long) {
+        synchronized(composerDraftRevisionLock) {
+            val current = latestComposerDraftRevisions[roomId] ?: Long.MIN_VALUE
+            if (revision > current) latestComposerDraftRevisions[roomId] = revision
+        }
+    }
+
+    suspend fun saveComposerDraft(roomId: String, body: String, revision: Long) = withContext(Dispatchers.IO) {
+        val writeMutex = composerDraftWriteMutexes.computeIfAbsent(roomId) { Mutex() }
+        writeMutex.withLock {
+            if (!isLatestComposerDraftRevision(roomId, revision)) return@withLock
+            val room = requireClient().rooms().firstOrNull { it.id() == roomId } ?: return@withLock
             try {
-                room.saveComposerDraft(draft, null)
-                _composerDraft.value = body
+                // Recheck after room lookup: another edit may have arrived while this write waited.
+                if (!isLatestComposerDraftRevision(roomId, revision)) return@withLock
+                if (body.isBlank()) {
+                    room.clearComposerDraft(null)
+                } else {
+                    val draft = ComposerDraft(
+                        plainText = body,
+                        htmlText = null,
+                        draftType = ComposerDraftType.NewMessage,
+                        attachments = emptyList(),
+                    )
+                    try {
+                        room.saveComposerDraft(draft, null)
+                    } finally {
+                        draft.destroy()
+                    }
+                }
             } finally {
-                draft.destroy()
+                room.close()
             }
         }
     }
+
+    private fun isLatestComposerDraftRevision(roomId: String, revision: Long): Boolean =
+        synchronized(composerDraftRevisionLock) {
+            latestComposerDraftRevisions[roomId] == revision
+        }
 
     suspend fun closeConversation() = withContext(Dispatchers.IO) {
         val roomId = activeRoomId
@@ -1818,12 +1987,12 @@ class MatrixRepository(context: Context) {
         _typingUsers.value = emptyList()
         clearTimelineMessages()
         _composerDraft.value = ""
+        _currentPeerUserId.value = null
         _peerTrust.value = PeerTrustStatus.UNKNOWN
     }
 
     suspend fun sendText(roomId: String, body: String, replyToEventId: String? = null): Boolean {
         var sendQueued = false
-        var draftClearFailed = false
         try {
             withContext(Dispatchers.IO) {
                 val room = requireRoom(roomId)
@@ -1858,14 +2027,6 @@ class MatrixRepository(context: Context) {
                     }
                     sendQueued = true
                     runCatching { sendHandle.destroy() }
-                    withContext(NonCancellable) {
-                        try {
-                            room.clearComposerDraft(null)
-                        } catch (_: Exception) {
-                            draftClearFailed = true
-                        }
-                        _composerDraft.value = ""
-                    }
                     runCatching { room.typingNotice(false) }
                 } finally {
                     runCatching { content.destroy() }
@@ -1881,9 +2042,8 @@ class MatrixRepository(context: Context) {
             }
         } catch (cancelled: CancellationException) {
             if (!sendQueued) throw cancelled
-            _composerDraft.value = ""
         }
-        return draftClearFailed
+        return sendQueued
     }
 
     /**
@@ -2251,17 +2411,21 @@ class MatrixRepository(context: Context) {
     }
 
     suspend fun loadAttachmentForViewing(message: ChatMessage): File = withContext(Dispatchers.IO) {
-        val attachment = checkNotNull(message.attachment) { "This message has no attachment" }
-        check(advertisedMediaSizeIsAllowed(attachment.sizeBytes, MAX_MEDIA_BYTES)) {
-            "This attachment has a missing or unsupported advertised size"
-        }
-        val client = requireClient()
-        val mediaSource = MediaSource.fromJson(attachment.sourceJson)
+        var stage = "validate-attachment"
+        var mediaSource: MediaSource? = null
         var mediaFile: MediaFileHandle? = null
         try {
+            val attachment = checkNotNull(message.attachment) { "This message has no attachment" }
+            check(advertisedMediaSizeIsAllowed(attachment.sizeBytes, MAX_MEDIA_BYTES)) {
+                "This attachment has a missing or unsupported advertised size"
+            }
+            val client = requireClient()
+            stage = "parse-encrypted-media-source"
+            mediaSource = MediaSource.fromJson(attachment.sourceJson)
+            stage = "download-and-decrypt"
             mediaTransferDir.mkdirs()
             mediaFile = client.getMediaFile(
-                mediaSource,
+                checkNotNull(mediaSource),
                 attachment.fileName,
                 attachment.mimeType,
                 false,
@@ -2275,6 +2439,7 @@ class MatrixRepository(context: Context) {
             val viewerFile = File(mediaTransferDir, "view-${UUID.randomUUID()}-$safeName")
             var copyComplete = false
             try {
+                stage = "copy-decrypted-media-to-private-cache"
                 decryptedFile.inputStream().use { input ->
                     FileOutputStream(viewerFile).use { output ->
                         input.copyTo(output)
@@ -2296,9 +2461,12 @@ class MatrixRepository(context: Context) {
                     viewerFile.delete()
                 }
             }
+        } catch (failure: Exception) {
+            if (failure is CancellationException) throw failure
+            throw MatrixAttachmentOpenFailure(stage, failure)
         } finally {
             mediaFile?.destroy()
-            mediaSource.destroy()
+            mediaSource?.destroy()
         }
     }
 
@@ -2686,6 +2854,7 @@ class MatrixRepository(context: Context) {
                 syncServiceRunning = false
                 client = null
                 ownUserId = null
+                _currentPeerUserId.value = null
                 _peerTrust.value = PeerTrustStatus.UNKNOWN
                 _typingUsers.value = emptyList()
                 expectedDeliveryMemberIdsByRoom.clear()
@@ -2723,11 +2892,132 @@ class MatrixRepository(context: Context) {
         }
     }
 
+    /** Reconcile the Matrix client with the latest Android activity lifecycle state. */
+    fun onAppBackgrounded() {
+        appInForeground = false
+        _connection.value = "Offline"
+        callbackScope.launch { withLifecycleLock { reconcileAppLifecycleLocked() } }
+    }
+
+    fun onAppForegrounded() {
+        appInForeground = true
+        callbackScope.launch { withLifecycleLock { reconcileAppLifecycleLocked() } }
+    }
+
+    private suspend fun reconcileAppLifecycleLocked() {
+        while (!logoutInProgress) {
+            val activeClient = client ?: return
+            val service = syncService
+            val requestedForegroundState = appInForeground
+            if (!appInForeground) {
+                cancelSyncRecovery()
+                if (!syncServiceStoppedForBackground) {
+                    runCatching {
+                        sendQueueMutex.withLock {
+                            sendQueuesEnabled = false
+                            activeClient.enableAllSendQueues(false)
+                        }
+                    }
+                    runCatching { service?.stop() }
+                    syncServiceRunning = false
+                    syncServiceStoppedForBackground = true
+                }
+                if (!clientPausedForBackground) {
+                    runCatching { activeClient.pause() }
+                        .onSuccess { clientPausedForBackground = true }
+                }
+                _connection.value = if (appInForeground) "Syncing" else "Offline"
+            } else {
+                if (clientPausedForBackground) {
+                    try {
+                        activeClient.resume()
+                        clientPausedForBackground = false
+                    } catch (_: Exception) {
+                        _connection.value = "Reconnecting"
+                        scheduleSyncRecovery(activeClient, service)
+                        return
+                    }
+                }
+                if (service != null && (syncServiceStoppedForBackground || !syncServiceRunning)) {
+                    try {
+                        syncServiceStoppedForBackground = false
+                        service.start()
+                        _connection.value = "Syncing"
+                    } catch (_: Exception) {
+                        _connection.value = "Reconnecting"
+                        scheduleSyncRecovery(activeClient, service)
+                        return
+                    }
+                }
+            }
+
+            // An opposite lifecycle event may arrive while an SDK call is suspended.
+            // Reconcile the newest requested state before releasing the lifecycle lock.
+            if (appInForeground == requestedForegroundState) return
+        }
+    }
+
+    private fun scheduleSyncRecovery(matrixClient: Client, service: SyncService?) {
+        if (service == null || !appInForeground || logoutInProgress) return
+        synchronized(syncRecoveryLock) {
+            if (syncRecoveryJob?.isActive == true) return
+            val recovery = callbackScope.launch(start = CoroutineStart.LAZY) {
+                var attempt = 0
+                while (true) {
+                    delay(SyncRecoveryRetryPolicy.delayMillis(attempt++))
+                    val shouldContinue = try {
+                        withLifecycleLock {
+                            if (client !== matrixClient || syncService !== service || logoutInProgress ||
+                                !appInForeground
+                            ) {
+                                false
+                            } else {
+                                if (clientPausedForBackground) {
+                                    matrixClient.resume()
+                                    clientPausedForBackground = false
+                                }
+                                syncServiceStoppedForBackground = false
+                                service.start()
+                                if (!syncServiceRunning) _connection.value = "Reconnecting"
+                                !syncServiceRunning
+                            }
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        if (client === matrixClient && appInForeground && !logoutInProgress) {
+                            _connection.value = "Reconnecting"
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    if (!shouldContinue) return@launch
+                }
+            }
+            syncRecoveryJob = recovery
+            recovery.invokeOnCompletion {
+                synchronized(syncRecoveryLock) {
+                    if (syncRecoveryJob === recovery) syncRecoveryJob = null
+                }
+            }
+            recovery.start()
+        }
+    }
+
+    private fun cancelSyncRecovery() {
+        synchronized(syncRecoveryLock) {
+            syncRecoveryJob?.cancel()
+            syncRecoveryJob = null
+        }
+    }
+
     /** Stop background Matrix work without signing out or deleting the encrypted local store. */
     suspend fun close() = withContext(Dispatchers.IO) {
         recordDebugLifecycleClose("waiting-lock")
         withLifecycleLock {
         recordDebugLifecycleClose("lock-acquired")
+        cancelSyncRecovery()
         syncServiceRunning = false
         stopReadReceiptRefresh()
         cancelPendingDataMediaReplay(resetRetryBudget = true)
@@ -2776,10 +3066,13 @@ class MatrixRepository(context: Context) {
         syncService = null
         client = null
         ownUserId = null
+        clientPausedForBackground = false
+        syncServiceStoppedForBackground = false
         mediaTransferDir.deleteRecursively()
         _typingUsers.value = emptyList()
         clearTimelineMessages()
         _connection.value = "Offline"
+        _currentPeerUserId.value = null
         _peerTrust.value = PeerTrustStatus.UNKNOWN
         syncServiceRunning = false
         recordDebugLifecycleClose("complete")
@@ -2817,6 +3110,8 @@ class MatrixRepository(context: Context) {
     }
 
     private suspend fun startSync(matrixClient: Client) {
+        clientPausedForBackground = false
+        syncServiceStoppedForBackground = false
         var stage = "install-udt-diagnostic-listener"
         try {
             installCallKeySubscription(matrixClient)
@@ -2879,6 +3174,7 @@ class MatrixRepository(context: Context) {
             val service = matrixClient.syncService().finish()
             syncService = service
             syncServiceRunning = false
+            syncServiceStoppedForBackground = false
             stage = "subscribe-sync-state"
             syncStateHandle = service.state(object : SyncServiceStateObserver {
                 override fun onUpdate(state: org.matrix.rustcomponents.sdk.SyncServiceState) {
@@ -2886,13 +3182,29 @@ class MatrixRepository(context: Context) {
                     syncServiceRunning = state == org.matrix.rustcomponents.sdk.SyncServiceState.RUNNING
                     refreshSendQueueGate(matrixClient)
                     _connection.value = when {
-                        state == org.matrix.rustcomponents.sdk.SyncServiceState.RUNNING -> "Connected"
+                        state == org.matrix.rustcomponents.sdk.SyncServiceState.RUNNING &&
+                            appInForeground && !clientPausedForBackground &&
+                            !syncServiceStoppedForBackground -> "Connected"
+                        state == org.matrix.rustcomponents.sdk.SyncServiceState.RUNNING -> "Offline"
                         state == org.matrix.rustcomponents.sdk.SyncServiceState.ERROR ||
                             state == org.matrix.rustcomponents.sdk.SyncServiceState.TERMINATED ||
-                            state == org.matrix.rustcomponents.sdk.SyncServiceState.OFFLINE -> "Reconnecting"
-                        else -> "Syncing"
+                            state == org.matrix.rustcomponents.sdk.SyncServiceState.OFFLINE ->
+                            if (appInForeground && !clientPausedForBackground &&
+                                !syncServiceStoppedForBackground
+                            ) "Reconnecting" else "Offline"
+                        else -> if (appInForeground) "Syncing" else "Offline"
                     }
-                    if (syncServiceRunning && !logoutInProgress) {
+                    if (state == org.matrix.rustcomponents.sdk.SyncServiceState.RUNNING) {
+                        cancelSyncRecovery()
+                    } else if (state == org.matrix.rustcomponents.sdk.SyncServiceState.ERROR ||
+                        state == org.matrix.rustcomponents.sdk.SyncServiceState.TERMINATED ||
+                        state == org.matrix.rustcomponents.sdk.SyncServiceState.OFFLINE
+                    ) {
+                        scheduleSyncRecovery(matrixClient, service)
+                    }
+                    if (syncServiceRunning && appInForeground && !clientPausedForBackground &&
+                        !syncServiceStoppedForBackground && !logoutInProgress
+                    ) {
                         retryRecoverableDeliveryAcks()
                         if (!wasRunning) {
                             requestPendingDataMediaReplay(resetRetryBudget = true)
@@ -2912,7 +3224,17 @@ class MatrixRepository(context: Context) {
             })
             _connection.value = "Syncing"
             stage = "start-sync-service"
-            service.start()
+            if (appInForeground) {
+                service.start()
+            } else {
+                stage = "pause-background-client"
+                service.stop()
+                syncServiceStoppedForBackground = true
+                matrixClient.pause()
+                clientPausedForBackground = true
+                syncServiceRunning = false
+                _connection.value = "Offline"
+            }
             stage = "refresh-conversations"
             refreshConversations()
         } catch (failure: Exception) {
@@ -3031,8 +3353,12 @@ class MatrixRepository(context: Context) {
                 }
                 is TimelineDiff.Set -> {
                     val index = update.index.toInt()
-                    if (index in timelineMessages.indices) {
-                        timelineMessages[index] = project(update.value)
+                    val projected = project(update.value)
+                    if (projected == null) {
+                        if (index in timelineMessages.indices) timelineMessages[index] = null
+                    } else {
+                        TimelineProjectionUpdatePolicy.targetIndices(timelineMessages, index, projected)
+                            .forEach { targetIndex -> timelineMessages[targetIndex] = projected }
                     }
                 }
                 is TimelineDiff.Remove -> {
@@ -3453,6 +3779,7 @@ class MatrixRepository(context: Context) {
                 null -> if (projectedEventId != null) deliveryStateFor(roomId, projectedEventId) else "Sent"
             }
             val replyTo = msgLike?.inReplyTo?.eventId()
+            val sdkTextEditable = messageContent?.msgType is MessageType.Text
             // SDK 26.09.28 moved aggregated reaction summaries onto EventTimelineItem.
             val reactions = event.reactions.map { reaction ->
                 ReactionSummary(
@@ -3479,8 +3806,9 @@ class MatrixRepository(context: Context) {
                 },
                 canRetry = (sendState as? EventSendState.SendingFailed)?.isRecoverable == true,
                 canReply = event.canBeRepliedTo && projectedEventId != null,
-                canEdit = event.isOwn && (event.isRemote || responseEventId != null) && event.isEditable &&
-                    messageContent?.msgType is MessageType.Text,
+                canEdit = event.isOwn &&
+                    (event.isRemote || responseEventId != null || acceptedEventId != null) &&
+                    event.isEditable && sdkTextEditable,
                 isEdited = messageContent?.isEdited == true,
                 canRedact = event.isOwn && projectedEventId != null && messageContent != null,
                 replyToEventId = replyTo,
@@ -3726,7 +4054,9 @@ class MatrixRepository(context: Context) {
                 promoteTimelineLocalEcho(roomId, update.transactionId, update.eventId)
             }
             is RoomSendQueueUpdate.CancelledLocalEvent -> discardPendingDeliverySnapshot(roomId, update.transactionId)
-            is RoomSendQueueUpdate.ReplacedLocalEvent -> discardPendingDeliverySnapshot(roomId, update.transactionId)
+            // Replacements retain the same transaction and delivery audience. The SDK emits
+            // this for media upload finalization as well as edits to a queued local echo.
+            is RoomSendQueueUpdate.ReplacedLocalEvent -> Unit
             else -> Unit
         }
     }
@@ -3783,6 +4113,7 @@ class MatrixRepository(context: Context) {
                 isOwn = true,
                 deliveryState = if (_connection.value == "Connected") "Sending" else "Queued",
                 replyToEventId = pending.replyToEventId,
+                isOptimisticTextEcho = true,
             )
             val acceptedEventId = acceptedSendEventIdsByTransaction[deliveryAckKey(roomId, transactionId)]
             timelineMessages += if (acceptedEventId == null) {
@@ -4636,6 +4967,10 @@ class MatrixRepository(context: Context) {
                 pendingVerificationRequest = null
                 verificationWasInitiatedHere = false
                 updateVerificationTerminal(DeviceVerificationStatus.VERIFIED)
+                val verifiedPeerUserId = _verification.value?.peerUserId
+                if (verifiedPeerUserId != null && verifiedPeerUserId == _currentPeerUserId.value) {
+                    _peerTrust.value = PeerTrustStatus.VERIFIED
+                }
                 activeRoomId?.let { roomId ->
                     callbackScope.launch { runCatching { refreshPeerTrustAfterVerification(roomId) } }
                 }
@@ -4858,7 +5193,8 @@ class MatrixRepository(context: Context) {
         // While logout is draining a registered native media send, keep its existing
         // queue worker alive so join() can observe a terminal result. The logout flag still
         // rejects new application sends at withSendQueueGate().
-        val queuesShouldRun = syncServiceRunning &&
+        val queuesShouldRun = appInForeground && !clientPausedForBackground &&
+            !syncServiceStoppedForBackground && syncServiceRunning &&
             (!logoutInProgress || activeAttachmentSends.isNotEmpty())
         if (sendQueuesEnabled == queuesShouldRun) return
         sendQueuesEnabled = queuesShouldRun
@@ -4866,7 +5202,8 @@ class MatrixRepository(context: Context) {
             sendQueueMutex.lock()
             try {
                 if (sendQueuesEnabled == queuesShouldRun && client === matrixClient &&
-                    (!queuesShouldRun || (syncServiceRunning &&
+                    (!queuesShouldRun || (appInForeground && !clientPausedForBackground &&
+                        !syncServiceStoppedForBackground && syncServiceRunning &&
                         (!logoutInProgress || activeAttachmentSends.isNotEmpty())))
                 ) {
                     matrixClient.enableAllSendQueues(queuesShouldRun)
@@ -5918,6 +6255,13 @@ class MatrixRepository(context: Context) {
             DeviceVerificationStatus.VERIFIED,
             DeviceVerificationStatus.CANCELLED,
             DeviceVerificationStatus.FAILED,
+        )
+        val ACTIVE_VERIFICATION_STATUSES = setOf(
+            DeviceVerificationStatus.REQUESTING,
+            DeviceVerificationStatus.INCOMING_REQUEST,
+            DeviceVerificationStatus.WAITING_FOR_ACCEPT,
+            DeviceVerificationStatus.COMPARING,
+            DeviceVerificationStatus.CONFIRMING,
         )
         const val VERIFICATION_CONTROL_ROOM_NAME = "Device verification"
         const val VERIFICATION_CONTROL_ROOM_TOPIC = "org.friendline.verification-control.v1"

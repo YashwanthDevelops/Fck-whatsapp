@@ -90,10 +90,15 @@ internal fun promoteAcceptedLocalMessage(
     if (!message.isOwn || message.id != transactionId || message.eventId != null) {
         return null
     }
+    val isConfirmedTextEcho = message.isOptimisticTextEcho
     return message.copy(
         id = eventId,
         eventId = eventId,
         isRemote = true,
         deliveryState = deliveryState,
+        canReply = message.canReply || isConfirmedTextEcho,
+        canEdit = message.canEdit || isConfirmedTextEcho,
+        canRedact = message.canRedact || isConfirmedTextEcho,
+        isOptimisticTextEcho = false,
     )
 }

@@ -32,7 +32,6 @@ import java.net.URI
 import java.net.URL
 import java.nio.charset.StandardCharsets
 import java.util.Locale
-import java.util.concurrent.atomic.AtomicInteger
 import javax.net.ssl.HttpsURLConnection
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -264,8 +263,8 @@ object MatrixPushClient {
 class PrivateMessengerFirebaseMessagingService : FirebaseMessagingService() {
     override fun onMessageReceived(message: RemoteMessage) {
         if (!runCatching { DeviceVault(applicationContext).loadPushNotificationsEnabled() }.getOrDefault(false)) return
-        // Deliberately ignore all remote fields, including event, room, sender, and content values.
-        GenericMessageNotification.show(this)
+        // Only opaque Matrix room/event identifiers are consumed. Sender and content fields are ignored.
+        GenericMessageNotification.show(this, PushNotificationRoutePolicy.parse(message.data))
     }
 
     override fun onNewToken(token: String) {
@@ -277,10 +276,9 @@ class PrivateMessengerFirebaseMessagingService : FirebaseMessagingService() {
 private object GenericMessageNotification {
     private const val CHANNEL_ID = "messages"
     private const val CHANNEL_NAME = "Messages"
-    private val notificationIds = AtomicInteger(1)
-
-    fun show(context: Context) {
+    fun show(context: Context, route: PushNotificationRoute?) {
         if (!MatrixPushClient.hasNotificationPermission(context)) return
+        val notificationId = PushNotificationRoutePolicy.stableNotificationId(route)
 
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -291,12 +289,18 @@ private object GenericMessageNotification {
             )
         }
 
-        val launchIntent = context.packageManager.getLaunchIntentForPackage(context.packageName)
-            ?: Intent(context, MainActivity::class.java)
+        val launchIntent = Intent(context, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            .apply {
+                route?.let {
+                    putExtra(PushNotificationRoutePolicy.EXTRA_ROOM_ID, it.roomId)
+                    it.eventId?.let { eventId -> putExtra(PushNotificationRoutePolicy.EXTRA_EVENT_ID, eventId) }
+                }
+            }
         val pendingIntent = PendingIntent.getActivity(
             context,
-            0,
-            launchIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            notificationId,
+            launchIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val notification = NotificationCompat.Builder(context, CHANNEL_ID)
@@ -308,6 +312,6 @@ private object GenericMessageNotification {
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
             .build()
-        NotificationManagerCompat.from(context).notify(notificationIds.getAndIncrement(), notification)
+        NotificationManagerCompat.from(context).notify(notificationId, notification)
     }
 }

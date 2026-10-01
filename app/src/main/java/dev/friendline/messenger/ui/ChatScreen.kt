@@ -85,6 +85,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import dev.friendline.messenger.data.ChatMessage
 import dev.friendline.messenger.data.AttachmentKind
+import dev.friendline.messenger.data.DeviceVerificationUiState
 import dev.friendline.messenger.data.MessageSearchHit
 import dev.friendline.messenger.data.PeerTrustStatus
 import dev.friendline.messenger.calls.MessengerCallKind
@@ -126,6 +127,8 @@ fun ChatScreen(
     onToggleCallCamera: () -> Unit,
     connection: String,
     peerTrust: PeerTrustStatus,
+    currentPeerUserId: String?,
+    verification: DeviceVerificationUiState?,
     messages: List<ChatMessage>,
     typingUsers: List<String>,
     replyTarget: ChatMessage?,
@@ -136,6 +139,8 @@ fun ChatScreen(
     navigationTargetEventId: String?,
     error: String?,
     isSendingAttachment: Boolean,
+    openingAttachmentMessageId: String?,
+    failedAttachmentMessageId: String?,
     isRecordingVoiceNote: Boolean,
     voiceRecordingStartedAtMillis: Long?,
     voiceNoteFilePath: String?,
@@ -328,7 +333,16 @@ fun ChatScreen(
                         TextButton(onClick = { requestCallPermissions(MessengerCallKind.VOICE) }) { Text("Call") }
                         TextButton(onClick = { requestCallPermissions(MessengerCallKind.VIDEO) }) { Text("Video") }
                     }
-                    TextButton(onClick = onVerifyPeer) { Text("Verify") }
+                    if (PeerVerificationActionPolicy.shouldShowVerifyAction(
+                            isEncrypted = isEncrypted,
+                            isGroup = isGroup,
+                            currentPeerUserId = currentPeerUserId,
+                            peerTrust = peerTrust,
+                            verification = verification,
+                        )
+                    ) {
+                        TextButton(onClick = onVerifyPeer) { Text("Verify") }
+                    }
                     IconButton(
                         onClick = {
                             searchVisible = !searchVisible
@@ -657,6 +671,8 @@ fun ChatScreen(
                             },
                             onRedact = { messagePendingRedaction = it },
                             onOpenAttachment = { attachmentToOpenExternally = it },
+                            attachmentIsOpening = message.id == openingAttachmentMessageId,
+                            attachmentOpenFailed = message.id == failedAttachmentMessageId,
                             audioPlayback = audioPlayback,
                             onPlayAudio = onPlayAudio,
                         )
@@ -857,6 +873,8 @@ private fun MessageLine(
     onEdit: (ChatMessage) -> Unit,
     onRedact: (ChatMessage) -> Unit,
     onOpenAttachment: (ChatMessage) -> Unit,
+    attachmentIsOpening: Boolean,
+    attachmentOpenFailed: Boolean,
     audioPlayback: AudioPlaybackUiState,
     onPlayAudio: (ChatMessage) -> Unit,
 ) {
@@ -901,7 +919,13 @@ private fun MessageLine(
                                 onClick = { onPlayAudio(message) },
                             )
                         } else {
-                            AttachmentCard(attachment.fileName, attachment.kind.name) { onOpenAttachment(message) }
+                            AttachmentCard(
+                                fileName = attachment.fileName,
+                                kind = attachment.kind.name,
+                                isOpening = attachmentIsOpening,
+                                openFailed = attachmentOpenFailed,
+                                onClick = { onOpenAttachment(message) },
+                            )
                         }
                     }
                     if (message.body.isNotBlank()) Text(message.body, style = MaterialTheme.typography.bodyLarge)
@@ -1042,7 +1066,13 @@ private fun formatVoiceDuration(durationMillis: Int): String {
 }
 
 @Composable
-private fun AttachmentCard(fileName: String, kind: String, onClick: () -> Unit) {
+private fun AttachmentCard(
+    fileName: String,
+    kind: String,
+    isOpening: Boolean,
+    openFailed: Boolean,
+    onClick: () -> Unit,
+) {
     val label = when (kind) {
         "IMAGE" -> "Photo"
         "VIDEO" -> "Video"
@@ -1052,7 +1082,7 @@ private fun AttachmentCard(fileName: String, kind: String, onClick: () -> Unit) 
     Surface(
         color = MaterialTheme.colorScheme.surface.copy(alpha = 0.68f),
         shape = RoundedCornerShape(12.dp),
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        modifier = Modifier.fillMaxWidth().clickable(enabled = !isOpening, onClick = onClick),
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
@@ -1063,7 +1093,15 @@ private fun AttachmentCard(fileName: String, kind: String, onClick: () -> Unit) 
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
                 Text(fileName, style = MaterialTheme.typography.bodyMedium, maxLines = 2)
-                Text("Tap to decrypt and choose an app", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    when {
+                        isOpening -> "Decrypting on this device…"
+                        openFailed -> "Couldn't open. Tap to retry."
+                        else -> "Tap to decrypt and choose an app"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (openFailed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }

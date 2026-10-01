@@ -33,6 +33,7 @@ private struct MessageFramePreferenceKey: PreferenceKey {
 
 struct ContentView: View {
     @EnvironmentObject private var messenger: MessengerStore
+    @StateObject private var notificationRoutes = PushNotificationRouteStore.shared
     @State private var showingNewConversation = false
     @State private var showingPrivacySettings = false
     @State private var searchText = ""
@@ -103,7 +104,17 @@ struct ContentView: View {
         .onChange(of: messenger.verificationStep) { step in
             if step == .incomingRequest { showingPrivacySettings = true }
         }
+        .onChange(of: notificationRoutes.revision) { _ in
+            receivePendingNotificationRoute()
+        }
+        .task { receivePendingNotificationRoute() }
         .modifier(PrivateScenePrivacyShield())
+    }
+
+    private func receivePendingNotificationRoute() {
+        guard let route = notificationRoutes.pendingRoute else { return }
+        messenger.receiveNotificationRoute(route)
+        notificationRoutes.clear(route)
     }
 
     private var conversationList: some View {
@@ -112,6 +123,10 @@ struct ContentView: View {
                 HStack(spacing: 8) {
                     Circle().fill(messenger.connection == "Connected" ? Color.green : Color.orange).frame(width: 7, height: 7)
                     Text(messenger.connection.uppercased()).font(.caption2.weight(.semibold)).tracking(1.1)
+                    if messenger.connection != "Connected",
+                       let host = URL(string: messenger.homeserver)?.host {
+                        Text(host).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    }
                     Spacer()
                     Text(messenger.userId ?? "").font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         .privacySensitive()
@@ -331,12 +346,20 @@ private struct PrivacySettingsScreen: View {
                             Label("Verification state is unavailable.", systemImage: "questionmark.shield")
                                 .foregroundStyle(.secondary)
                         }
-                        Button {
-                            Task { await messenger.requestPeerVerification() }
-                        } label: {
-                            Label("Verify this person", systemImage: "person.crop.circle.badge.checkmark")
+                        if messenger.peerVerificationCompleteForCurrentConversation {
+                            Label("This person is verified", systemImage: "checkmark.shield.fill")
+                                .foregroundStyle(.green)
+                        } else if messenger.shouldOfferPeerVerification {
+                            Button {
+                                Task { await messenger.requestPeerVerification() }
+                            } label: {
+                                Label("Verify this person", systemImage: "person.crop.circle.badge.checkmark")
+                            }
+                            .disabled(messenger.verificationIsBusy)
+                        } else {
+                            Label("Verification is in progress", systemImage: "hourglass")
+                                .foregroundStyle(.secondary)
                         }
-                        .disabled(messenger.verificationIsBusy || !(messenger.verificationStep == .idle || messenger.verificationStep == .verified || messenger.verificationStep == .failed || messenger.verificationStep == .cancelled))
                     }
                 }
                 Section("DEVICE VERIFICATION") {
@@ -345,6 +368,10 @@ private struct PrivacySettingsScreen: View {
 
                     switch messenger.verificationStep {
                     case .idle:
+                        if messenger.ownIdentityVerified {
+                            Label("This account identity is verified.", systemImage: "checkmark.shield.fill")
+                                .foregroundStyle(.green)
+                        }
                         Button {
                             Task { await messenger.requestDeviceVerification() }
                         } label: {
@@ -570,6 +597,8 @@ private struct SignInScreen: View {
                 Section("PRIVATE HOMESERVER") {
                     TextField("https://chat.example.org", text: $messenger.homeserver)
                         .textInputAutocapitalization(.never).keyboardType(.URL).autocorrectionDisabled()
+                    Text("On phones, use the laptop's Wi-Fi address, such as http://192.168.1.6:8008. Don't use localhost as this address; :localhost in a Matrix ID is only its server name.")
+                        .font(.footnote).foregroundStyle(.secondary)
                     TextField("@you:example.org", text: $messenger.username)
                         .textInputAutocapitalization(.never).autocorrectionDisabled().privacySensitive()
                     SecureField("Password", text: $messenger.password)
@@ -1005,6 +1034,7 @@ private struct ChatScreen: View {
                                             onEdit: { editingMessage = $0 },
                                             onRedact: { messagePendingRedaction = $0 },
                                             onOpenAttachment: openAttachment,
+                                            isOpeningAttachment: openingAttachmentID == message.id,
                                             isAudioLoading: loadingAudioMessageID == message.id,
                                             isAudioPlaying: voicePlayback.playingMessageId == message.id
                                         )
@@ -1302,9 +1332,7 @@ private struct ChatScreen: View {
                         } else {
                             Button {
                                 let outgoing = messageText
-                                messageText = ""
-                                messenger.updateDraft("")
-                                Task { await messenger.sendMessage(outgoing) }
+                                messenger.sendMessage(outgoing)
                             } label: {
                                 Image(systemName: "arrow.up.circle.fill").font(.system(size: 34))
                             }
@@ -1537,6 +1565,7 @@ private struct MessageRow: View {
     let onEdit: (ChatMessage) -> Void
     let onRedact: (ChatMessage) -> Void
     let onOpenAttachment: (ChatMessage) -> Void
+    var isOpeningAttachment = false
     var isAudioLoading = false
     var isAudioPlaying = false
 
@@ -1555,16 +1584,24 @@ private struct MessageRow: View {
                 if let attachment = message.attachment {
                     Button { onOpenAttachment(message) } label: {
                         HStack(spacing: 11) {
-                            Image(systemName: attachment.kind == .audio
-                                    ? (isAudioPlaying ? "stop.fill" : isAudioLoading ? "hourglass" : "play.fill")
-                                    : attachmentSymbol(attachment.kind))
-                                .font(.title3).foregroundStyle(Color.accentColor)
-                                .frame(width: 34, height: 34)
-                                .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+                            Group {
+                                if isOpeningAttachment {
+                                    ProgressView()
+                                } else {
+                                    Image(systemName: attachment.kind == .audio
+                                            ? (isAudioPlaying ? "stop.fill" : isAudioLoading ? "hourglass" : "play.fill")
+                                            : attachmentSymbol(attachment.kind))
+                                        .font(.title3).foregroundStyle(Color.accentColor)
+                                }
+                            }
+                            .frame(width: 34, height: 34)
+                            .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(attachment.kind == .audio ? "Audio message" : attachment.fileName)
                                     .font(.subheadline.weight(.semibold)).lineLimit(1)
-                                Text(attachment.kind == .audio
+                                Text(isOpeningAttachment
+                                     ? "Decrypting on this device…"
+                                     : attachment.kind == .audio
                                      ? (isAudioPlaying ? "Stop playback" : isAudioLoading ? "Decrypting audio…" : "Play encrypted audio")
                                      : "Tap to decrypt and open")
                                     .font(.caption2).foregroundStyle(.secondary)
@@ -1577,6 +1614,7 @@ private struct MessageRow: View {
                         .background(Color(uiColor: .tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
                     }
                     .buttonStyle(.plain)
+                    .disabled(isOpeningAttachment)
                     .accessibilityLabel(attachment.kind == .audio
                                         ? (isAudioPlaying ? "Stop audio message from \(message.sender)" : "Play encrypted audio message from \(message.sender)")
                                         : "Decrypt and open \(attachment.fileName)")
