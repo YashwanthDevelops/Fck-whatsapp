@@ -1,0 +1,19 @@
+diff --git a/bindings/matrix-sdk-ffi/src/session_verification.rs b/bindings/matrix-sdk-ffi/src/session_verification.rs
+index ac66bfbb4..59e1f2f4b 100644
+--- a/bindings/matrix-sdk-ffi/src/session_verification.rs
++++ b/bindings/matrix-sdk-ffi/src/session_verification.rs
+@@ -390,6 +390,15 @@ impl SessionVerificationController {
+         while let Some(state) = stream.next().await {
+             match state {
+                 VerificationRequestState::Transitioned { verification } => {
++                    // `start_sas_verification()` already starts and observes SAS for the
++                    // initiating device. The request change stream reports the same
++                    // transition, so skip it here to avoid a second SAS observer. Only the
++                    // receiving side should auto-accept a transitioned request.
++                    if verification.we_started() {
++                        continue;
++                    }
++
+                     let Some(verification) = verification.sas() else {
+                         error!("Invalid, non-sas verification flow. Returning.");
+                         return;

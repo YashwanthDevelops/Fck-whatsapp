@@ -1,22 +1,29 @@
 package dev.friendline.messenger.data
 
 import android.Manifest
+import android.content.ComponentName
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.media.MediaRecorder
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.ResultReceiver
 import androidx.core.content.FileProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import android.util.Log
 import dev.friendline.messenger.ui.PeerVerificationActionPolicy
 import kotlinx.coroutines.async
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -1891,6 +1898,33 @@ class AndroidPeerAcceptanceIntegrationTest {
             )
         }
         check(verificationCompleted) { "Both fresh accounts did not complete device verification" }
+        val senderVerificationCallbacks = sender.verificationCallbackSummaryForDiagnostic()
+        val recipientVerificationCallbacks = recipient.verificationCallbackSummaryForDiagnostic()
+        fun callbackCount(summary: String, name: String): Int =
+            Regex("(?:^|,)$name=(\\d+)(?:,|$)").find(summary)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        for ((side, callbacks) in listOf(
+            "sender" to senderVerificationCallbacks,
+            "recipient" to recipientVerificationCallbacks,
+        )) {
+            check(callbackCount(callbacks, "sas-started") > 0 &&
+                callbackCount(callbacks, "sas-received") > 0 &&
+                callbackCount(callbacks, "finished") > 0
+            ) { "$side did not observe the full SAS verification lifecycle: $callbacks" }
+        }
+        val completedProtocolEvents = sender.verificationProtocolEventCountsForDiagnostic(
+            checkNotNull(verificationControlRoomId),
+            peerUserId,
+        )
+        check(
+            "start=1,0,0" in completedProtocolEvents &&
+                "accept=0,1,0" in completedProtocolEvents &&
+                "key=1,1,0" in completedProtocolEvents &&
+                "mac=1,1,0" in completedProtocolEvents,
+        ) { "The verified SAS exchange did not produce one protocol flow: $completedProtocolEvents" }
+        println(
+            "OUTBOX_DIAG_VERIFY_CALLBACKS sender=$senderVerificationCallbacks " +
+                "recipient=$recipientVerificationCallbacks protocol=$completedProtocolEvents",
+        )
         onVerificationStep("verificationPeerTrust")
         var senderTrustsRecipient = false
         var recipientTrustsSender = false
@@ -2181,11 +2215,12 @@ class AndroidPeerAcceptanceIntegrationTest {
                     "${appContext.packageName}.files",
                     viewerFile,
                 )
-                val viewerBytes = instrumentation.targetContext.contentResolver
-                    .openInputStream(viewerUri)?.use { it.readBytes() }
-                check(viewerBytes?.contentEquals(imageBytes) == true) {
-                    "The decrypted JPEG FileProvider URI did not return the original bytes"
-                }
+                verifyExternalImageViewerCanRead(
+                    instrumentation = instrumentation,
+                    contentUri = viewerUri,
+                    mimeType = attachment.mimeType,
+                    expectedBytes = imageBytes,
+                )
             } finally {
                 recipient.cleanupExternalViewerFiles()
                 viewerFile.delete()
@@ -2194,6 +2229,58 @@ class AndroidPeerAcceptanceIntegrationTest {
             check(!opened.exists()) { "The decrypted JPEG cache file was not removed after viewer cleanup" }
         } finally {
             source.delete()
+        }
+    }
+
+    private suspend fun verifyExternalImageViewerCanRead(
+        instrumentation: android.app.Instrumentation,
+        contentUri: android.net.Uri,
+        mimeType: String,
+        expectedBytes: ByteArray,
+    ) {
+        val targetContext = instrumentation.targetContext
+        val viewerContext = instrumentation.context
+        check(targetContext.applicationInfo.uid != viewerContext.applicationInfo.uid) {
+            "The viewer test APK must run under a separate Android app identity"
+        }
+
+        val viewerResult = CompletableDeferred<Pair<Int, Bundle?>>()
+        val receiver = object : ResultReceiver(Handler(Looper.getMainLooper())) {
+            override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
+                viewerResult.complete(resultCode to resultData)
+            }
+        }
+        val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(contentUri, mimeType)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            putExtra(TestAttachmentViewerActivity.EXTRA_RESULT_RECEIVER, receiver)
+        }
+
+        val chooser = Intent.createChooser(viewIntent, "Open attachment")
+        @Suppress("DEPRECATION")
+        val chooserTarget = chooser.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
+            ?: error("The attachment chooser did not contain a target intent")
+        check(chooserTarget.data == contentUri) {
+            "The attachment chooser did not preserve the decrypted content URI"
+        }
+        check(chooserTarget.type.equals(mimeType, ignoreCase = true)) {
+            "The attachment chooser did not preserve the image MIME type"
+        }
+        check(chooserTarget.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0) {
+            "The attachment chooser did not preserve the FileProvider read grant"
+        }
+
+        val explicitViewerIntent = Intent(viewIntent).apply {
+            component = ComponentName(viewerContext.packageName, TestAttachmentViewerActivity::class.java.name)
+        }
+        targetContext.startActivity(explicitViewerIntent)
+        val (resultCode, resultData) = withTimeout(10_000) { viewerResult.await() }
+        check(resultCode == android.app.Activity.RESULT_OK) {
+            "The separate viewer app could not read the temporary decrypted image: " +
+                (resultData?.getString(TestAttachmentViewerActivity.EXTRA_ERROR) ?: "no viewer error detail")
+        }
+        check(resultData?.getByteArray(TestAttachmentViewerActivity.EXTRA_BYTES)?.contentEquals(expectedBytes) == true) {
+            "The separate viewer app read different bytes from the decrypted image"
         }
     }
 

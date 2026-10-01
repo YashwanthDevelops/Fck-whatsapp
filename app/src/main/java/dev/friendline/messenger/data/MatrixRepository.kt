@@ -1333,11 +1333,16 @@ class MatrixRepository(context: Context) {
             if (events != null) {
                 for (index in 0 until events.length()) {
                     val event = events.optJSONObject(index) ?: continue
-                    // The in-room verification API wraps the protocol kind in
-                    // m.room.message.content.msgtype. Top-level `type` is always
-                    // m.room.message for this dedicated control room.
-                    if (event.optString("type") != "m.room.message") continue
-                    val protocolType = event.optJSONObject("content")?.optString("msgtype")
+                    // Current SDKs send in-room verification events using their own event
+                    // types. Keep support for the older m.room.message/msgtype representation.
+                    val eventType = event.optString("type")
+                    val protocolType = when {
+                        eventType.startsWith("m.key.verification.") -> eventType
+                        eventType == "m.room.message" -> event.optJSONObject("content")
+                            ?.optString("msgtype")
+                            .orEmpty()
+                        else -> continue
+                    }
                     val name = when (protocolType) {
                         "m.key.verification.request" -> "request"
                         "m.key.verification.ready" -> "ready"

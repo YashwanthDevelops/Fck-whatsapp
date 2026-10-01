@@ -282,6 +282,9 @@ function Invoke-DiagnosticInstrumentation {
     }
     $logOutput = @(& $adb -s $Device logcat -d -t 5000 2>$null)
     $allowListedLogLines = @($logOutput | Where-Object {
+        $_ -match "OUTBOX_DIAG_VERIFICATION_FINAL sender=(missing|requesting|incoming-request|waiting-for-accept|comparing|confirming|verified|cancelled|failed) recipient=(missing|requesting|incoming-request|waiting-for-accept|comparing|confirming|verified|cancelled|failed)" -or
+        $_ -match "OUTBOX_DIAG_VERIFY_EVENTS(?: phase=after-approval)? http=(?:0|[1-5][0-9]{2})(?:\|(request|ready|start|accept|key|mac|done|cancel)=\d{1,3},\d{1,3},\d{1,3}){0,8}" -or
+        $_ -match "OUTBOX_DIAG_VERIFY_CALLBACKS sender=(request=\d{1,3},accepted=\d{1,3},sas-started=\d{1,3},sas-received=\d{1,3},failed=\d{1,3},cancelled=\d{1,3},finished=\d{1,3}) recipient=(request=\d{1,3},accepted=\d{1,3},sas-started=\d{1,3},sas-received=\d{1,3},failed=\d{1,3},cancelled=\d{1,3},finished=\d{1,3})" -or
         $_ -match "OUTBOX_DIAG_EDIT_ECHO pipeline=" -or
         $_ -match "OUTBOX_DIAG_ATTACHMENT_COUNTS sender=\d{1,3} recipient=\d{1,3}" -or
         $_ -match "OUTBOX_DIAG_ATTACHMENT_MATRIX senderExpected=\d{1,3} senderSibling=\d{1,3} senderExpectedRemote=\d{1,3} senderSiblingRemote=\d{1,3} recipientExpected=\d{1,3} recipientSibling=\d{1,3} recipientFetchExpected=(true|false) recipientFetchSibling=(true|false)" -or
