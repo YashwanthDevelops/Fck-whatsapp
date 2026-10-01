@@ -93,6 +93,7 @@ import io.livekit.android.renderer.TextureViewRenderer
 import io.livekit.android.room.track.VideoTrack
 import livekit.org.webrtc.RendererCommon
 import java.text.DateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import kotlinx.coroutines.flow.collect
@@ -881,7 +882,7 @@ private fun MessageLine(
     val alignment = if (message.isOwn) Alignment.End else Alignment.Start
     val surface = if (message.isOwn) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surface
     val author = if (message.isOwn) "You" else message.sender
-    val time = DateFormat.getTimeInstance(DateFormat.SHORT, Locale.getDefault()).format(Date(message.timestampMillis))
+    val time = messageTimestampLabel(message.timestampMillis)
     val deliveryLabel = messageDeliveryLabel(
         deliveryState = message.deliveryState,
         hasBeenRead = message.hasBeenRead,
@@ -1011,6 +1012,24 @@ internal fun messageDeliveryLabel(
     isGroup && deliveryState.startsWith("Delivered to ") -> "$deliveryState · Seen"
     isGroup -> "Seen"
     else -> "Read"
+}
+
+internal fun messageTimestampLabel(
+    timestampMillis: Long,
+    nowMillis: Long = System.currentTimeMillis(),
+    locale: Locale = Locale.getDefault(),
+): String {
+    val messageDate = Calendar.getInstance().apply { timeInMillis = timestampMillis }
+    val currentDate = Calendar.getInstance().apply { timeInMillis = nowMillis }
+    val isToday = messageDate.get(Calendar.ERA) == currentDate.get(Calendar.ERA) &&
+        messageDate.get(Calendar.YEAR) == currentDate.get(Calendar.YEAR) &&
+        messageDate.get(Calendar.DAY_OF_YEAR) == currentDate.get(Calendar.DAY_OF_YEAR)
+    val format = if (isToday) {
+        DateFormat.getTimeInstance(DateFormat.SHORT, locale)
+    } else {
+        DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT, locale)
+    }
+    return format.format(Date(timestampMillis))
 }
 
 @Composable

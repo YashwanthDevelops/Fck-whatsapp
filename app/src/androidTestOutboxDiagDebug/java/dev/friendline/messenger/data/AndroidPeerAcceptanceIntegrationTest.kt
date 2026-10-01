@@ -974,9 +974,15 @@ class AndroidPeerAcceptanceIntegrationTest {
 
         onStep("verificationStateRestore")
         reportProgress(instrumentation, "core", "verificationStateRestore", "start")
-        verifyPeerTrustStateRestore(sender, senderId, recipientId, roomId)
+        verifyPeerTrustStateRestore(
+            context = instrumentation.targetContext,
+            sender = sender,
+            senderId = senderId,
+            recipientId = recipientId,
+            roomId = roomId,
+        )
         reportProgress(instrumentation, "core", "verificationStateRestore", "complete")
-        println("OUTBOX_DIAG_VERIFICATION_RESTORE sameSession=true trustVerified=true verifyActionHidden=true")
+        println("OUTBOX_DIAG_VERIFICATION_RESTORE freshRepository=true trustVerified=true verifyActionHidden=true")
 
         stateFile.parentFile?.mkdirs()
         stateFile.writeText(JSONObject().put("roomId", roomId).toString())
@@ -1084,7 +1090,7 @@ class AndroidPeerAcceptanceIntegrationTest {
             }
             onStep("voiceDeliveredAck")
             val eventId = checkNotNull(sentVoiceMessage.eventId)
-            fun reportVoiceAckState(delivered: Boolean) {
+            fun reportVoiceAckState(delivered: Boolean, initial: Boolean = false) {
                 val senderAck = runCatching { sender.deliveryAckDiagnosticSnapshot(roomId, eventId) }.getOrNull()
                 val recipientAck = runCatching { recipient.deliveryAckDiagnosticSnapshot(roomId, eventId) }.getOrNull()
                 val summary =
@@ -1102,10 +1108,14 @@ class AndroidPeerAcceptanceIntegrationTest {
                         "${recipientAck?.sendQueueUpdatesObserverInstalled ?: "unavailable"}|" +
                         "${recipientAck?.activeSnapshotReservation ?: "unavailable"}"
                 InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
-                    putString("outbox_diag_voice_ack", summary)
+                    putString(
+                        if (initial) "outbox_diag_voice_ack_initial" else "outbox_diag_voice_ack",
+                        summary,
+                    )
                 })
                 println(
-                    "OUTBOX_DIAG_VOICE_ACK delivered=$delivered eventIdPresent=true " +
+                    "${if (initial) "OUTBOX_DIAG_VOICE_ACK_INITIAL" else "OUTBOX_DIAG_VOICE_ACK"} " +
+                        "delivered=$delivered eventIdPresent=true " +
                         "senderObserver=${senderAck?.observerInstalled ?: "unavailable"} " +
                         "senderRecord=${senderAck?.recordPresent ?: "unavailable"} " +
                         "senderState=${senderAck?.state ?: "unavailable"} " +
@@ -1124,7 +1134,7 @@ class AndroidPeerAcceptanceIntegrationTest {
                         "recipientSnapshotReservation=${recipientAck?.activeSnapshotReservation ?: "unavailable"}",
                 )
             }
-            reportVoiceAckState(delivered = false)
+            reportVoiceAckState(delivered = false, initial = true)
             val voiceProjectionCategories = sender.timelineCategoriesForDiagnostic(roomId)
                 .filterKeys { it.startsWith("OWN_LOCAL_") }
                 .toSortedMap()
@@ -2096,6 +2106,7 @@ class AndroidPeerAcceptanceIntegrationTest {
     }
 
     private suspend fun verifyPeerTrustStateRestore(
+        context: Context,
         sender: MatrixRepository,
         senderId: String,
         recipientId: String,
@@ -2103,19 +2114,24 @@ class AndroidPeerAcceptanceIntegrationTest {
     ) {
         check(sender.isPeerVerified(roomId)) { "The verified peer trust was not available before store restore" }
         sender.close()
-        assertEquals("The repository must restore the same account session", senderId, sender.restoreSession())
-        awaitConnected(sender)
-        sender.openConversation(roomId)
-        await("verified contact state is restored for the conversation UI") {
-            sender.peerTrust.value == PeerTrustStatus.VERIFIED
+        val restoredSender = newIsolatedRepository(context, "sender")
+        try {
+            assertEquals("A fresh repository must restore the same account session", senderId, restoredSender.restoreSession())
+            awaitConnected(restoredSender)
+            restoredSender.openConversation(roomId)
+            await("verified contact state is restored for the conversation UI") {
+                restoredSender.peerTrust.value == PeerTrustStatus.VERIFIED
+            }
+            check(!PeerVerificationActionPolicy.shouldShowVerifyAction(
+                isEncrypted = true,
+                isGroup = false,
+                currentPeerUserId = recipientId,
+                peerTrust = restoredSender.peerTrust.value,
+                verification = restoredSender.verification.value,
+            )) { "The Verify action remained visible after restored peer trust became verified" }
+        } finally {
+            restoredSender.close()
         }
-        check(!PeerVerificationActionPolicy.shouldShowVerifyAction(
-            isEncrypted = true,
-            isGroup = false,
-            currentPeerUserId = recipientId,
-            peerTrust = sender.peerTrust.value,
-            verification = sender.verification.value,
-        )) { "The Verify action remained visible after restored peer trust became verified" }
     }
 
     private suspend fun verifyEncryptedJpegRoundTrip(
