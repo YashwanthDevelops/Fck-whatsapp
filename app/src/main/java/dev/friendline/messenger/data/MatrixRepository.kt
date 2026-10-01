@@ -181,8 +181,9 @@ class MatrixRepository(context: Context) {
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
     private val timelineMessagesLock = Any()
     // Keep null slots for timeline items that are not chat messages. SDK diff indices refer to
-    // the full timeline, so applying them to the filtered UI list can leave stale local echoes.
+    // the full timeline; app-owned text fallbacks are merged only when publishing the UI list.
     private val timelineMessages = mutableListOf<ChatMessage?>()
+    private val optimisticTextEchoesByTransaction = LinkedHashMap<String, PendingTextEchoProjection>()
     private val _composerDraft = MutableStateFlow("")
     private val composerDraftRevisionLock = Any()
     private val latestComposerDraftRevisions = mutableMapOf<String, Long>()
@@ -2878,6 +2879,7 @@ class MatrixRepository(context: Context) {
                 lastVisibleReadReceiptEventIds.clear()
                 _conversations.value = emptyList()
                 clearTimelineMessages()
+                synchronized(timelineMessagesLock) { optimisticTextEchoesByTransaction.clear() }
                 _composerDraft.value = ""
                 _connection.value = "Offline"
 
@@ -3522,9 +3524,28 @@ class MatrixRepository(context: Context) {
                 message
             }
         }
-        val latestById = current.associateBy(ChatMessage::id)
-        val seen = HashSet<String>(current.size)
-        _messages.value = current.mapNotNull { message ->
+        val roomId = activeRoomId
+        val timelineEventIds = if (roomId == null) emptySet() else {
+            timelineMessages.mapNotNull { it?.eventId }.toSet()
+        }
+        if (roomId != null && timelineEventIds.isNotEmpty()) {
+            optimisticTextEchoesByTransaction.entries.removeAll { (_, projection) ->
+                projection.roomId == roomId && projection.message.eventId != null &&
+                    projection.message.eventId in timelineEventIds
+            }
+        }
+        val activeFallbacks = roomId?.let { activeRoomId ->
+            optimisticTextEchoesByTransaction.values
+                .filter { it.roomId == activeRoomId }
+                .map(PendingTextEchoProjection::message)
+        }.orEmpty()
+        val visibleMessages = current + TimelineProjectionUpdatePolicy.unrepresentedFallbackEchoes(
+            timelineMessages = timelineMessages,
+            fallbackEchoes = activeFallbacks,
+        )
+        val latestById = visibleMessages.associateBy(ChatMessage::id)
+        val seen = HashSet<String>(visibleMessages.size)
+        _messages.value = visibleMessages.mapNotNull { message ->
             if (seen.add(message.id)) latestById[message.id] else null
         }.takeLast(300)
     }
@@ -3639,6 +3660,7 @@ class MatrixRepository(context: Context) {
             if (transactionId != null && responseEventId != null) {
                 rememberAcceptedSendEvent(roomId, transactionId, responseEventId)
                 promoteDeliverySnapshot(roomId, transactionId, responseEventId)
+                promoteTimelineLocalEcho(roomId, transactionId, responseEventId)
             }
             val acceptedEventId = transactionId?.let { acceptedSendEventIdsByTransaction[deliveryAckKey(roomId, it)] }
             if (BuildConfig.DEBUG && event.isOwn && !event.isRemote && diagnosticLocalIdentifier != null) {
@@ -4053,7 +4075,10 @@ class MatrixRepository(context: Context) {
                 promoteDeliverySnapshot(roomId, update.transactionId, update.eventId)
                 promoteTimelineLocalEcho(roomId, update.transactionId, update.eventId)
             }
-            is RoomSendQueueUpdate.CancelledLocalEvent -> discardPendingDeliverySnapshot(roomId, update.transactionId)
+            is RoomSendQueueUpdate.CancelledLocalEvent -> {
+                discardPendingDeliverySnapshot(roomId, update.transactionId)
+                discardTimelineLocalEcho(roomId, update.transactionId)
+            }
             // Replacements retain the same transaction and delivery audience. The SDK emits
             // this for media upload finalization as well as edits to a queued local echo.
             is RoomSendQueueUpdate.ReplacedLocalEvent -> Unit
@@ -4078,18 +4103,16 @@ class MatrixRepository(context: Context) {
     private fun promoteTimelineLocalEcho(roomId: String, transactionId: String, eventId: String) {
         synchronized(timelineMessagesLock) {
             if (logoutInProgress || activeRoomId != roomId) return
-            val index = timelineMessages.indexOfFirst { message ->
-                message?.isOwn == true && message.id == transactionId && message.eventId == null
-            }
-            if (index < 0) return
-            val message = checkNotNull(timelineMessages[index])
-            timelineMessages[index] = promoteLocalMessageWithEditOverride(
+            val key = deliveryAckKey(roomId, transactionId)
+            val pending = optimisticTextEchoesByTransaction[key]?.takeIf { it.roomId == roomId } ?: return
+            val promoted = promoteLocalMessageWithEditOverride(
                 roomId = roomId,
-                message = message,
+                message = pending.message,
                 transactionId = transactionId,
                 eventId = eventId,
                 deliveryState = deliveryStateFor(roomId, eventId, "Sent"),
             ) ?: return
+            optimisticTextEchoesByTransaction[key] = PendingTextEchoProjection(roomId, promoted)
             publishTimelineMessagesLocked()
         }
     }
@@ -4103,6 +4126,8 @@ class MatrixRepository(context: Context) {
         synchronized(timelineMessagesLock) {
             if (logoutInProgress || activeRoomId != roomId) return
             if (timelineMessages.any { it?.id == transactionId }) return
+            val key = deliveryAckKey(roomId, transactionId)
+            if (key in optimisticTextEchoesByTransaction) return
             val localEcho = ChatMessage(
                 id = transactionId,
                 eventId = null,
@@ -4116,7 +4141,7 @@ class MatrixRepository(context: Context) {
                 isOptimisticTextEcho = true,
             )
             val acceptedEventId = acceptedSendEventIdsByTransaction[deliveryAckKey(roomId, transactionId)]
-            timelineMessages += if (acceptedEventId == null) {
+            val projection = if (acceptedEventId == null) {
                 localEcho
             } else {
                 promoteLocalMessageWithEditOverride(
@@ -4127,7 +4152,20 @@ class MatrixRepository(context: Context) {
                     deliveryState = deliveryStateFor(roomId, acceptedEventId, "Sent"),
                 ) ?: localEcho
             }
+            optimisticTextEchoesByTransaction[key] = PendingTextEchoProjection(roomId, projection)
+            if (optimisticTextEchoesByTransaction.size > 512) {
+                optimisticTextEchoesByTransaction.keys
+                    .take(optimisticTextEchoesByTransaction.size - 512)
+                    .forEach(optimisticTextEchoesByTransaction::remove)
+            }
             publishTimelineMessagesLocked()
+        }
+    }
+
+    private fun discardTimelineLocalEcho(roomId: String, transactionId: String) {
+        synchronized(timelineMessagesLock) {
+            val removed = optimisticTextEchoesByTransaction.remove(deliveryAckKey(roomId, transactionId))
+            if (removed != null && activeRoomId == roomId) publishTimelineMessagesLocked()
         }
     }
 
@@ -6340,6 +6378,11 @@ class MatrixRepository(context: Context) {
         val body: String,
         val timestampMillis: Long,
         val replyToEventId: String?,
+    )
+
+    private data class PendingTextEchoProjection(
+        val roomId: String,
+        val message: ChatMessage,
     )
     private data class PendingMediaRecord(
         val id: String,

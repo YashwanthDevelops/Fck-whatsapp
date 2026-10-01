@@ -5,10 +5,52 @@ import org.junit.Test
 
 class TimelineProjectionUpdatePolicyTest {
     @Test
-    fun sdkIndexUpdateFindsEventAfterOptimisticLocalEchoShift() {
+    fun fallbackEchoDoesNotOccupyAnSdkTimelineIndexWhenTransactionRowExists() {
         val timeline = listOf(
             message(id = "first", eventId = "$first"),
-            message(id = "fallback-echo", eventId = null),
+            message(id = "txn-1", eventId = null, body = "hello").copy(isOwn = true),
+            message(id = "target", eventId = "$target"),
+        )
+        val fallback = message(id = "txn-1", eventId = null, body = "hello").copy(isOwn = true)
+
+        assertEquals(
+            emptyList<ChatMessage>(),
+            TimelineProjectionUpdatePolicy.unrepresentedFallbackEchoes(timeline, listOf(fallback)),
+        )
+        assertEquals(3, timeline.size)
+        assertEquals(listOf(2), TimelineProjectionUpdatePolicy.targetIndices(
+            timeline,
+            sdkIndex = 1,
+            projected = message(id = "target", eventId = "$target", body = "updated"),
+        ))
+    }
+
+    @Test
+    fun acceptedFallbackEchoIsSuppressedByTheExactEventId() {
+        val timeline = listOf(message(id = "$acceptedEvent", eventId = "$acceptedEvent").copy(isOwn = true))
+        val fallback = message(id = "$acceptedEvent", eventId = "$acceptedEvent").copy(isOwn = true)
+
+        assertEquals(
+            emptyList<ChatMessage>(),
+            TimelineProjectionUpdatePolicy.unrepresentedFallbackEchoes(timeline, listOf(fallback)),
+        )
+    }
+
+    @Test
+    fun fallbackEchoRemainsVisibleWhenSdkHasNoMatchingMessageProjection() {
+        val fallback = message(id = "txn-1", eventId = null, body = "hello").copy(isOwn = true)
+
+        assertEquals(
+            listOf(fallback),
+            TimelineProjectionUpdatePolicy.unrepresentedFallbackEchoes(listOf(null), listOf(fallback)),
+        )
+    }
+
+    @Test
+    fun sdkIndexUpdateFindsEventAfterNonMessageTimelineSlot() {
+        val timeline = listOf(
+            message(id = "first", eventId = "$first"),
+            null,
             message(id = "target", eventId = "$target"),
         )
         val changedTarget = message(id = "target", eventId = "$target", body = "updated")
@@ -48,6 +90,7 @@ class TimelineProjectionUpdatePolicyTest {
     )
 
     private companion object {
+        const val acceptedEvent = "accepted-event-id"
         const val first = "event-first"
         const val target = "event-target"
         const val next = "event-next"

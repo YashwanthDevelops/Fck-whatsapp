@@ -2,6 +2,17 @@ package dev.friendline.messenger.data
 
 /** Keeps SDK index updates attached to the right message when a local echo overlay shifts the list. */
 internal object TimelineProjectionUpdatePolicy {
+    /** Fallback echoes must stay outside the SDK's indexed timeline slots. */
+    fun unrepresentedFallbackEchoes(
+        timelineMessages: List<ChatMessage?>,
+        fallbackEchoes: List<ChatMessage>,
+    ): List<ChatMessage> = fallbackEchoes.filterNot { fallback ->
+        timelineMessages.any { current ->
+            current != null && (current.id == fallback.id ||
+                (fallback.eventId != null && current.eventId == fallback.eventId))
+        }
+    }
+
     fun targetIndices(
         messages: List<ChatMessage?>,
         sdkIndex: Int,

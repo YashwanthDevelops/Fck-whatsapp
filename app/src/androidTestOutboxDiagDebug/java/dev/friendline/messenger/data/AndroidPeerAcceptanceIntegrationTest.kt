@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Color
 import android.media.MediaRecorder
 import android.os.Bundle
 import androidx.core.content.FileProvider
@@ -27,6 +29,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
@@ -350,6 +353,12 @@ class AndroidPeerAcceptanceIntegrationTest {
         sender.openConversation(roomId)
         recipient.openConversation(roomId)
         reportProgress(instrumentation, "core", "verifyDiagnosticRoom", "complete")
+
+        onStep("rapidTextBurst")
+        verifyRapidTextBurst(sender, recipient, roomId, marker)
+
+        onStep("encryptedJpegRoundTrip")
+        verifyEncryptedJpegRoundTrip(sender, recipient, roomId, marker, instrumentation)
 
         onStep("editAndRedactEncryptedMessage")
         verifyMessageEditingAndRedaction(roomId, marker, sender, recipient, onStep)
@@ -900,8 +909,12 @@ class AndroidPeerAcceptanceIntegrationTest {
             val deliveryState = sender.messages.value.firstOrNull { it.eventId == senderGroupEventId }
                 ?.deliveryState?.let(::safeToken) ?: "missing"
             val observation = listOf(
+                senderAck.recordPresent,
+                senderAck.snapshotKnown,
+                senderAck.state,
                 senderAck.expectedRecipientCount,
                 senderAck.acknowledgedRecipientCount,
+                senderAck.provisionalAcknowledgementCount,
                 deliveryState,
                 senderAck.remoteAckMessageCount,
                 recipientAck.observerInstalled,
@@ -912,8 +925,11 @@ class AndroidPeerAcceptanceIntegrationTest {
                 putString("outbox_diag_group_delivery_failure", observation)
             })
             println(
-                "OUTBOX_DIAG_GROUP_DELIVERY_FAILURE expected=${senderAck.expectedRecipientCount} " +
+                "OUTBOX_DIAG_GROUP_DELIVERY_FAILURE record=${senderAck.recordPresent} " +
+                    "snapshotKnown=${senderAck.snapshotKnown} state=${senderAck.state} " +
+                    "expected=${senderAck.expectedRecipientCount} " +
                     "acknowledged=${senderAck.acknowledgedRecipientCount} delivery=$deliveryState " +
+                    "provisional=${senderAck.provisionalAcknowledgementCount} " +
                     "senderRemoteAckMessages=${senderAck.remoteAckMessageCount} " +
                     "recipientObserver=${recipientAck.observerInstalled} " +
                     "recipientAckRecord=${recipientAck.recordPresent} recipientAckState=${recipientAck.state}",
@@ -1892,6 +1908,112 @@ class AndroidPeerAcceptanceIntegrationTest {
         }
         check(peerIdentitiesConverged) {
             "The peers completed SAS, but their cross-signing trust did not converge in both directions"
+        }
+    }
+
+    private suspend fun verifyRapidTextBurst(
+        sender: MatrixRepository,
+        recipient: MatrixRepository,
+        roomId: String,
+        marker: String,
+    ) {
+        val bodies = (1..5).map { "peer-burst-$marker-$it" }
+        bodies.forEach { body ->
+            check(sender.sendText(roomId, body)) { "The rapid encrypted text send was not accepted by the SDK queue" }
+        }
+        await("rapid text burst reaches both clients exactly once") {
+            val senderRows = sender.messages.value.filter { it.isOwn && it.body in bodies }
+            val recipientRows = recipient.messages.value.filter { !it.isOwn && it.body in bodies }
+            senderRows.size == bodies.size && recipientRows.size == bodies.size &&
+                senderRows.all { it.eventId != null } && recipientRows.all { it.eventId != null } &&
+                senderRows.map { it.body } == bodies && recipientRows.map { it.body } == bodies &&
+                senderRows.mapNotNull(ChatMessage::eventId) == recipientRows.mapNotNull(ChatMessage::eventId)
+        }
+        delay(1_500)
+        val senderRows = sender.messages.value.filter { it.isOwn && it.body in bodies }
+        val recipientRows = recipient.messages.value.filter { !it.isOwn && it.body in bodies }
+        assertEquals("The sender timeline must show each rapid text send exactly once", bodies, senderRows.map { it.body })
+        assertEquals("The recipient timeline must show each rapid text send exactly once", bodies, recipientRows.map { it.body })
+        assertEquals(
+            "Sender and recipient must project the same event IDs in send order",
+            senderRows.mapNotNull(ChatMessage::eventId),
+            recipientRows.mapNotNull(ChatMessage::eventId),
+        )
+    }
+
+    private suspend fun verifyEncryptedJpegRoundTrip(
+        sender: MatrixRepository,
+        recipient: MatrixRepository,
+        roomId: String,
+        marker: String,
+        instrumentation: android.app.Instrumentation,
+    ) {
+        val imageBytes = createTinyJpeg()
+        val source = File(
+            instrumentation.targetContext.cacheDir,
+            "private-messenger/media/peer-image-$marker.jpg",
+        ).apply {
+            parentFile?.mkdirs()
+            writeBytes(imageBytes)
+        }
+        try {
+            val sourceUri = FileProvider.getUriForFile(
+                instrumentation.targetContext,
+                "${instrumentation.targetContext.packageName}.files",
+                source,
+            )
+            sender.sendAttachment(roomId, sourceUri.toString())
+            val received = awaitMessage(recipient, "encrypted JPEG attachment") {
+                it.attachment?.fileName == source.name && !it.isOwn && it.eventId != null
+            }
+            val attachment = checkNotNull(received.attachment)
+            check(attachment.kind == AttachmentKind.IMAGE) { "The encrypted JPEG was not identified as an image" }
+            check(attachment.mimeType.equals("image/jpeg", ignoreCase = true)) {
+                "The receiver did not preserve the JPEG MIME type: ${attachment.mimeType}"
+            }
+            val opened = recipient.loadAttachmentForViewing(received)
+            val appContext = instrumentation.targetContext
+            val viewerFile = File(
+                appContext.cacheDir,
+                "private-messenger/media/peer-acceptance-viewer/${source.name}",
+            )
+            try {
+                check(opened.isFile && opened.readBytes().contentEquals(imageBytes)) {
+                    "The receiver did not decrypt the JPEG bytes exactly"
+                }
+                viewerFile.parentFile?.mkdirs()
+                opened.copyTo(viewerFile, overwrite = true)
+                val viewerUri = FileProvider.getUriForFile(
+                    appContext,
+                    "${appContext.packageName}.files",
+                    viewerFile,
+                )
+                val viewerBytes = instrumentation.targetContext.contentResolver
+                    .openInputStream(viewerUri)?.use { it.readBytes() }
+                check(viewerBytes?.contentEquals(imageBytes) == true) {
+                    "The decrypted JPEG FileProvider URI did not return the original bytes"
+                }
+            } finally {
+                recipient.cleanupExternalViewerFiles()
+                viewerFile.delete()
+                viewerFile.parentFile?.delete()
+            }
+            check(!opened.exists()) { "The decrypted JPEG cache file was not removed after viewer cleanup" }
+        } finally {
+            source.delete()
+        }
+    }
+
+    private fun createTinyJpeg(): ByteArray {
+        val bitmap = Bitmap.createBitmap(3, 2, Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(Color.rgb(37, 105, 87))
+        return try {
+            ByteArrayOutputStream().use { output ->
+                check(bitmap.compress(Bitmap.CompressFormat.JPEG, 92, output))
+                output.toByteArray()
+            }
+        } finally {
+            bitmap.recycle()
         }
     }
 
