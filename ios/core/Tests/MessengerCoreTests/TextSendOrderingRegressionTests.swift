@@ -21,6 +21,7 @@ final class TextSendOrderingRegressionTests: XCTestCase {
 
         XCTAssertFalse(revisions.isCurrent(sentRevision, for: "!room:example.org"))
         XCTAssertTrue(revisions.isCurrent(newerDraftRevision, for: "!room:example.org"))
-        XCTAssertTrue(revisions.isCurrent(sentRevision, for: "!other:example.org"))
+        XCTAssertFalse(revisions.isCurrent(sentRevision, for: "!other:example.org"))
+        XCTAssertEqual(revisions.current(for: "!other:example.org"), 0)
     }
 }
