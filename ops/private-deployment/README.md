@@ -4,7 +4,7 @@ This is a separate hosted deployment bundle for the private friend group. It doe
 
 The stack keeps public registration and guest access disabled, blocks federation at both the Synapse listener and configuration layers, disables URL previews and anonymous statistics, and sets `push.include_content: false`. PostgreSQL is initialized with UTF-8 encoding and the `C` locale required by Synapse; this only takes effect when its data volume is first created. PostgreSQL, Synapse, and Caddy state use named Docker volumes. The database has no published port. Synapse is reachable only from Caddy and the call authorizer on an isolated Docker network, and its outbound network is isolated as well. On that private proxy network, Docker resolves the configured Matrix domain to Caddy so Synapse can reach the same HTTPS push URL without public-network egress. Since Synapse's outbound IP-range protection also applies to push gateways and blocks private addresses by default, Caddy receives a fixed address and Synapse permits only that exact `/32`. The default proxy subnet is `172.30.255.0/29`; if it overlaps a host, VPN, or Docker network, set both `PROXY_NETWORK_SUBNET` and `CADDY_PROXY_IP` in `.env` to a free RFC1918 subnet between `/24` and `/29` and a usable address inside it before first setup. Caddy publishes TCP 80/443. The optional calls profile uses UDP 443 for TURN, so Caddy's HTTP/3 listener is disabled.
 
-The server domain is an identity decision: Matrix user IDs include it. Choose the stable DNS name you own before first setup. Do not use the `.invalid` placeholder from `.env.example` for a real deployment.
+`MATRIX_SERVER_NAME` is the immutable Matrix identity in user IDs and must match the existing Synapse configuration and database. Friendline's existing identity is `localhost`, so keep `MATRIX_SERVER_NAME=localhost` when preserving those accounts and E2EE device identities. `MATRIX_DOMAIN` is the separate public HTTPS hostname used by Caddy and `public_baseurl`; for production it is `matrix.friendline.run.place`. Changing the public hostname does not change Matrix IDs. The configuration helper refuses to run if the existing `server_name` differs from `MATRIX_SERVER_NAME`.
 
 ## Host requirements
 
@@ -29,7 +29,7 @@ Run these commands on the Linux host from this directory (`ops/private-deploymen
    chmod 600 .env
    ```
 
-2. Edit `.env`: set `MATRIX_DOMAIN` to the stable DNS name you own and confirm `POSTGRES_PASSWORD_FILE=./secrets/postgres_password`. Calls are an optional Compose profile; do not set up `CALLS_DOMAIN` or LiveKit keys for a messenger-only server. Do not use reserved documentation or local-only names such as `.invalid`, `.example`, `.test`, or `.local`; the Synapse helper rejects these for the Matrix identity, and Caddy cannot issue public certificates for reserved names. This syntax check cannot verify DNS ownership or reachability. The image tags are pinned to release versions. Before production, review security advisories and pin each image to a verified digest in the same change-control process.
+2. Edit `.env`: preserve `MATRIX_SERVER_NAME=localhost`, set `MATRIX_DOMAIN=matrix.friendline.run.place`, and confirm `POSTGRES_PASSWORD_FILE=./secrets/postgres_password`. Calls are an optional Compose profile; do not set up `CALLS_DOMAIN` or LiveKit keys for a messenger-only server. `MATRIX_DOMAIN` must be the stable public DNS name served by Caddy; the helper rejects reserved documentation and local-only hostnames. This syntax check cannot verify DNS ownership or reachability. The image tags are pinned to release versions. Before production, review security advisories and pin each image to a verified digest in the same change-control process.
 
    The default proxy subnet is `172.30.255.0/29`, with Caddy at `172.30.255.2`. Check that it does not overlap a host, VPN, or existing Docker network. If it does, add `PROXY_NETWORK_SUBNET=<free-RFC1918-subnet-from-/24-through-/29>` and `CADDY_PROXY_IP=<usable-address-in-that-subnet>` to `.env`; the Synapse helper validates the address/subnet pairing and permits only the exact Caddy address for push-gateway requests.
 
@@ -39,7 +39,9 @@ Run these commands on the Linux host from this directory (`ops/private-deploymen
    docker compose --env-file .env config --quiet
    ```
 
-4. Initialize PostgreSQL, generate the Synapse signing/configuration files, then apply the private-server configuration. Run this only for a new Synapse data volume:
+4. The following initialization is only for a genuinely new Synapse identity and an empty Synapse volume. It is not the migration procedure for Friendline's existing `localhost` server. Never run `synapse generate` against restored or existing Synapse data: preserve and restore the existing database and complete Synapse data (including its signing key, media, and `homeserver.yaml`), then confirm `server_name: localhost` before applying the private-server settings. For any existing database or data volume, stop here and use the separately approved migration/restore procedure.
+
+   For a genuinely new server only, initialize PostgreSQL, generate the Synapse signing/configuration files, then apply the private-server configuration:
 
    ```sh
    docker compose --env-file .env up -d db
@@ -59,10 +61,10 @@ Run these commands on the Linux host from this directory (`ops/private-deploymen
    Caddy obtains and renews the HTTPS certificate automatically. Verify the public client versions endpoint from a network outside the host:
 
    ```sh
-   curl --fail --silent --show-error "https://YOUR_OWNED_DOMAIN/_matrix/client/versions"
+   curl --fail --silent --show-error "https://matrix.friendline.run.place/_matrix/client/versions"
    ```
 
-   Replace `YOUR_OWNED_DOMAIN` with the same value as `MATRIX_DOMAIN`.
+   This must use the same value as `MATRIX_DOMAIN`; it is independent of the preserved Matrix `server_name`.
 
 6. Calls are outside the messenger deployment gate. To enable the existing optional calls profile later, create a protected LiveKit key file and set `CALLS_DOMAIN` and `LIVEKIT_KEYS_FILE` in `.env`. Verify that the calls domain has a reachable A/AAAA record and open the additional call ports listed under Host requirements. Start the calls profile:
 
@@ -181,10 +183,10 @@ docker compose --env-file .env exec synapse python -c "import urllib.request; ur
 
 The repository contains a deployment definition and operator procedure, not a running server. The following operator-owned inputs and actions remain before private use:
 
-- Choose the permanent Matrix domain and provision a Linux host with Docker Compose V2. Point DNS A/AAAA records at that host, configure inbound TCP 80/443 (and optional UDP 443), and arrange encrypted storage, firewall policy, and tested backups. The Matrix domain becomes part of every account ID and should be selected before creating accounts.
-- On that host, create `.env` from `.env.example`, set `MATRIX_DOMAIN`, and create `secrets/postgres_password` with a random value of at least 32 characters and restrictive file permissions. Run the first-time initialization and account-provisioning steps above.
+- Provision a Linux host with Docker Compose V2. Point the public hostname at that host, configure inbound TCP 80/443 (and optional UDP 443), and arrange encrypted storage, firewall policy, and tested backups. The existing Matrix identity remains `localhost`; the public hostname does not become part of user IDs.
+- On that host, create `.env` from `.env.example`, retain `MATRIX_SERVER_NAME=localhost`, set `MATRIX_DOMAIN=matrix.friendline.run.place`, and create `secrets/postgres_password` with a random value of at least 32 characters and restrictive file permissions. Do not run first-time Synapse generation when restoring Friendline's existing data.
 - For Android push, create a Firebase project, enable FCM HTTP v1, register each application ID that will be built (the four current IDs are listed above), add matching client `google-services.json` files on the Android build machine, and place the Firebase service-account JSON on the host at `credentials/firebase_service_account.json`. Set the Firebase project ID in `sygnal.yaml`.
 - For iOS push, use an Apple Developer team to enable Push Notifications for bundle ID `dev.friendline.messenger.ios`, create an APNs authentication key, and install matching signed provisioning profiles on macOS/Xcode. Place the `.p8` key on the host at `credentials/apns_auth_key.p8`; set its Key ID and Team ID in `sygnal.yaml`. The debug build uses APNs sandbox and the release build uses production.
 - Enable the Sygnal `push` profile only after both provider configurations and client builds are ready. Validate registration and actual APNs/FCM payloads with signed physical devices before giving builds to friends. Push acceptance cannot be completed from this Windows host without the Apple signing setup and physical iOS device.
 
-Provider credentials and host secrets belong only in their protected local files; do not commit or share them. No hosting account, payment, credential, or real domain has been provisioned for this project.
+Provider credentials and host secrets belong only in their protected local files; do not commit or share them. The repository does not provision the Azure host, DNS, firewall, storage, or provider credentials.

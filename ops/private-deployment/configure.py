@@ -1,4 +1,4 @@
-"""Apply private hosted-server settings to a generated Synapse config."""
+"""Apply private hosted-server settings to an existing Synapse config."""
 
 from __future__ import annotations
 
@@ -88,6 +88,16 @@ def read_database_password() -> str:
     return password
 
 
+def configure_public_identity(config: dict, server_name: str, domain: str) -> None:
+    """Keep the existing Matrix identity while setting its public client URL."""
+    if config.get("server_name") != server_name:
+        raise SystemExit(
+            "Synapse server_name does not match MATRIX_SERVER_NAME; "
+            "Matrix identities cannot be changed."
+        )
+    config["public_baseurl"] = f"https://{domain}/"
+
+
 def persist_registration_secret(existing_secret: str | None) -> None:
     if REGISTRATION_SECRET_PATH.exists():
         return
@@ -103,7 +113,14 @@ def persist_registration_secret(existing_secret: str | None) -> None:
 
 def configure() -> None:
     if not CONFIG_PATH.is_file():
-        raise SystemExit("Generate /data/homeserver.yaml with the Synapse image first.")
+        raise SystemExit(
+            "Synapse configuration is missing at /data/homeserver.yaml; "
+            "initialize only an empty Synapse data volume."
+        )
+
+    server_name = os.environ.get("MATRIX_SERVER_NAME", "")
+    if not server_name:
+        raise SystemExit("MATRIX_SERVER_NAME must match the existing Matrix identity.")
 
     domain = os.environ.get("MATRIX_DOMAIN", "")
     if not is_deployable_domain(domain):
@@ -121,8 +138,7 @@ def configure() -> None:
     registration_secret = config.pop("registration_shared_secret", None)
     persist_registration_secret(registration_secret)
     config["registration_shared_secret_path"] = str(REGISTRATION_SECRET_PATH)
-    config["server_name"] = domain
-    config["public_baseurl"] = f"https://{domain}/"
+    configure_public_identity(config, server_name, domain)
     config["database"] = {
         "name": "psycopg2",
         "args": {

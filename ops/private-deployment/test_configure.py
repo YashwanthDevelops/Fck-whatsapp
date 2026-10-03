@@ -3,7 +3,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from configure import caddy_proxy_ip_range, is_deployable_domain
+from configure import (
+    caddy_proxy_ip_range,
+    configure_public_identity,
+    is_deployable_domain,
+)
 
 
 class MatrixDomainValidationTests(unittest.TestCase):
@@ -20,6 +24,24 @@ class MatrixDomainValidationTests(unittest.TestCase):
         ):
             with self.subTest(domain=domain):
                 self.assertFalse(is_deployable_domain(domain))
+
+
+class MatrixIdentityConfigurationTests(unittest.TestCase):
+    def test_preserves_server_name_and_sets_separate_https_public_baseurl(self) -> None:
+        config = {"server_name": "localhost"}
+
+        configure_public_identity(config, "localhost", "matrix.friendline.run.place")
+
+        self.assertEqual(config["server_name"], "localhost")
+        self.assertEqual(
+            config["public_baseurl"], "https://matrix.friendline.run.place/"
+        )
+
+    def test_rejects_a_server_name_that_would_change_matrix_identities(self) -> None:
+        config = {"server_name": "matrix.friendline.run.place"}
+
+        with self.assertRaisesRegex(SystemExit, "Matrix identities cannot be changed"):
+            configure_public_identity(config, "localhost", "matrix.friendline.run.place")
 
 
 class PushProxyNetworkTests(unittest.TestCase):

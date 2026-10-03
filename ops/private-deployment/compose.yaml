@@ -36,8 +36,9 @@ services:
     logging: *bounded-logging
     environment:
       SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
-      SYNAPSE_SERVER_NAME: ${MATRIX_DOMAIN:?Set MATRIX_DOMAIN to the stable domain you own}
+      SYNAPSE_SERVER_NAME: ${MATRIX_SERVER_NAME:?Set MATRIX_SERVER_NAME to the existing Matrix identity}
       SYNAPSE_REPORT_STATS: "no"
+      MATRIX_SERVER_NAME: ${MATRIX_SERVER_NAME:?Set MATRIX_SERVER_NAME to the existing Matrix identity}
       MATRIX_DOMAIN: ${MATRIX_DOMAIN:?Set MATRIX_DOMAIN to the stable domain you own}
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       CADDY_PROXY_IP: ${CADDY_PROXY_IP:-172.30.255.2}
